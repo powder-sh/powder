@@ -1,4 +1,9 @@
-# powder
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="brand/powder-wordmark-dark.svg">
+    <img src="brand/powder-wordmark.svg" alt="powder" width="240">
+  </picture>
+</h1>
 
 **Push to deploy on servers you own.**
 
