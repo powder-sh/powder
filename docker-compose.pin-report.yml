@@ -1,0 +1,8 @@
+# Used only by `bin/self-deploy.sh --pin-report` (the env render target report): the images it
+# builds to run the env render target report get their own tags, so the :latest tags
+# the running powder and worker were created from stay as they are.
+services:
+  powder:
+    image: powder:pin-report
+  worker:
+    image: powder-worker:pin-report

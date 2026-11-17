@@ -1,0 +1,31 @@
+# deps
+node_modules/
+.pnpm-store/
+
+# builds
+.next/
+dist/
+.turbo/
+*.tsbuildinfo
+
+# logs
+*.log
+
+# os
+.DS_Store
+
+# env / secrets
+.env
+.env.local
+.env.production
+.env.*.local
+*.env
+!.env.example
+!packages/db/drizzle/
+
+# local DB-dump dirs at the repo root (project-scoped code dirs named
+# "backups" — e.g. /projects/[id]/backups page — must NOT be ignored)
+/backups/
+
+# local coding-agent state
+.claude/

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/powder-sh/powder/security/policy
+    about: Please do not open a public issue. See SECURITY.md.
+  - name: Documentation
+    url: https://github.com/powder-sh/powder/tree/main/apps/web/content/docs
+    about: Install, upgrade and troubleshooting guides.

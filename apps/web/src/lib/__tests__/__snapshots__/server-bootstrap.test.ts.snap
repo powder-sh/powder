@@ -1,0 +1,10 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`per-server helpers > the plan installs an absent helper, replaces an outdated one, never the resource guard 1`] = `
+"S=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+# T: a temp file in /usr/local/bin that powder writes its infra/powder-migrate to over SFTP
+if [ "$(sha256sum "$T" | cut -c1-64)" != "$S" ]; then rm -f "$T"; echo 'the uploaded copy does not match, nothing installed'; exit 1; fi
+if [ -d '/usr/local/bin/powder-migrate' ]; then rm -f "$T"; echo '/usr/local/bin/powder-migrate is a directory, not touching it'; exit 1; fi
+chown root:root "$T" && chmod 0755 "$T" && mv -f "$T" '/usr/local/bin/powder-migrate' || { rm -f "$T"; echo 'install failed'; exit 1; }
+echo "installed /usr/local/bin/powder-migrate (sha256 $S)""
+`;

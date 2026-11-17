@@ -1,0 +1,4 @@
+FROM alpine AS a
+RUN --mount=type=bind,from=0,target=/x true
+FROM alpine
+COPY --from=0 /a /b

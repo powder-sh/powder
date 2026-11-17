@@ -1,0 +1,31 @@
+[extend]
+useDefault = true
+
+# Targeted allow-list: the shared fake-secret corpus file, plus the exact fake
+# values and placeholder key blocks the tests use. Any other secret-shaped value
+# in a test file is still reported.
+[allowlist]
+description = "Template Dockerfile placeholders, the fake-secret corpus fixture, and the exact fake fixtures in tests"
+paths = ['''(^|/)apps/web/src/lib/__tests__/fixtures/secret-corpus\.ts$''']
+regexes = [
+  # templates/next-standard Dockerfile build-time placeholders
+  '''sk_test_placeholder''',
+  '''eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.placeholder\.placeholder''',
+  '''valuevalue12''',
+  # fake values in single tests
+  '''^gh_secret_0123456789abcdef0123456789$''',
+  '''^a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9f$''',
+  '''^9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08$''',
+  '''^ZXhhbXBsZTpzZWNyZXQ=$''',
+  '''^sk_live_supersecretvalue$''',
+  '''^admin:hunter2pw$''',
+  '''^abcd1234efgh$''',
+  '''^abcdefghijkl$''',
+  # placeholder PEM blocks: a template interpolation or a short fake body
+  '''^-----BEGIN [A-Z ]*PRIVATE KEY-----\\n\$\{(FX\.)?(PEM_BODY|body)\}''',
+  '''^-----BEGIN PRIVATE KEY-----\\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\\n'\)''',
+  '''^-----BEGIN RSA PRIVATE KEY-----\\nMIIEowIBAAKCAQEA\\nabcdef\\n-----END RS''',
+  '''^-----BEGIN RSA PRIVATE KEY-----\\nProc-Type: 4,ENCRYPTED\\nDEK-Info: AES-128-CBC,00FF''',
+  '''^-----BEGIN OPENSSH PRIVATE KEY-----" /root/\.ssh/id\\nok\\n__POWDER_FAIL_''',
+  '''^-----BEGIN OPENSSH PRIVATE KEY-----',\n\t+\.\.\.Array\.from\(\{ length: 30 \}''',
+]

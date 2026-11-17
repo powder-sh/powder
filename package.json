@@ -1,0 +1,49 @@
+{
+	"name": "powder",
+	"version": "0.10.0",
+	"private": true,
+	"description": "Push to deploy on servers you own.",
+	"license": "AGPL-3.0-or-later",
+	"homepage": "https://powder.sh",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/powder-sh/powder.git"
+	},
+	"bugs": {
+		"url": "https://github.com/powder-sh/powder/issues"
+	},
+	"scripts": {
+		"dev": "turbo run dev",
+		"build": "turbo run build",
+		"typecheck": "turbo run typecheck",
+		"lint": "biome lint .",
+		"db:init": "bash bin/db-init.sh"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^1.9.0",
+		"turbo": "^2.5.0",
+		"typescript": "^5.8.0"
+	},
+	"packageManager": "pnpm@10.21.0",
+	"pnpm": {
+		"onlyBuiltDependencies": [
+			"@biomejs/biome",
+			"esbuild",
+			"msgpackr-extract",
+			"sharp"
+		],
+		"overrides": {
+			"@tailwindcss/postcss>postcss": "8.5.33",
+			"baseline-browser-mapping": "2.11.36",
+			"decode-uri-component": ">=0.5.1",
+			"dompurify": ">=3.4.17",
+			"fast-xml-parser": "5.12.0",
+			"sharp": "0.35.5",
+			"shell-quote": ">=1.11.0",
+			"source-map-js": ">=1.2.2",
+			"tinypool": ">=2.1.2",
+			"vite@7": "7.3.7",
+			"vite@7>esbuild": "0.28.2"
+		}
+	}
+}

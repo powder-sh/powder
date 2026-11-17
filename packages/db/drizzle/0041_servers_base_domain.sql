@@ -1,0 +1,12 @@
+-- idempotent
+-- Per-server base domain for default app hosts (<app>.<base_domain>) and preview
+-- hosts. Replaces a hardcoded default domain and the assumption that an
+-- ingress setting names it. NULL = no default host: the server needs custom domains and
+-- previews are ignored.
+-- Hand-apply (idempotent), BEFORE deploying the powder build that reads it:
+--   psql ... -f 0041_servers_base_domain.sql
+-- Backfill: no existing setting holds the domain (the old ingress setting held
+-- serverId=ip pairs), so set each server by hand:
+--   update servers set base_domain='<domain>' where id='<server id>'
+-- and point a wildcard DNS record *.<domain> at the server.
+ALTER TABLE "servers" ADD COLUMN IF NOT EXISTS "base_domain" text;

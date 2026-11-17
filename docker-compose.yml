@@ -1,0 +1,174 @@
+# Compose file for powder itself: the dashboard (`powder`), the deploy worker
+# (`worker`) and a bundled Postgres.
+#
+# What it assumes (all adjustable in the env file, see docker/powder.env.example):
+#   - env file: /opt/apps/powder.env (POWDER_ENV_FILE overrides the path)
+#   - Postgres data: ${POWDER_DATA_DIR:-/opt/apps}/powder-pgdata
+#   - dashboard on 127.0.0.1:${POWDER_PORT:-3050}
+#   - SSH key: SSH_KEY_PATH (default /root/.ssh/id_ed25519), created by you
+#   - external docker network `web`:  docker network create web
+#   - the DB is `powder-postgres` on the private `powder-db` network (internal:
+#     true, created by compose): only powder and powder-worker reach it. Use the host
+#     powder-postgres in DATABASE_URL. It also answers to `postgres` there, but with
+#     no DB container the layout detection (bin/lib-db-layout.sh) reads host
+#     postgres as the shared-network layout unless POWDER_DB_NETWORK=private.
+#   - a server where powder's DB runs as `postgres` on the shared `internal`
+#     network (the shared-network layout): bin/self-deploy.sh detects it and adds
+#     docker-compose.shared-db.yml with a warning; move with
+#     docs/SELF-HOSTING.md "DB network cutover".
+#   - powder and worker run with cap_drop ALL and no-new-privileges (both stay
+#     root: the master SSH key is a 0600 root file; root reads its own file without
+#     capabilities). POWDER_HARDEN=false (bin/self-deploy.sh adds
+#     docker-compose.unharden.yml) turns that off; POWDER_WEB_READONLY=true adds
+#     docker-compose.web-readonly.yml (read-only web root fs)
+#   - Traefik labels only when POWDER_DASHBOARD_HOST is set
+
+name: powder
+
+services:
+  # Bundled control-plane DB. Creds come from POWDER_DB_* in /opt/apps/powder.env
+  # (the deploy scripts pass it via --env-file for compose interpolation), so
+  # no secret is committed. Data is a bind mount at ${POWDER_DATA_DIR:-/opt/apps}/powder-pgdata.
+  postgres:
+    image: pgvector/pgvector:pg16@sha256:0dd3149a06e4579a0d70d8fef9945636cd514005e7237deb27f9b67886f8dc4f
+    # Alone with powder + worker on the private powder-db network. The shared-network layout
+    # (docker-compose.shared-db.yml) names it `postgres` on the shared `internal` network.
+    container_name: powder-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POWDER_DB_USER:?set POWDER_DB_USER in /opt/apps/powder.env}
+      POSTGRES_PASSWORD: ${POWDER_DB_PASSWORD:?set POWDER_DB_PASSWORD in /opt/apps/powder.env}
+      POSTGRES_DB: ${POWDER_DB_NAME:?set POWDER_DB_NAME in /opt/apps/powder.env}
+    volumes:
+      - ${POWDER_DATA_DIR:-/opt/apps}/powder-pgdata:/var/lib/postgresql/data
+    networks:
+      powder-db:
+        aliases:
+          - powder-postgres
+          - postgres
+
+  powder:
+    image: powder:latest
+    build:
+      context: .
+      dockerfile: docker/web.Dockerfile
+      # MUST pin the web stage. `runner-worker` is the LAST stage in the
+      # Dockerfile, and a targetless build resolves to the final stage -
+      # which would silently build powder as the worker (no web server).
+      target: runner
+      # Optional analytics, baked at build. Set in /opt/apps/powder.env (deploy scripts pass --env-file)
+      # (blank = PostHog off).
+      args:
+        NEXT_PUBLIC_POSTHOG_KEY: ${NEXT_PUBLIC_POSTHOG_KEY:-}
+        NEXT_PUBLIC_POSTHOG_HOST: ${NEXT_PUBLIC_POSTHOG_HOST:-}
+        NEXT_PUBLIC_POSTHOG_UI_HOST: ${NEXT_PUBLIC_POSTHOG_UI_HOST:-}
+        # Secret part of powder's own BuildKit cache ids (docker/web.Dockerfile);
+        # the self-deploy paths export it from /opt/apps/.powder-build-cache-id.
+        POWDER_BUILD_CACHE_ID: ${POWDER_BUILD_CACHE_ID:-}
+    container_name: powder
+    restart: unless-stopped
+    env_file: ${POWDER_ENV_FILE:-/opt/apps/powder.env}
+    environment:
+      # bin/self-deploy.sh --skip-migrations sets this to 1 for that recreate so
+      # the boot-time schema step (docker/powder-entrypoint.sh) is skipped too
+      # and a failing file cannot crash-loop the container. Every other run sets 0.
+      POWDER_SKIP_BOOT_MIGRATIONS: ${POWDER_SKIP_BOOT_MIGRATIONS:-0}
+    volumes:
+      # ssh key from host so the dashboard can reach managed servers.
+      # SSH_KEY_PATH (powder.env, see docs/SELF-HOSTING.md) is the host path of the
+      # master private key (default /root/.ssh/id_ed25519) and is mounted at the SAME
+      # path inside the container, so the app's own SSH_KEY_PATH resolves to it.
+      - ${SSH_KEY_PATH:-/root/.ssh/id_ed25519}:${SSH_KEY_PATH:-/root/.ssh/id_ed25519}:ro
+      - ${SSH_KEY_PATH:-/root/.ssh/id_ed25519}.pub:${SSH_KEY_PATH:-/root/.ssh/id_ed25519}.pub:ro
+    ports:
+      - "127.0.0.1:${POWDER_PORT:-3050}:3000"
+    # A pre-auth request flood must not take the server down.
+    mem_limit: 1g
+    pids_limit: 512
+    # no capabilities, no privilege gain (opt out: POWDER_HARDEN=false).
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks:
+      - web
+      - powder-db
+    # Traefik (docker provider, exposedbydefault=false) routes ONLY containers
+    # that carry traefik.enable=true. Set POWDER_DASHBOARD_HOST (powder.env) to the
+    # dashboard's public hostname to get a router for it; unset/empty = no Traefik
+    # labels (traefik.enable stays empty, so nothing routes to this container).
+    # POWDER_DASHBOARD_HOST_ALIAS and POWDER_DASHBOARD_HOST_ALIAS2 (optional) add a
+    # second and third host, e.g. www.
+    # Host split (optional, see docs/SELF-HOSTING.md "Public site on its own host"):
+    # set POWDER_SITE_HOST (powder.env, runtime) to the public-site host(s) and
+    # route them here via the aliases; the app then serves only the site, /docs,
+    # webhooks, /api/health and /ingest on them and 404s everything else.
+    # BETTER_AUTH_URL must be the dashboard origin. Unset = one host serves all.
+    # The bundled `postgres` service above is defined in this file and reached via
+    # DATABASE_URL on the private `powder-db` network (host powder-postgres), or on
+    # `internal` (host postgres) with docker-compose.shared-db.yml (the shared-network layout).
+    labels:
+      - traefik.enable=${POWDER_DASHBOARD_HOST:+true}
+      - traefik.http.routers.powder.rule=${POWDER_DASHBOARD_HOST:+Host(`${POWDER_DASHBOARD_HOST}`)}${POWDER_DASHBOARD_HOST_ALIAS:+ || Host(`${POWDER_DASHBOARD_HOST_ALIAS}`)}${POWDER_DASHBOARD_HOST_ALIAS2:+ || Host(`${POWDER_DASHBOARD_HOST_ALIAS2}`)}
+      - traefik.http.routers.powder.entrypoints=${POWDER_DASHBOARD_HOST:+websecure}
+      - traefik.http.routers.powder.tls.certresolver=${POWDER_DASHBOARD_HOST:+le}
+      - traefik.http.services.powder.loadbalancer.server.port=3000
+
+  # Deploy worker. Separate process so a powder self-deploy (which recreates
+  # ONLY the `powder` service above) can never SIGKILL an in-flight app deploy
+  # (a killed deploy can leave the app down). It claims 'queued' deploys from the
+  # `deploys` table (the table IS the queue; no Redis) and owns the cron/uptime/
+  # backup/watchdog scheduler. Gated by POWDER_DEPLOY_WORKER in powder.env: when
+  # unset it idles and web runs deploys and the scheduler itself (in-web mode).
+  #
+  # bin/self-deploy.sh rebuilds and recreates it together with `powder` (both run
+  # the same code); it drains in-flight deploys first (see stop_grace_period).
+  # Only `powder` applies the schema (its entrypoint, before it serves), so the
+  # worker waits at start until the migration ledger records every pre-deploy
+  # file of its image (apps/web/src/lib/migration-wait.ts, bounded by
+  # POWDER_WORKER_MIGRATION_WAIT). Not a depends_on on a powder healthcheck:
+  # /api/health answers 503 until this worker's claim heartbeat is fresh, and
+  # the self-deploy recreate runs with --no-deps.
+  worker:
+    image: powder-worker:latest
+    build:
+      context: .
+      dockerfile: docker/web.Dockerfile
+      target: runner-worker
+      # Same build args as `powder` so the shared builder stage has identical
+      # cache keys and the second build reuses the first one's Next build.
+      args:
+        NEXT_PUBLIC_POSTHOG_KEY: ${NEXT_PUBLIC_POSTHOG_KEY:-}
+        NEXT_PUBLIC_POSTHOG_HOST: ${NEXT_PUBLIC_POSTHOG_HOST:-}
+        NEXT_PUBLIC_POSTHOG_UI_HOST: ${NEXT_PUBLIC_POSTHOG_UI_HOST:-}
+        # Secret part of powder's own BuildKit cache ids (docker/web.Dockerfile);
+        # the self-deploy paths export it from /opt/apps/.powder-build-cache-id.
+        POWDER_BUILD_CACHE_ID: ${POWDER_BUILD_CACHE_ID:-}
+    container_name: powder-worker
+    restart: unless-stopped
+    env_file: ${POWDER_ENV_FILE:-/opt/apps/powder.env}
+    volumes:
+      - ${SSH_KEY_PATH:-/root/.ssh/id_ed25519}:${SSH_KEY_PATH:-/root/.ssh/id_ed25519}:ro
+      - ${SSH_KEY_PATH:-/root/.ssh/id_ed25519}.pub:${SSH_KEY_PATH:-/root/.ssh/id_ed25519}.pub:ro
+    # Stays on `web`: other containers there (e.g. an HQ reached by name) may be
+    # what POWDER_HQ_* point at.
+    networks:
+      - web
+      - powder-db
+    # On stop the worker stops claiming and waits for in-flight deploys to finish
+    # before exiting (SIGTERM handler in worker.ts). Give compose room for the
+    # WORST-case deploy: up to 40 min waiting on the target server's build flock
+    # (flock -w 2400 in rebuildDeploy) + 30 min build + up/health. A grace shorter
+    # than that could SIGKILL a drain mid-deploy and orphan the deploy.
+    # bin/self-deploy.sh also waits for a quiet queue
+    # before recreating, so this grace is the backstop, not the primary guard.
+    stop_grace_period: 80m
+    mem_limit: 1g
+    pids_limit: 512
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+networks:
+  web:
+    external: true
+  powder-db:
+    name: powder-db
+    internal: true

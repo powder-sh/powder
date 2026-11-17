@@ -1,0 +1,1 @@
+ALTER TABLE "app_domains" ADD COLUMN "preview_deploy_id" text;

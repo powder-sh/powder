@@ -1,0 +1,1 @@
+ALTER TABLE "app_repos" ADD COLUMN "has_kv" boolean DEFAULT false NOT NULL;

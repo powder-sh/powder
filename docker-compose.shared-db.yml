@@ -1,0 +1,27 @@
+# Shared-network DB layout: a server where powder's DB runs as the container `postgres`
+# on the shared `internal` network (every app on that network can reach it or
+# squat the name). bin/self-deploy.sh adds this file
+# (`-f docker-compose.yml -f docker-compose.shared-db.yml`) when the server still
+# runs that layout and POWDER_DB_NETWORK is not `private`, and warns on every run.
+# Move to the private layout: docs/SELF-HOSTING.md "DB network cutover".
+# Needs docker compose >= 2.24 (`!override`).
+
+services:
+  postgres:
+    container_name: postgres
+    networks: !override
+      - internal
+
+  powder:
+    networks: !override
+      - web
+      - internal
+
+  worker:
+    networks: !override
+      - web
+      - internal
+
+networks:
+  internal:
+    external: true

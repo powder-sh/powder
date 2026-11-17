@@ -1,0 +1,1 @@
+ALTER TABLE "app_repos" ADD COLUMN "owner_user_id" text;

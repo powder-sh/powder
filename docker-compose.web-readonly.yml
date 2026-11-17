@@ -1,0 +1,15 @@
+# Opt-in read-only root filesystem for powder's web container. Used
+# only when POWDER_WEB_READONLY=true is set in /opt/apps/powder.env:
+# bin/self-deploy.sh then adds `-f docker-compose.web-readonly.yml` (after the
+# shared-db / unharden overrides, if any).
+#
+# Writable then: /tmp (deploy-key generation, psql) and Next's runtime cache dir.
+# The worker is never read_only (pnpm/corepack and tsx write caches under /root and
+# /tmp at start). cap_drop ALL + no-new-privileges are in docker-compose.yml.
+
+services:
+  powder:
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/apps/web/.next/cache

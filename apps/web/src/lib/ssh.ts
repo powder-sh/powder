@@ -1,0 +1,17 @@
+// Barrel: the old 2.7k-line module was split into lib/shell.ts, lib/ssh/* and
+// lib/deploy/*. Importers keep using '@/lib/ssh'.
+export { shellQuote } from './shell'
+export { sshConnectConfig, runCommand } from './ssh/connection'
+export { getNginxRoutes, extractHostPorts, getContainerHostNetInfo, listContainers, inspectContainer } from './ssh/discovery'
+export type { ContainerInfo, NginxRoute, ContainerExtras, ContainerDetail } from './ssh/discovery'
+export { composeEnvFilePaths, envFileCandidatesFor, findEnvFile, readEnvFile, bulkReadAppEnvFiles, writeEnvFile, writeFileViaSftp, writeFileSecret, deleteRemoteFile, envSnapshotPath, snapshotEnvForDeploy, restoreEnvSnapshot, readEnvRestoreMarker, clearEnvRestoreMarker } from './ssh/files'
+export { gitCloneRepo, getGitStatus, GIT_REF_RE, GITHUB_KNOWN_HOSTS_SETUP, GIT_SSH_HOSTKEY_OPTS, gitResolveTarget } from './ssh/git'
+export type { GitStatus } from './ssh/git'
+export { composeUpService, composeFileArgs, infraServicesFromConfig, resolveInfraServices, infraCountShell, imageLabelGuardShell, bridgeShellFunctions, HEALTH_ACCEPT_STRICT, HEALTH_ACCEPT_LOOSE, SWAP_CHECK_WAIT_SEC, SWAP_CHECK_INTERVAL_SEC, resolveSwapCheckPlan, swapCheckShellFunctions } from './deploy/fragments'
+export type { SwapCheckPlan } from './deploy/fragments'
+export { buildDeployScript } from './deploy/script'
+export { DEPLOY_BUDGET_SEC, runDeployScript, tagDeployImage, removeLeakedBridges, parseDeployedImage, rebuildDeploy, verifyRunningImage } from './deploy/run'
+export { healthCheckContainer, livenessCheckContainer, rollbackToImage } from './deploy/health'
+export { getContainerLogs, streamContainerLogs, restartContainer } from './ssh/logs'
+export { getRootCrontab, getAllCronSources } from './ssh/crontab'
+export type { CrontabSource } from './ssh/crontab'

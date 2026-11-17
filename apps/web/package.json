@@ -1,0 +1,44 @@
+{
+	"name": "@powder/web",
+	"version": "0.10.0",
+	"private": true,
+	"license": "AGPL-3.0-or-later",
+	"scripts": {
+		"dev": "next dev --port 3000",
+		"build": "next build",
+		"start": "next start",
+		"worker": "tsx src/worker.ts",
+		"typecheck": "tsc --noEmit",
+		"test": "vitest run"
+	},
+	"dependencies": {
+		"@powder/db": "workspace:*",
+		"better-auth": "1.7.7",
+		"clsx": "^2.1.1",
+		"cmdk": "^1.0.4",
+		"cron-parser": "^5.5.0",
+		"gray-matter": "^4.0.3",
+		"lucide-react": "^1.11.0",
+		"marked": "^16.4.2",
+		"minio": "^8.0.0",
+		"next": "16.4.6",
+		"nodemailer": "^10.3.1",
+		"posthog-js": "^1.438.7",
+		"react": "19.2.4",
+		"react-dom": "19.2.4",
+		"ssh2": "^1.17.0",
+		"tailwind-merge": "^3.5.0",
+		"yaml": "2.8.3"
+	},
+	"devDependencies": {
+		"@tailwindcss/postcss": "^4",
+		"@types/node": "^20",
+		"@types/react": "^19",
+		"@types/react-dom": "^19",
+		"@types/ssh2": "^1.15.5",
+		"tailwindcss": "^4",
+		"tsx": "^4.23.15",
+		"typescript": "^5",
+		"vitest": "^4.1.12"
+	}
+}

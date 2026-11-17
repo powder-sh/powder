@@ -1,0 +1,14 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+# Install scripts pnpm never runs, listed so `pnpm install` does not warn about them.
+# ssh2 builds an optional native crypto binding and cpu-features is its optional
+# helper: without them ssh2 uses its JavaScript code paths. core-js only prints a
+# message.
+ignoredBuiltDependencies:
+  - core-js
+  - cpu-features
+  - sharp
+  - ssh2
+  - unrs-resolver

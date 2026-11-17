@@ -1,0 +1,11 @@
+{
+  "name": "@powder/config",
+  "version": "0.10.0",
+  "private": true,
+  "license": "AGPL-3.0-or-later",
+  "exports": {
+    "./tsconfig/base": "./tsconfig.base.json",
+    "./tsconfig/next": "./tsconfig.next.json",
+    "./tsconfig/bun": "./tsconfig.bun.json"
+  }
+}

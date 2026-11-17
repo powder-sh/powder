@@ -1,0 +1,32 @@
+# syntax=docker/dockerfile:1.7
+# check=skip=SecretsUsedInArgOrEnv
+ARG NODE_VERSION=20.11.0
+ARG BASE="node:${NODE_VERSION}-alpine"
+FROM --platform=${BUILDPLATFORM} ${BASE} AS Builder
+ENV PNPM_HOME="/pnpm" PATH="$PNPM_HOME:$PATH"
+ENV LEGACY some value here
+WORKDIR /usr/src/app
+RUN --mount=type=bind,source=package.json,target=package.json \
+    --mount=type=bind,source=package-lock.json,target=package-lock.json \
+    --mount=type=cache,target=/root/.npm,sharing=locked \
+    --mount=type=secret,id=npmrc,target=/root/.npmrc \
+    npm ci --omit=dev
+RUN --mount=type=ssh --network=none echo hi
+COPY --link --chmod=755 --chown=node:node . .
+ADD --chown=node:node src/ /app/src/
+ADD https://example.com/x.tgz /tmp/
+FROM builder AS test
+RUN --mount=type=bind,from=builder,source=/usr/src/app,target=/x ls /x
+COPY --from=Builder /usr/src/app /app
+COPY --from=ghcr.io/foo/bar:1 /bin/x /bin/x
+FROM rust:1.79-slim-bookworm AS rbuild
+ARG APP_NAME=app
+RUN --mount=type=bind,source=src,target=src \
+    --mount=type=cache,target=/app/target/ \
+    --mount=type=cache,target=/usr/local/cargo/git/db \
+    cargo build --locked --release && cp ./target/release/$APP_NAME /bin/server
+FROM eclipse-temurin:21-jre-jammy AS final
+ONBUILD RUN echo hi
+COPY --from=rbuild /bin/server /bin/
+from gcr.io/distroless/static-debian12:nonroot
+COPY --from=final /bin/server /

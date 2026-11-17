@@ -1,0 +1,15 @@
+# Keep local secrets and keys out of every build context. bin/self-deploy.sh
+# already ships only `git archive HEAD`; this is the second line of defence.
+**/.env*
+!**/.env.example
+**/*.pem
+
+# Host build output and dependencies: a `docker compose build` from a developer
+# checkout must not copy them over what the deps and builder stages produce.
+# Every COPY source in docker/web.Dockerfile stays in the context
+# (apps/web/src/lib/__tests__/dockerignore-copy-sources.test.ts).
+**/node_modules
+**/.next
+**/.turbo
+**/dist
+**/*.tsbuildinfo

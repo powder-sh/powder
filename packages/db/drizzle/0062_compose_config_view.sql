@@ -1,0 +1,11 @@
+-- idempotent
+-- deploys.compose_config_view: written with compose_config_hash when a deploy succeeds
+--   (0056). A small view of the same compose structure (apps/web/src/lib/deploy/
+--   compose-diff.ts): per service, per key, the values safe to print (network_mode,
+--   ports, binds, image repo, networks) and, for keys that can hold a secret (labels,
+--   build, command, healthcheck, unknown keys), only the key names with a short HMAC (keyed
+--   by POWDER_ENCRYPTION_KEY and a random salt kept in the view) of
+--   each value. No `environment` value is ever in it. When the next deploy's compose
+--   guard refuses because the config differs, it prints what changed against this.
+--   NULL for rows from before this migration: the refusal then says no copy is stored.
+ALTER TABLE "deploys" ADD COLUMN IF NOT EXISTS "compose_config_view" jsonb;

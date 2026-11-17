@@ -1,0 +1,38 @@
+# powder
+
+> Open-source (AGPL-3.0-or-later), self-hosted deploy platform. You install it on your own Linux server. On every git push to GitHub it builds the app's Docker image on your own server over SSH, health-checks the new container, swaps it in and keeps the previous image for rollback. No CI service, no registry, no hosted account.
+
+Key facts:
+
+- Single-tenant: one install per person or team. There is no signup; on an empty install the first GitHub login after entering the one-time setup token (printed to the powder log) at /setup becomes the admin. Persist it with `sudo bin/install.sh --set-admin <user id>` in the powder checkout on the server (it writes POWDER_ADMIN_USER_IDS and recreates powder and worker).
+- Powder is one Next.js app (dashboard and API), a worker container that runs deploys, and a Postgres database, started with Docker Compose. All config lives in /opt/apps/powder.env.
+- Powder reaches each server over SSH with a key you control. Register a server in the dashboard, then add a new app at /new (repository, branch, server and name), or adopt an app already running there with "connect" on its container's git card (GitHub must be connected first). Powder adds a read-only deploy key and a webhook to the repository.
+- An app needs only a Dockerfile in its repository. Powder writes the compose file on the server (/opt/apps/<app>/docker-compose.yml), clones the repository into that app directory and builds its Dockerfile there. Every deploy force-syncs the directory to GitHub, so the repository is the source of truth.
+- Deploy stages, in order: preflight, build, test gate (optional .powder/test.sh), swap gate, db migrate, release (optional image label powder.release.cmd), swap-check, docker compose up, health check, tag. A failed build or check leaves the old container serving.
+- Give the app a health URL path such as /api/health that answers 2xx without a Host header.
+- Env vars are stored encrypted in powder's database and rendered to /opt/apps/<app>.env at deploy time. Edit them in the dashboard, not on the server. NEXT_PUBLIC_* values are baked in at build time.
+- Coding agents can operate powder over MCP: POST <your powder dashboard URL>/api/mcp with an API token as a bearer header (tools: list_apps, get_app, list_deploys, get_deploy_log, deploy_app, list_env_keys, set_env_var, delete_env_var, list_servers). No tool runs shell on a server.
+- Optional per-app Postgres 16 (DATABASE_URL is set for you) and Redis, encrypted Postgres backups to S3-compatible storage, crons, uptime checks and logs.
+
+## Docs
+
+- [Quickstart](https://powder.sh/docs/quickstart): install on one Ubuntu server with bin/install.sh, sign in as the admin, add a server, deploy with git push
+- [Self-hosting](https://powder.sh/docs/self-hosting): install on one server, the env file, first login, adding servers, upgrading
+- [What your repo needs](https://powder.sh/docs/app-requirements): a Dockerfile is enough, what /new generates on the server, which compose constructs powder refuses
+- [Upgrading](https://powder.sh/docs/upgrading): upgrade on the server or from a workstation, how the schema is applied, release notes, rollback
+- [Uninstall](https://powder.sh/docs/uninstall): remove powder from its own server, its app servers and GitHub; deployed apps keep running
+- [How a deploy runs](https://powder.sh/docs/deploys): every deploy stage, swap-check, rollback, stop, start and delete an app, powder.json
+- [Domains and proxy](https://powder.sh/docs/domains-and-proxy): nginx or Traefik per server, TLS modes, base domain, custom domains, redirects
+- [Env vars and secrets](https://powder.sh/docs/env-and-secrets): encryption, scopes, audit trail, how values reach containers, drift guard
+- [Backups](https://powder.sh/docs/backups): S3 target, what a backup does, retention, manual restore
+- [Crons, uptime and logs](https://powder.sh/docs/crons-uptime-logs): HTTP and exec crons, uptime checks, deploy logs and live container logs
+- [Troubleshooting](https://powder.sh/docs/troubleshooting): the failure classes a failed deploy names, what each means, install problems
+- [Security model](https://powder.sh/docs/security-model): what powder trusts and what it protects
+- [MCP for coding agents](https://powder.sh/docs/mcp): connect Claude Code or any MCP client, tools, token scopes
+- [FAQ](https://powder.sh/docs/faq): requirements, licence, releases, help
+
+## Optional
+
+- [Source code](https://github.com/powder-sh/powder): README, CHANGELOG.md, docker-compose.yml, docker/powder.env.example
+- [Releases](https://github.com/powder-sh/powder/releases): tagged vX.Y.Z
+- Contact: hello@powder.sh

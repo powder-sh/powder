@@ -1,0 +1,70 @@
+import { describe, expect, it } from 'vitest'
+
+// Guards the lib/ssh.ts barrel: the file was split into lib/ssh/*, lib/deploy/*
+// and lib/shell.ts, and the 47 importers must keep seeing the same names.
+const EXPECTED = [
+	'DEPLOY_BUDGET_SEC',
+	'GITHUB_KNOWN_HOSTS_SETUP',
+	'GIT_REF_RE',
+	'GIT_SSH_HOSTKEY_OPTS',
+	'HEALTH_ACCEPT_LOOSE',
+	'HEALTH_ACCEPT_STRICT',
+	'SWAP_CHECK_INTERVAL_SEC',
+	'SWAP_CHECK_WAIT_SEC',
+	'bridgeShellFunctions',
+	'buildDeployScript',
+	'bulkReadAppEnvFiles',
+	'clearEnvRestoreMarker',
+	'composeEnvFilePaths',
+	'composeFileArgs',
+	'composeUpService',
+	'deleteRemoteFile',
+	'envFileCandidatesFor',
+	'envSnapshotPath',
+	'extractHostPorts',
+	'findEnvFile',
+	'getAllCronSources',
+	'getContainerHostNetInfo',
+	'getContainerLogs',
+	'getGitStatus',
+	'getNginxRoutes',
+	'getRootCrontab',
+	'gitCloneRepo',
+	'gitResolveTarget',
+	'healthCheckContainer',
+	'imageLabelGuardShell',
+	'infraCountShell',
+	'infraServicesFromConfig',
+	'inspectContainer',
+	'listContainers',
+	'livenessCheckContainer',
+	'parseDeployedImage',
+	'readEnvFile',
+	'readEnvRestoreMarker',
+	'rebuildDeploy',
+	'removeLeakedBridges',
+	'resolveInfraServices',
+	'resolveSwapCheckPlan',
+	'restartContainer',
+	'restoreEnvSnapshot',
+	'rollbackToImage',
+	'runCommand',
+	'runDeployScript',
+	'shellQuote',
+	'snapshotEnvForDeploy',
+	'sshConnectConfig',
+	'streamContainerLogs',
+	'swapCheckShellFunctions',
+	'tagDeployImage',
+	'verifyRunningImage',
+	'writeEnvFile',
+	'writeFileSecret',
+	'writeFileViaSftp',
+]
+
+describe('lib/ssh barrel', () => {
+	it('exports exactly the pre-split names', async () => {
+		const mod = await import('@/lib/ssh')
+		expect(Object.keys(mod).sort()).toEqual(EXPECTED)
+	})
+})

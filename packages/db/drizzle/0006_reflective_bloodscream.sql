@@ -1,0 +1,1 @@
+ALTER TABLE "app_repos" ADD COLUMN "has_postgres" boolean DEFAULT false NOT NULL;

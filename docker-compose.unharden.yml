@@ -1,0 +1,15 @@
+# Opt-out of powder's container hardening. Used only when
+# POWDER_HARDEN=false is set in /opt/apps/powder.env: bin/self-deploy.sh then adds
+# `-f docker-compose.unharden.yml`. It removes the cap_drop ALL and
+# no-new-privileges that docker-compose.yml sets on powder and worker, for a server
+# where the hardened containers have not been verified yet.
+# Needs docker compose >= 2.24 (`!reset`).
+
+services:
+  powder:
+    cap_drop: !reset []
+    security_opt: !reset []
+
+  worker:
+    cap_drop: !reset []
+    security_opt: !reset []

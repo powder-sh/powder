@@ -1,0 +1,520 @@
+#!/usr/bin/env bash
+# powder-migrate: apply an app's pending SQL migrations to its DB on deploy,
+# tracked in _powder_migrations so an already-applied migration never re-runs.
+# Universal: works for any ORM that ships plain *.sql (drizzle/kysely/knex/raw).
+#
+#   powder-migrate <app> apply     # deploy-path: 1st run on an existing-schema DB
+#                                   # AUTO-BASELINES (records, runs nothing); later
+#                                   # runs apply only genuinely-new migrations.
+#   powder-migrate <app> baseline  # force: record all current files as applied, run none
+#   powder-migrate <app> status    # show applied vs pending, run nothing
+set -uo pipefail
+APP="${1:?app}"; MODE="${2:-status}"
+APPS="${POWDER_APPS_DIR:-/opt/apps}"
+SRC="$APPS/$APP/src"; [ -d "$SRC" ] || SRC="$APPS/$APP"
+# A repo-tracked `src -> /opt/apps/<other>/src` link would make this app run
+# (and read) another app's checkout. The source dir must be a real directory.
+if [ -L "$SRC" ]; then echo "[migrate] $APP: REFUSING: $SRC is a symlink (repo-controlled link out of the app dir)"; exit 1; fi
+SRCREAL=$(readlink -f "$SRC" 2>/dev/null || true)
+[ -n "$SRCREAL" ] || { echo "[migrate] $APP: cannot resolve $SRC"; exit 1; }
+# Resolve the app's running container. <app> is the powder app name (=
+# container_name, = /opt/apps/<app>). A caller may also pass the compose SERVICE
+# name ("app"), which matches no container name, so fall back to the compose project
+# label so either spelling works, skipping infra siblings (db/kv/redis/...).
+# the fallback only trusts a NON-one-off compose container whose
+# config_files all live in this app's dir (or powder's override state dir). Labels
+# are settable by anyone who can start a container; a one-off (release, swap-check
+# candidate) or a container claiming this working_dir from elsewhere is skipped.
+# The container's config_files label minus powder's per-deploy temp overrides
+# (/tmp/powder-dfr.<x>/override.yml|labels.yml, /tmp/powder-stage.*): a container
+# created with such a temp override lists them, and they are deleted after the deploy.
+# Comma-separated, like the label.
+label_files() {
+  local cf f out=""
+  cf=$(docker inspect "$1" --format '{{index .Config.Labels "com.docker.compose.project.config_files"}}' 2>/dev/null || true)
+  for f in ${cf//,/ }; do
+    case "$f" in /tmp/powder-dfr.*/override.yml|/tmp/powder-dfr.*/labels.yml|/tmp/powder-stage.*|/tmp/powder-stage-*) continue;; esac
+    out="$out,$f"
+  done
+  printf '%s' "${out#,}"
+}
+own_compose_ctr() {
+  local cf f
+  cf=$(label_files "$1")
+  [ -n "$cf" ] || return 1
+  for f in ${cf//,/ }; do
+    case "$f" in "$APPS/$APP/"*|/var/lib/powder/compose/*) ;; *) return 1;; esac
+    case "$f" in *..*) return 1;; esac
+  done
+  return 0
+}
+CTR="$APP"
+if ! docker inspect "$CTR" >/dev/null 2>&1; then
+  CTR=""
+  for C in $(docker ps --filter "label=com.docker.compose.project.working_dir=$APPS/$APP" --filter "label=com.docker.compose.oneoff=False" --format '{{.Names}}' 2>/dev/null \
+        | grep -vE -- '-(db|kv|redis|postgres|traefik)$'); do
+    if own_compose_ctr "$C"; then CTR="$C"; break; fi
+  done
+fi
+[ -z "$CTR" ] && { echo "[migrate] $APP: WARNING no running container found for '$APP' (tried the name and the compose project label) — skipping migrations"; exit 0; }
+# DATABASE_URL comes from what the NEXT container will get: the env_file(s) the
+# compose service declares (in order, last wins) and then its environment:
+# overrides, via `docker compose config`. NEVER from the running container first:
+# after an env change (e.g. a DB password rotation) the old container still holds
+# the old value, the migrate fails to authenticate and the deploy aborts with the
+# app stuck on the old credentials. The running container is only a fallback
+# when no compose source declares the variable (logged).
+resolve_dburl() {
+  local cfgs svc json
+  cfgs=$(label_files "$CTR")
+  svc=$(docker inspect "$CTR" --format '{{index .Config.Labels "com.docker.compose.service"}}' 2>/dev/null || true)
+  # First deploy / container made without compose labels: use the app's compose
+  # file at the powder convention path; the python below picks the service.
+  [ -n "$cfgs" ] || { [ -f "$APPS/$APP/docker-compose.yml" ] && cfgs="$APPS/$APP/docker-compose.yml"; }
+  [ -n "$svc" ] || svc="$APP"
+  [ -n "$cfgs" ] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  local args=() f
+  for f in ${cfgs//,/ }; do args+=(-f "$f"); done
+  json=$(docker compose "${args[@]}" config --format json 2>/dev/null) || return 1
+  SVC="$svc" RENDERED="$APPS/$APP.env" python3 -c '
+import json, os, re, sys
+cfg = json.load(sys.stdin)
+svcs = cfg.get("services", {})
+svc = svcs.get(os.environ["SVC"])
+if svc is None:
+    # no label to name the service: the only non-infra service
+    cand = [k for k in svcs if not re.search(r"(^|-)(db|kv|redis|postgres|traefik)$", k)]
+    if len(cand) != 1:
+        sys.exit(1)
+    svc = svcs[cand[0]]
+val = None
+ef = svc.get("env_file") or []
+if isinstance(ef, (str, dict)):
+    ef = [ef]
+if not ef:
+    # compose declares no env_file: the env file powder rendered for this app
+    ef = [os.environ["RENDERED"]]
+for e in ef:
+    path = e if isinstance(e, str) else e.get("path")
+    try:
+        lines = open(path).read().splitlines()
+    except OSError:
+        continue
+    for line in lines:
+        m = re.match(r"\s*(?:export\s+)?DATABASE_URL\s*=\s*(.*)$", line)
+        if m:
+            v = m.group(1).strip()
+            if len(v) >= 2 and v[0] == v[-1] == chr(34):
+                # same codec as env-parse.ts parseRawEnv: backslash-escaped quote, backslash, dollar,
+                # backtick, plus \n and \r, inside double quotes
+                body, out, i = v[1:-1], [], 0
+                while i < len(body):
+                    c = body[i]
+                    if c == chr(92) and i + 1 < len(body):
+                        n = body[i + 1]
+                        if n in (chr(34), chr(92), "$", chr(96)):
+                            out.append(n)
+                            i += 2
+                            continue
+                        if n in ("n", "r"):
+                            out.append(chr(10) if n == "n" else chr(13))
+                            i += 2
+                            continue
+                    out.append(c)
+                    i += 1
+                v = "".join(out)
+            elif len(v) >= 2 and v[0] == v[-1] == "\x27":
+                v = v[1:-1]
+            val = v
+env = svc.get("environment") or {}
+if isinstance(env, list):
+    env = dict(x.split("=", 1) for x in env if "=" in x)
+if env.get("DATABASE_URL"):
+    val = env["DATABASE_URL"]
+if not val:
+    sys.exit(1)
+print(val)
+' <<<"$json"
+}
+DBURL=$(resolve_dburl 2>/dev/null || true)
+if [ -n "$DBURL" ]; then
+  echo "[migrate] $APP: DATABASE_URL read from the compose env_file/environment (not the running container)"
+else
+  DBURL=$(docker exec "$CTR" printenv DATABASE_URL 2>/dev/null || true)
+  [ -n "$DBURL" ] && echo "[migrate] $APP: no env_file/environment declares DATABASE_URL, falling back to the running container $CTR"
+fi
+if [ -z "$DBURL" ]; then
+  # LOUD when the app clearly HAS a database (a db service in its compose file, or
+  # a <app>-db / backup_db_* container): a silent skip here shipped schema-less deploys.
+  if grep -qE '^[[:space:]]+db:' "$APPS/$APP/docker-compose.yml" 2>/dev/null \
+     || docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qE -- "^(${APP}-db|backup_db_${APP})"; then
+    echo "[migrate] $APP: !!! WARNING !!! NO DATABASE_URL found (rendered env file, compose, running container) but this app HAS a database (db service / ${APP}-db container). MIGRATIONS WERE SKIPPED. Set DATABASE_URL in the powder env and redeploy."
+  else
+    echo "[migrate] $APP: container $CTR has no DATABASE_URL — skip (no database for this app)"
+  fi
+  exit 0
+fi
+NET=$(docker inspect "$CTR" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' 2>/dev/null | head -1)
+[ -z "$NET" ] && { echo "[migrate] $APP: no docker network — skip"; exit 0; }
+MIG=""
+for d in "$SRC/src/drizzle" "$SRC/drizzle" "$SRC/migrations" "$SRC/src/migrations" "$SRC/supabase/migrations" "$SRC/db/migrations"; do
+  # A candidate dir that is itself a link is refused, never followed (a repo
+  # can commit `drizzle -> /root/.ssh`); files are found with find, not a glob.
+  if [ -L "$d" ]; then echo "[migrate] $APP: REFUSING: $d is a symlink"; exit 1; fi
+  [ -d "$d" ] || continue
+  if [ -n "$(find "$d" -maxdepth 1 -name '*.sql' -print -quit 2>/dev/null)" ]; then MIG="$d"; break; fi
+done
+[ -z "$MIG" ] && { echo "[migrate] $APP: no *.sql migrations dir — skip"; exit 0; }
+# $MIG must resolve inside $SRC and no .sql may be a link (a committed
+# `0099.sql -> /root/.ssh/id_ed25519` would be fed to the app DB as SQL, as root, and
+# echoed by postgres logs). Only regular files are ever read (find -type f).
+MIGREAL=$(readlink -f "$MIG" 2>/dev/null || true)
+case "$MIGREAL" in "$SRCREAL"/*) ;; *) echo "[migrate] $APP: REFUSING: $MIG resolves outside $SRC"; exit 1 ;; esac
+if [ -n "$(find "$MIG" -maxdepth 1 -name '*.sql' ! -type f -print -quit 2>/dev/null)" ]; then
+  echo "[migrate] $APP: REFUSING: $MIG holds a *.sql that is not a regular file (symlink): $(find "$MIG" -maxdepth 1 -name '*.sql' ! -type f -print -quit)"
+  exit 1
+fi
+FILES=()
+while IFS= read -r -d '' f; do FILES+=("$f"); done < <(find "$MIG" -maxdepth 1 -type f -name '*.sql' -print0 | sort -z)
+# the checks above and the reads below are seconds apart (docker run psql
+# calls). A container with a writable bind over $MIG could swap a checked .sql for a
+# link to another app's env file or root's ssh key in between. So right now every
+# .sql is copied, never dereferenced (cp -R -P: a link stays a link, a fifo or device
+# stays one, its content is never read), into a fresh root-only dir; any copy that is
+# not a regular file refuses the run, and ONLY the copies are read from here on
+# (ledger names, psql input). The copy runs from inside $MIG (cd -P), so swapping a
+# folder on the way for a link after this point changes nothing.
+MIGWORK_BASE="${POWDER_MIGRATE_WORK_DIR:-/var/lib/powder/migrate}"
+mkdir -p -m 700 "$MIGWORK_BASE" 2>/dev/null
+if [ -L "$MIGWORK_BASE" ] || [ ! -d "$MIGWORK_BASE" ] || [ ! -O "$MIGWORK_BASE" ]; then
+  echo "[migrate] $APP: REFUSING: work dir $MIGWORK_BASE is not a directory owned by $(id -un) (or is a symlink)"; exit 1
+fi
+chmod 700 "$MIGWORK_BASE" || { echo "[migrate] $APP: cannot chmod 700 $MIGWORK_BASE"; exit 1; }
+MIGCOPY=$(mktemp -d "$MIGWORK_BASE/$APP.XXXXXX") || { echo "[migrate] $APP: cannot create a work dir under $MIGWORK_BASE"; exit 1; }
+trap 'rm -rf -- "$MIGCOPY"' EXIT
+if ! (
+  cd -P -- "$MIG" || exit 1
+  here=$(pwd -P)
+  case "$here" in "$SRCREAL"/*) ;; *) echo "[migrate] $APP: REFUSING: $MIG resolves outside $SRC" >&2; exit 1 ;; esac
+  for f in ${FILES[@]+"${FILES[@]}"}; do
+    b=${f##*/}
+    cp -R -P -- "./$b" "$MIGCOPY/$b" || exit 1
+  done
+); then
+  echo "[migrate] $APP: REFUSING: could not copy the migrations of $MIG for a safe read"; exit 1
+fi
+bad=$(find "$MIGCOPY" -mindepth 1 -maxdepth 1 ! -type f -print -quit 2>/dev/null)
+if [ -n "$bad" ]; then
+  echo "[migrate] $APP: REFUSING: $MIG holds a *.sql that is not a regular file (symlink): $MIG/${bad##*/}"
+  exit 1
+fi
+COPIES=()
+for f in ${FILES[@]+"${FILES[@]}"}; do
+  b=${f##*/}
+  [ -f "$MIGCOPY/$b" ] && [ ! -L "$MIGCOPY/$b" ] || { echo "[migrate] $APP: REFUSING: $MIG/$b changed while it was copied"; exit 1; }
+  COPIES+=("$MIGCOPY/$b")
+done
+FILES=(${COPIES[@]+"${COPIES[@]}"})
+# a fixed, digest-pinned psql image, never the newest local image whose name
+# matches pgvector|postgres, which an app named "postgres-x" could win (and a
+# non-psql image would break every deploy on the server). Override with
+# POWDER_MIGRATE_IMAGE only for an air-gapped registry mirror.
+IMG="${POWDER_MIGRATE_IMAGE:-postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab}"
+docker image inspect "$IMG" >/dev/null 2>&1 || docker pull -q "$IMG" >/dev/null 2>&1 \
+  || { echo "[migrate] $APP: cannot pull $IMG"; exit 1; }
+# Join the app container's own network namespace: the DB host in DATABASE_URL
+# resolves exactly as it does for the app. "--network $NET" used the FIRST of
+# the app's networks, which on multi-network apps isn't the one the DB is on
+# (an app on <app>_default + internal with its db only on internal: every deploy
+# failed "could not translate host name").
+# DBURL travels as an env var (-e DBURL, value never in argv / `ps`).
+export DBURL
+# the URL is parsed INSIDE the container into PG* env vars; psql never gets it in
+# argv (docker run argv and the container's /proc/<pid>/cmdline are host-visible).
+IFS= read -r -d '' PSQL_SH <<'EOS' || true
+u="$DBURL"
+case "$u" in postgres://*|postgresql://*) ;; *) echo "[migrate] DATABASE_URL is not a postgres:// URL" >&2; exit 1 ;; esac
+dec() { printf '%b' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/%\([0-9A-Fa-f][0-9A-Fa-f]\)/\\x\1/g')"; }
+u=${u#*://}
+q=""; case "$u" in *\?*) q=${u#*\?}; u=${u%%\?*} ;; esac
+auth=""; case "$u" in *@*) auth=${u%@*}; u=${u##*@} ;; esac
+hp=${u%%/*}; db=""; case "$u" in */*) db=${u#*/} ;; esac
+user=${auth%%:*}; pw=""; case "$auth" in *:*) pw=${auth#*:} ;; esac
+port=""
+case "$hp" in
+  \[*\]*) host=${hp%%\]*}; host=${host#\[}; r=${hp#*\]}; case "$r" in :*) port=${r#:} ;; esac ;;
+  *:*) host=${hp%:*}; port=${hp##*:} ;;
+  *) host=$hp ;;
+esac
+[ -n "$host" ] && export PGHOST="$(dec "$host")"
+[ -n "$port" ] && export PGPORT="$port"
+[ -n "$user" ] && export PGUSER="$(dec "$user")"
+[ -n "$pw" ] && export PGPASSWORD="$(dec "$pw")"
+[ -n "$db" ] && export PGDATABASE="$(dec "$db")"
+for kv in $(printf '%s' "$q" | tr '&' ' '); do
+  case "$kv" in sslmode=*) export PGSSLMODE="${kv#sslmode=}" ;; esac
+done
+unset DBURL
+exec psql -X -v ON_ERROR_STOP=1 "$@"
+EOS
+# psql runs inside the app's network namespace, so it gets no capability at all
+# (NET_RAW there could forge ARP / raw packets on the shared `web` bridge), no privilege
+# gain, the postgres user of the image (uid 70), a read-only root with a tmpfs /tmp as
+# HOME, and pid / memory caps. Keep in sync with lib/side-run.ts (TOOL_RUN_HARDEN).
+PSQL() { docker run --rm -i --network "container:$CTR" --cap-drop ALL --security-opt no-new-privileges --user 70:70 --read-only --tmpfs /tmp --pids-limit 256 --memory 512m -e HOME=/tmp -e DBURL ${PSQL_ENV[@]+"${PSQL_ENV[@]}"} "$IMG" sh -c "$PSQL_SH" sh "$@"; }
+# Lock timeout for the sessions that apply TRANSACTIONAL migration files (only those):
+# an ALTER queued behind a long transaction holds its ACCESS EXCLUSIVE request, and
+# every later query on that table queues behind it while the old container still
+# serves. With a timeout the file fails and rolls back, the deploy stops before the
+# swap and the app keeps running. Non-transactional files (CONCURRENTLY, ADD VALUE)
+# get none: a concurrent index build waits for older transactions without blocking
+# readers or writers, and a timeout there leaves an INVALID index; a statement that
+# fails mid-file outside a transaction leaves the earlier ones applied.
+# POWDER_MIGRATE_LOCK_TIMEOUT: 0 (none: the role/database default applies) or 1s to
+# 10min, written as <n>ms, <n>s, <n>min or a plain number of ms; default 10s.
+# Anything else warns and uses 10s. A file that runs SET lock_timeout itself keeps
+# control for its own session.
+LOCK_TIMEOUT="${POWDER_MIGRATE_LOCK_TIMEOUT:-10s}"
+LT_MS=""
+if [[ "$LOCK_TIMEOUT" =~ ^([0-9]{1,7})(ms|s|min)?$ ]]; then
+  lt_n=$((10#${BASH_REMATCH[1]}))
+  case "${BASH_REMATCH[2]}" in ''|ms) LT_MS=$lt_n ;; s) LT_MS=$((lt_n * 1000)) ;; min) LT_MS=$((lt_n * 60000)) ;; esac
+fi
+if [ -z "$LT_MS" ] || { [ "$LT_MS" -ne 0 ] && { [ "$LT_MS" -lt 1000 ] || [ "$LT_MS" -gt 600000 ]; }; }; then
+  echo "[migrate] $APP: WARNING: POWDER_MIGRATE_LOCK_TIMEOUT='${LOCK_TIMEOUT//[^A-Za-z0-9._-]/}' is not 0 or a duration from 1s to 600s (like 10s, 1500ms, 2min) - using 10s"
+  LT_MS=10000
+fi
+PSQL_ENV=()
+PSQL_APPLY() {
+  local rc
+  [ "$LT_MS" -eq 0 ] || PSQL_ENV=(-e "PGOPTIONS=-c lock_timeout=${LT_MS}ms")
+  PSQL "$@"; rc=$?
+  PSQL_ENV=()
+  return $rc
+}
+# Invalid indexes (a concurrent build that failed or was cancelled leaves one: postgres
+# keeps maintaining it but never uses it, and a rerun with IF NOT EXISTS skips it).
+# One name per line; non-zero when the catalog query fails.
+# Bare relnames (no schema, no quotes), so they compare with the names a file writes.
+INVALID_SQL="select c.relname from pg_index i join pg_class c on c.oid = i.indexrelid where not i.indisvalid"
+invalid_indexes() { PSQL -tAc "$INVALID_SQL order by 1" 2>/dev/null; }
+# The same, without the indexes a CREATE INDEX CONCURRENTLY in another session is still
+# building (it is INVALID until that build ends, and that session owns it). Read after a
+# file ran, so a build another session started meanwhile never fails the file. Postgres
+# without pg_stat_progress_create_index (before 12): the full list.
+settled_invalid_indexes() {
+  PSQL -tAc "$INVALID_SQL and not exists (select 1 from pg_stat_progress_create_index p where p.index_relid = i.indexrelid) order by 1" 2>/dev/null || invalid_indexes
+}
+# The invalid indexes a non-transactional file is accountable for: every one whose
+# name appears in the file's SQL, comments left out, as a whole word (any case;
+# "quoted" and schema.qualified forms match too), invalid before the file or not (a
+# rerun with IF NOT EXISTS skips it and exits 0), plus, when the list before the file
+# is known ($2 = y), any that turned invalid while it ran (an index the file builds
+# without naming it). Unrelated indexes that were invalid before never count.
+# $1 file, $2 y|n, $3 list before, $4 list after (settled_invalid_indexes). Space-separated names.
+bad_indexes() { local x out="" code; code=$(migration_sql_code "$1"); while IFS= read -r x; do [ -n "$x" ] || continue; if grep -qiwF -- "$x" <<<"$code" || { [ "$2" = y ] && ! grep -qxF -- "$x" <<<"$3"; }; then out="$out $x"; fi; done <<<"$4"; printf '%s' "${out# }"; }
+INVALID_HELP="An INVALID index is what a failed or cancelled CREATE INDEX CONCURRENTLY leaves: postgres keeps updating it but never uses it, and a rerun with IF NOT EXISTS skips it. Drop it (DROP INDEX CONCURRENTLY <name>;), fix the cause (for a UNIQUE index: the duplicate rows) and redeploy so the file builds it again. Never record the file by hand while the index is INVALID."
+PSQL -tAc "create table if not exists _powder_migrations(filename text primary key, applied_at timestamptz default now());" >/dev/null 2>&1
+
+# The ledger read MUST succeed. A deploy that starts right after the previous
+# one swapped the container can see this query fail transiently; an empty
+# result read as "0 tracked" (with auto-baseline skipped because the schema
+# query failed too) would replay the oldest schema file against a fully
+# migrated DB. An unreadable ledger is a hard stop, never "nothing applied".
+tracked=$(PSQL -tAc "select count(*) from _powder_migrations" 2>&1 | tr -d ' \r')
+case "$tracked" in
+  ''|*[!0-9]*) echo "[migrate] $APP: cannot read _powder_migrations ('$tracked') — aborting rather than treating the ledger as empty"; exit 1 ;;
+esac
+# Auto-baseline: first deploy of an app whose DB already has a schema => record, don't run.
+# FAIL CLOSED: the table count must be a number. It counts tables in EVERY schema
+# except the system ones (an app on a non-public schema is still a populated DB),
+# and an unreadable result (query failed, no information_schema visibility) is a
+# hard stop, never "0 tables" (which replays every migration on a live DB).
+if [ "$MODE" = "apply" ] && [ "$tracked" = "0" ]; then
+  pub=$(PSQL -tAc "select count(*) from information_schema.tables where table_schema not in ('pg_catalog','information_schema','pg_toast') and table_name <> '_powder_migrations'" 2>/dev/null); psql_rc=$?
+  pub=$(printf '%s' "$pub" | tr -d ' \r\n')
+  case "$pub" in
+    ''|*[!0-9]*) echo "[migrate] $APP: cannot count existing tables (got '${pub}', psql rc=$psql_rc) - aborting rather than assuming an empty database"; exit 1 ;;
+  esac
+  if [ "$psql_rc" -ne 0 ]; then echo "[migrate] $APP: table count query failed (psql rc=$psql_rc) - aborting"; exit 1; fi
+  if [ "$pub" -gt 0 ]; then MODE="baseline"; echo "[migrate] $APP: first run on existing schema ($pub tables) -> BASELINE (record, run nothing)"; fi
+fi
+echo "[migrate] $APP: container=$CTR dir=$MIG net=$NET mode=$MODE"
+applied=$(PSQL -tAc "select filename from _powder_migrations" 2>&1) || { echo "[migrate] $APP: cannot list _powder_migrations — aborting"; exit 1; }
+# A migration filename is interpolated into SQL and ends up in a ledger row, so
+# refuse anything outside a conservative charset BEFORE touching the database
+# (a repo can name a file with a quote and a SQL statement in it). Checked for
+# every file, applied or not, so one bad name stops the whole run.
+for f in ${FILES[@]+"${FILES[@]}"}; do
+  b=${f##*/}
+  if ! [[ "$b" =~ ^[A-Za-z0-9._-]+\.sql$ ]]; then
+    echo "[migrate] $APP: REFUSING migration filename '$b': only [A-Za-z0-9._-] and a .sql suffix are allowed - rename it"
+    exit 1
+  fi
+done
+# The filename reaches psql as a variable (-v b=..., read via :'b' on stdin, which
+# psql quotes as a literal), never spliced into the SQL text.
+record() { PSQL -v b="$1" -tA <<<"insert into _powder_migrations(filename) values (:'b') on conflict do nothing;" >/dev/null || { echo "[migrate] $APP: FAILED to record $1 in _powder_migrations - aborting (the file may be applied but untracked; fix the ledger by hand before redeploying)"; exit 1; }; }
+# defense in depth only. The guarantee is the hardened psql container above: no
+# capability, uid 70, read-only root, no privilege gain, inside the app's own network
+# namespace, so a program psql starts can reach exactly what the app container can on
+# the network (its DB, its networks) and nothing on the host, and cannot forge packets.
+# Before any migration runs, a pending one is refused when it has (1) a meta-command that
+# runs a program written out (`\!`, `\o |`, `\g |`, `\w |`, `\copy ... program`, `\e`,
+# a backquote; the whole line, psql reads meta-commands mid-line), or (2) outside SQL
+# strings and comments, a meta-command that sets, reads or redirects through variables or
+# files (`\set`, `\gset`, `\getenv`, `\setenv`, `\o`, `\g`, `\gx`, `\w`, `\i`, `\ir`,
+# `\include`, `\copy`, `\!`) or a psql variable (`:name`, `:'name'`, `:"name"`, `:{?name}`;
+# `::` casts pass): `\set x '|cmd'` + `\o :x` built the command from a variable.
+IFS= read -r -d '' PSQL_META_AWK <<'EOAWK' || true
+# psql meta-command / variable check (POSIX awk, mawk-safe). Prints
+# "<line>: <reason>" for the first hit and exits 1; exits 0 when clean.
+# Outside SQL strings ('...', E'...', "...", $tag$...$tag$) and comments (--, /* */):
+#   a backslash followed by set, gset, getenv, setenv, o, out, g, gx, w, write, i, ir,
+#   include, include_relative, copy, or !  (case-insensitive)
+#   a psql variable :name, :'name', :"name", :{?name}  (not ::)
+# Anywhere: standard_conforming_strings or backslash_quote (the string tracking assumes
+# standard strings).
+function idc(c) { return c ~ /[A-Za-z0-9_]/ }
+function hit(why) { print NR ": " why; bad = 1; exit 1 }
+BEGIN { st = 0; e = 0; tag = "" }
+{
+	# the string tracking below assumes standard strings: a file that changes how
+	# backslashes in '...' are read is refused (anywhere, any case)
+	if (tolower($0) ~ /standard_conforming_strings|backslash_quote/) hit("sets standard_conforming_strings / backslash_quote")
+	s = $0; n = length(s); i = 1
+	while (i <= n) {
+		c = substr(s, i, 1)
+		if (st == 1) {
+			if (e && c == "\\") { i += 2; continue }
+			if (c == "'") { if (substr(s, i + 1, 1) == "'") { i += 2; continue } st = 0 }
+			i++; continue
+		}
+		if (st == 2) { if (c == "\"") st = 0; i++; continue }
+		if (st == 3) { if (substr(s, i, length(tag)) == tag) { st = 0; i += length(tag); continue } i++; continue }
+		if (st == 4) { if (substr(s, i, 2) == "*/") { st = 0; i += 2; continue } i++; continue }
+		if (substr(s, i, 2) == "--") break
+		if (substr(s, i, 2) == "/*") { st = 4; i += 2; continue }
+		p = (i > 1) ? substr(s, i - 1, 1) : ""
+		if (c == "'") { st = 1; e = (p ~ /[Ee]/ && !(i > 2 && idc(substr(s, i - 2, 1)))); i++; continue }
+		if (c == "\"") { st = 2; i++; continue }
+		if (c == "$" && !idc(p)) {
+			rest = substr(s, i + 1)
+			if (match(rest, /^[A-Za-z_][A-Za-z0-9_]*\$/) || match(rest, /^\$/)) { tag = "$" substr(rest, 1, RLENGTH); st = 3; i += length(tag); continue }
+		}
+		if (c == "\\") {
+			w = tolower(substr(s, i + 1))
+			if (substr(w, 1, 1) == "!") hit("psql meta-command \\!")
+			if (match(w, /^(include_relative|include|gset|getenv|setenv|write|copy|set|out|gx|ir|o|g|w|i)/)) {
+				nx = substr(w, RLENGTH + 1, 1)
+				if (nx == "" || nx !~ /[a-z0-9_]/) hit("psql meta-command \\" substr(w, 1, RLENGTH))
+			}
+			i++; continue
+		}
+		if (c == ":") {
+			nx = substr(s, i + 1, 1)
+			if (nx == ":") { i += 2; continue }
+			if (nx ~ /[A-Za-z_]/) hit("psql variable :" substr(s, i + 1, 40))
+			if ((nx == "'" || nx == "\"") && substr(s, i + 2, 1) ~ /[A-Za-z_]/) hit("psql variable :" substr(s, i + 1, 40))
+			if (nx == "{" && substr(s, i + 2, 1) == "?") hit("psql variable :{?")
+		}
+		i++
+	}
+}
+END { exit bad }
+EOAWK
+PSQL_EXEC_ERE='\\!|\\(o|out|g|gx|w|write)[[:space:]]*[|]|\\copy.*[Pp][Rr][Oo][Gg][Rr][Aa][Mm]|\\(e|edit|ef|ev)([[:space:]]|$)|\\[A-Za-z]+[^`]*`'
+if [ "$MODE" = "apply" ]; then
+  for f in ${FILES[@]+"${FILES[@]}"}; do
+    b=${f##*/}
+    grep -qxF "$b" <<<"$applied" && continue
+    hit=$(grep -nE -m1 -- "$PSQL_EXEC_ERE" "$f" | cut -d: -f1)
+    if [ -n "$hit" ]; then
+      echo "[migrate] $APP: REFUSING migration $b: line $hit has a psql meta-command that runs a program (\\!, \\o |, \\g |, \\w |, \\copy program, \\e, or a backquote). Use plain SQL. Nothing was applied."
+      exit 1
+    fi
+    if ! meta=$(awk "$PSQL_META_AWK" "$f" 2>&1); then
+      echo "[migrate] $APP: REFUSING migration $b: line ${meta:-?} (psql meta-commands and psql variables are not allowed in migrations). Use plain SQL. Nothing was applied."
+      exit 1
+    fi
+  done
+fi
+# BEGIN migration-txn: kept byte-identical in bin/lib-migrations.sh and
+# infra/powder-migrate (the server copy cannot source the lib); a test compares them.
+# The SQL of a file with -- line comments and /* */ block comments removed (string
+# literals are not parsed: a "--" inside a quoted string cuts the rest of that line,
+# which can only hide a keyword, never invent one).
+IFS= read -r -d '' MIGRATION_SQL_CODE_AWK <<'EOSQLCODE' || true
+{
+  line = $0; out = ""
+  while (length(line) > 0) {
+    if (inblk) {
+      i = index(line, "*/")
+      if (i == 0) { line = ""; break }
+      line = substr(line, i + 2); inblk = 0; continue
+    }
+    a = index(line, "--"); b = index(line, "/*")
+    if (a == 0 && b == 0) { out = out line; break }
+    if (a > 0 && (b == 0 || a < b)) { out = out substr(line, 1, a - 1); break }
+    out = out substr(line, 1, b - 1); line = substr(line, b + 2); inblk = 1
+  }
+  print out
+}
+EOSQLCODE
+migration_sql_code() { awk "$MIGRATION_SQL_CODE_AWK" "$1"; }
+
+# Prints why the file cannot run inside a transaction block ("CONCURRENTLY":
+# CREATE INDEX CONCURRENTLY refuses a transaction; "ADD VALUE": an
+# ALTER TYPE ... ADD VALUE, PG12+ cannot use a new enum value in the transaction
+# that added it), or nothing. Comments do not count. Here-strings, not pipes: under
+# pipefail an early-exiting grep -q can SIGPIPE the writer and hide a match.
+migration_txn_exception() {
+  local code
+  code=$(migration_sql_code "$1" | tr '\n' ' ')
+  if grep -qiw 'concurrently' <<<"$code"; then echo CONCURRENTLY
+  elif grep -qiE '(^|[^[:alnum:]_])alter[[:space:]]+type[[:space:]][^;]*[[:space:]]add[[:space:]]+value([^[:alnum:]_]|$)' <<<"$code"; then echo "ADD VALUE"
+  fi
+}
+# END migration-txn
+
+pending=0; ran=0
+for f in ${FILES[@]+"${FILES[@]}"}; do
+  b=${f##*/}
+  # here-string, not a pipe: under pipefail an early-exiting grep -q can SIGPIPE
+  # printf, so an applied file could look pending and be replayed
+  grep -qxF "$b" <<<"$applied" && continue
+  pending=$((pending+1))
+  case "$MODE" in
+    baseline) record "$b"; echo "  baselined: $b" ;;
+    apply)    # One transaction per file, except the files migration_txn_exception names
+              # (CONCURRENTLY, ALTER TYPE .. ADD VALUE; comments do not count).
+              nt=$(migration_txn_exception "$f")
+              if [ -n "$nt" ]; then
+                echo "  applying: $b (non-transactional: $nt), without lock_timeout"
+                # A non-transactional file is never recorded while an index it names is
+                # INVALID. A failing catalog query only warns (it never fails a deploy).
+                inv_ok=y; inv_before=$(invalid_indexes) || { inv_ok=n; inv_before=""; echo "[migrate] $APP: WARNING: could not list invalid indexes before $b - only the indexes it names are checked"; }
+                if ! PSQL -f - < "$f"; then
+                  echo "[migrate] FAILED on $b - aborting (deploy should not swap)"
+                  if inv_after=$(settled_invalid_indexes); then
+                    left=$(bad_indexes "$f" "$inv_ok" "$inv_before" "$inv_after")
+                    [ -n "$left" ] && echo "[migrate] $APP: INVALID index(es) that $b names or left behind: $left. $INVALID_HELP"
+                  fi
+                  exit 1
+                fi
+                if inv_after=$(settled_invalid_indexes); then
+                  left=$(bad_indexes "$f" "$inv_ok" "$inv_before" "$inv_after")
+                  if [ -n "$left" ]; then echo "[migrate] FAILED on $b: INVALID index(es) it names or left behind: $left - not recorded, aborting (deploy should not swap). $INVALID_HELP"; exit 1; fi
+                else
+                  echo "[migrate] $APP: WARNING: could not list invalid indexes after $b - recording it unchecked"
+                fi
+              else
+                echo "  applying: $b"
+                PSQL_APPLY -1 -f - < "$f" || { echo "[migrate] FAILED on $b - aborting (deploy should not swap; 'canceling statement due to lock timeout' above means another session held a lock it needed for longer than lock_timeout=${LT_MS}ms)"; exit 1; }
+              fi
+              record "$b"; ran=$((ran+1)) ;;
+    status)   echo "  PENDING: $b" ;;
+  esac
+done
+echo "[migrate] $APP: pending=$pending ran=$ran tracked=$(PSQL -tAc 'select count(*) from _powder_migrations' 2>/dev/null | tr -d ' ')"

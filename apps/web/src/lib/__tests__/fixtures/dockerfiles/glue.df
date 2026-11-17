@@ -1,0 +1,5 @@
+FROM alpine
+COPY --chown=0\
+:0 a b
+RUN --network=none\
+ true
