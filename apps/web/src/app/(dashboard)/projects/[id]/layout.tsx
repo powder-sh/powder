@@ -11,7 +11,9 @@ import { EmptyState } from '@/components/ui/empty-state'
 import { BackLink } from '@/components/ui/page-header'
 import { Skeleton } from '@/components/ui/skeleton'
 import { StatusLabel } from '@/components/ui/status'
+import { useHint } from '@/components/ui/tooltip'
 import { APP_HEALTH } from '@/lib/app-health'
+import { redeployHint } from '@/lib/apps-table'
 import { cn } from '@/lib/cn'
 import {
 	Activity,
@@ -100,6 +102,7 @@ function Shell({ children }: { children: React.ReactNode }) {
 	// releases it at once.
 	const heldDeploy = activeDeploy?.status === 'queued' && activeDeploy.waiting ? activeDeploy : null
 	const status = project ? computeProjectStatus(deploys, uptime, project.container) : 'not_deployed'
+	const redeployTip = useHint(redeployHint(project?.branch, status === 'not_deployed'))
 
 	const redeploy = async () => {
 		setRedeploying(true)
@@ -229,6 +232,7 @@ function Shell({ children }: { children: React.ReactNode }) {
 						disabled={!!activeDeploy && !heldDeploy}
 						loading={redeploying}
 						className="self-start"
+						{...redeployTip.props}
 					>
 						{!redeploying && (
 							<RefreshCw className={cn('h-3.5 w-3.5', activeDeploy && !heldDeploy && 'animate-spin')} />
@@ -243,6 +247,7 @@ function Shell({ children }: { children: React.ReactNode }) {
 										: 'deploying…'
 									: 'redeploy'}
 					</Button>
+					{redeployTip.tooltip}
 				</div>
 				{heldDeploy?.waiting && <p className="text-xs text-muted-foreground">{heldDeploy.waiting}</p>}
 				{redeployError && (
@@ -256,7 +261,7 @@ function Shell({ children }: { children: React.ReactNode }) {
 			<nav
 				ref={tabsRef}
 				aria-label="app sections"
-				className="-mx-4 flex gap-0.5 overflow-x-auto border-b border-border px-4 [mask-image:linear-gradient(to_right,black_calc(100%-3rem),transparent)] [scrollbar-width:none] sm:mx-0 sm:px-0 sm:[mask-image:none] [&::-webkit-scrollbar]:hidden"
+				className="relative -mx-4 flex gap-0.5 overflow-x-auto border-b border-border px-4 [mask-image:linear-gradient(to_right,black_calc(100%-3rem),transparent)] [scrollbar-width:none] sm:mx-0 sm:px-0 sm:[mask-image:none] [&::-webkit-scrollbar]:hidden"
 			>
 				{tabs.map((tab) => {
 					const isActive = tab.exact

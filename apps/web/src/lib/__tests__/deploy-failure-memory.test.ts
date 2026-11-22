@@ -108,13 +108,125 @@ describe('parseDeployFailure carries the memory kind', () => {
 	it('test gate exit 137', () => {
 		expect(parseDeployFailure(gate(KILLED, '[test-gate]', 137)).errorSummary).toMatch(/^container-oom: the test gate was killed/)
 	})
-	it('ordinary test failure keeps the plain step summary', () => {
+	it('ordinary test failure names the failed tests, with no memory hint', () => {
 		const s = parseDeployFailure(gate(ORDINARY, '[test-gate]', 1)).errorSummary
-		expect(s).toBe('failed during: test gate')
+		expect(s).toBe('test-failure: first failing file: src/lib/price.test.ts, Tests 1 failed | 380 passed (381)')
 		expect(s).not.toMatch(/heap-oom|container-oom|NODE_OPTIONS/)
 	})
 	it('a heap message in an earlier step does not leak into a later failure', () => {
 		const log = `── docker compose build ──\nJavaScript heap out of memory (retried, ok)\n── test gate ──\n${ORDINARY}\n__POWDER_FAIL__ step=test gate code=1\n`
-		expect(parseDeployFailure(log).errorSummary).toBe('failed during: test gate')
+		const s = parseDeployFailure(log).errorSummary
+		expect(s).toMatch(/^test-failure: first failing file: src\/lib\/price\.test\.ts/)
+		expect(s).not.toMatch(/heap|NODE_OPTIONS/)
+	})
+})
+
+// A side worker printed a V8 heap crash,
+// the suite went on and failed one assertion. A memory signature only wins when no
+// assertion failures are reported after it.
+const SIDE_HEAP_THEN_ASSERTION = `> shop@1.0.0 test
+> vitest run
+
+ ✓ __tests__/a.test.ts (12 tests) 40ms
+FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory
+ ✓ __tests__/b.test.ts (3 tests) 10ms
+ FAIL  __tests__/pipeline-content.test.ts > pipeline > renders the summary
+AssertionError: expected 'a' to be 'b'
+ Test Files  1 failed | 233 passed (234)
+      Tests  1 failed | 2301 passed (2302)`
+
+const ASSERTION_THEN_HEAP_ABORT = ` FAIL  src/x.test.ts > y
+AssertionError: expected 1 to be 2
+<--- JS stacktrace --->
+FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory
+Aborted (core dumped)`
+
+const WORKER_CRASH_ONLY = `FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory
+ FAIL  src/big.test.ts [ src/big.test.ts ]
+Error: Worker exited unexpectedly
+ Test Files  1 failed | 10 passed (11)`
+
+const NODE_TEST_FAIL = `FATAL ERROR: Ineffective mark-compacts near heap limit Allocation failed - JavaScript heap out of memory
+not ok 3 - parses dates
+# tests 40
+# pass 39
+# fail 1`
+
+const NODE_TEST_PASS_COUNT = `# tests 40
+# pass 40
+# fail 0
+FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory`
+
+const BUILD_STEP = ['docker', 'compose', 'build'].join(' ')
+const build = (body: string) =>
+	`── ${BUILD_STEP} ──\n#12 [build 6/8] RUN npm run lint && npm run docs:check && npm test\n${body}\nERROR: process "/bin/sh -c npm run lint && npm run docs:check && npm test" did not complete successfully: exit code: 1\n__POWDER_FAIL__ step=${BUILD_STEP} code=1\n`
+
+describe('a heap message does not win over real test failures', () => {
+	it('side-process heap crash + assertion failure: not heap-oom', () => {
+		expect(classifyMemoryFailure(SIDE_HEAP_THEN_ASSERTION, BUILD_STEP)).toBeNull()
+		expect(classifyMemoryFailure(gate(SIDE_HEAP_THEN_ASSERTION, '[test-gate]', 1), 'test gate')).toBeNull()
+	})
+	it('parseDeployFailure names it a test failure with the first failing file', () => {
+		const s = parseDeployFailure(build(SIDE_HEAP_THEN_ASSERTION)).errorSummary
+		expect(s).toMatch(/^test-failure: /)
+		expect(s).toContain('__tests__/pipeline-content.test.ts')
+		expect(s).not.toMatch(/heap-oom|OOM-killed|--max-old-space-size/)
+	})
+	it('node --test "# fail 1" after a heap message is a test failure', () => {
+		expect(classifyMemoryFailure(NODE_TEST_FAIL, 'test gate')).toBeNull()
+		expect(parseDeployFailure(gate(NODE_TEST_FAIL, '[test-gate]', 1)).errorSummary).toMatch(/^test-failure: /)
+	})
+	it('the run aborted on the heap crash (after the failures): heap-oom', () => {
+		expect(classifyMemoryFailure(ASSERTION_THEN_HEAP_ABORT, 'test gate')?.kind).toBe('heap-oom')
+	})
+	it('a file that failed only because its worker died is the crash: heap-oom', () => {
+		expect(classifyMemoryFailure(WORKER_CRASH_ONLY, 'test gate')?.kind).toBe('heap-oom')
+	})
+	it('"# fail 0" is no failure: heap-oom', () => {
+		expect(classifyMemoryFailure(NODE_TEST_PASS_COUNT, 'test gate')?.kind).toBe('heap-oom')
+	})
+	it('an npm test as BuildKit prints it (tests in a RUN step, "#16 84.84 " prefixes): test-failure', () => {
+		const log = [
+			`── ${BUILD_STEP} ──`,
+			'#16 [build 6/8] RUN npm run lint && npm run docs:check && npm test',
+			'#16 12.03 > shop@1.0.0 test',
+			'#16 12.03 > vitest run',
+			'#16 40.11  ✓ __tests__/a.test.ts (12 tests) 40ms',
+			'#16 84.84 FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory',
+			'#16 85.02  ✓ __tests__/b.test.ts (3 tests) 10ms',
+			'#16 90.50  FAIL  __tests__/pipeline-content.test.ts > pipeline > renders the summary',
+			"#16 90.50 AssertionError: expected 'a' to be 'b'",
+			'#16 91.08  Test Files  1 failed | 233 passed (244)',
+			'#16 91.08       Tests  1 failed | 2301 passed (2302)',
+			'#16 ERROR: process "/bin/sh -c npm run lint && npm run docs:check && npm test" did not complete successfully: exit code: 1',
+			`__POWDER_FAIL__ step=${BUILD_STEP} code=1`,
+		].join('\n')
+		const s = parseDeployFailure(log).errorSummary
+		expect(s).toMatch(/^test-failure: /)
+		expect(s).toMatch(/^test-failure: first failing file: __tests__\/pipeline-content\.test\.ts, /)
+		expect(s).not.toMatch(/heap-oom|OOM-killed|--max-old-space-size/)
+	})
+	it('BuildKit-prefixed "Test Files  0 failed" then a heap abort stays heap-oom', () => {
+		const log = [
+			`── ${BUILD_STEP} ──`,
+			'#16 60.00  Test Files  0 failed | 10 passed (10)',
+			'#16 61.20 FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory',
+			'#16 ERROR: process "/bin/sh -c npm test" did not complete successfully: exit code: 134',
+			`__POWDER_FAIL__ step=${BUILD_STEP} code=1`,
+		].join('\n')
+		expect(parseDeployFailure(log).errorSummary).toMatch(/^heap-oom: /)
+	})
+	it('jest worker deaths are the crash, not assertions: heap-oom', () => {
+		for (const crash of [
+			'A jest worker process (pid=4242) was terminated by another process: signal=SIGABRT',
+			'Call retries were exceeded',
+		]) {
+			const text = `FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory\nFAIL src/big.test.ts\n  ● Test suite failed to run\n    ${crash}\nTest Suites: 1 failed, 20 passed, 21 total`
+			expect(classifyMemoryFailure(text, 'test gate')?.kind).toBe('heap-oom')
+		}
+	})
+	it('the existing heap-oom cases still win', () => {
+		expect(parseDeployFailure(gate(TSC_HEAP)).errorSummary).toMatch(/^heap-oom: /)
+		expect(parseDeployFailure(build(TSC_HEAP)).errorSummary).toMatch(/^heap-oom: /)
 	})
 })

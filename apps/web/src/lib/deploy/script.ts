@@ -1,8 +1,11 @@
 import { gitCmd, gitHardenShellFunctions } from '../git-harden'
+import { APP_SRC_LINK_TEST, appCheckoutDirShell } from '../app-checkout'
+import { GIT_REMOTE_UNREADABLE } from './tool-lines'
 import { DEPLOY_BUDGET_SEC } from '../deploy-budget'
 import { appLockDirShell, appLockPath, supersedeCheckShell, swapGateShell, swapPrevPath, swapStampPath } from '../deploy-supersede'
 import { SERVICE_FIELD_AWK, bridgeShellFunctions, fontFetchRetryShellFunctions, onServerComposeGuardShell, childTimeoutPrefix, composeProjectStableShell, projectChangedMarkerFor, imageLabelGuardShell, infraCountShell, infraMountGuardShell, serviceImageLabelGuardShell, testGateShell, testGateStopShell, swapCheckShellFunctions, trackedDotenvGuardShell } from './fragments'
 import type { SwapCheckPlan } from './fragments'
+import { drainActiveFor } from '../drain-mode'
 import { lockedPruneShell } from './prune-lock'
 import { shq } from '../shell'
 import { buildLockShell } from '../build-lock'
@@ -12,13 +15,33 @@ import type { DockerfileImageAuthority } from '../compose-safety'
 import { protectExistingIgnoreShell, writeDockerignoreShell } from '../app-runtime-files'
 import { OVERRIDE_FILE, deployOverrideDirFor, isPowderTempComposeFile } from '../compose-override'
 import { targetLinkGuardShell, targetLinkSourcesShell } from '../target-links'
-import { migratePathScanShell, stabilityMarkShell, testGatePresenceShell } from './stability'
+import { migratePathScanShell, stabilityMarkShell, stabilityMarkerFor, syncedShaMarkerFor, testGatePresenceShell, testGateResultMark } from './stability'
 
 /** Shell: print the nonce-tagged sha marker (no-op without a nonce). */
 function shaMarkerShell(safeDir: string, nonce: string): string {
 	return nonce
-		? `  echo "__POWDER_SHA_${nonce}__ $(${gitCmd(safeDir)} rev-parse HEAD) $(${gitCmd(safeDir)} rev-parse --abbrev-ref HEAD)" && `
+		? `  echo "${syncedShaMarkerFor(nonce)} $(${gitCmd(safeDir)} rev-parse HEAD) $(${gitCmd(safeDir)} rev-parse --abbrev-ref HEAD)" && `
 		: ''
+}
+/** Shell (inside a `then` branch where the repo compose already differs from the
+ *  runtime one): decide whether that difference is news. Only a deploy whose commit
+ *  range (last successful deploy's sha .. HEAD) changed docker-compose.yml prints the
+ *  WARNING and the 'drift' mark; standing drift (a leftover repo compose that never
+ *  matched the server file) prints an info line and 'standing', which neither raises
+ *  nor resolves the card (deploy/compose-drift-inventory.ts; composeDriftVerdict is
+ *  the same rule). A base missing from the clone (a fresh or shallow clone) is fetched
+ *  once. With no usable base (first deploy, sha not fetchable, git error) it falls back
+ *  to the WARNING and 'drift': a committed change is never hidden for lack of a base. */
+function composeDriftShell(g: string, baseSha: string | null, nonce: string, warning: string): string {
+	const base = baseSha && /^[0-9a-f]{40}$/.test(baseSha) ? baseSha : null
+	const mark = (v: 'drift' | 'standing') => (nonce ? stabilityMarkShell(nonce, 'compose-drift', v) : '')
+	const warn = `echo ${shq(warning)}; ${mark('drift')}`
+	if (!base) return `    ${warn}`
+	return (
+		`    if { ${g} cat-file -e "${base}^{commit}" 2>/dev/null || { ${g} fetch origin "${base}" >/dev/null 2>&1 && ${g} cat-file -e "${base}^{commit}" 2>/dev/null; }; } && ${g} diff --no-ext-diff --no-textconv --quiet ${base} HEAD -- docker-compose.yml 2>/dev/null; then ` +
+		`echo "[compose-drift] info: the repo docker-compose.yml differs from the runtime compose, but no commit since the last deploy (${base.slice(0, 12)}) changed it: standing drift (fleet inventory, no card)."; ${mark('standing')}` +
+		`else ${warn}fi; `
+	)
 }
 import { GITHUB_KNOWN_HOSTS_SETUP, GIT_SSH_HOSTKEY_OPTS, gitResolveTarget, repoSymlinkGuardShell, workdirSyncShell } from '../ssh/git'
 
@@ -79,6 +102,9 @@ export function buildDeployScript(p: {
 	/** Random per-run token: the synced commit is reported as `__POWDER_SHA_<nonce>__ <sha> <branch>`,
 	 *  so build/test output cannot forge the recorded git sha. */
 	shaNonce?: string
+	/** The drain for this deploy (drain-mode.ts); unset = drainActiveFor(app) from the env
+	 *  (off unless POWDER_DRAIN turns it on). Off renders the script exactly as before it. */
+	drain?: boolean
 	/** Every compose file (-f) of the app; the workdir-layout sync preserves those under the workdir. */
 	composeFiles?: string[]
 	/** BuildKit cache namespace of this app (build-cache.ts, from its powder_meta salt).
@@ -97,6 +123,7 @@ export function buildDeployScript(p: {
 	const opts = { migrateApp: p.migrateApp }
 	const shaNonce = (p.shaNonce ?? '').replace(/[^A-Za-z0-9]/g, '')
 	const app = p.migrateApp ?? service
+	const drain = p.drain ?? drainActiveFor(app)
 	const ns = (p.cacheNamespace ?? '').replace(/[^0-9a-f]/g, '')
 	// Compose args for every command that may BUILD an image (build, up, run): powder's
 	// rewritten-Dockerfile override and the pulled-sibling pin ride along.
@@ -147,7 +174,11 @@ export function buildDeployScript(p: {
 		`SWAPPED=0; PREVF=${shq(ord ? prevFile : '')}; ` +
 		// Always drop the staged build tag + override file on exit. After a swap the
 		// shared tag already points at the same image, so this only untags.
-		`trap 'rc=$?; bridge_stop; ${swapOn ? 'swap_stop; ' : ''}release_stop; if [ "$rc" -ne 0 ] && [ "$SWAPPED" != 1 ]; then release_restore; fi; if [ -n "$STAGE_IMG" ] && [ "$CG_RECHECK" != 1 ]; then docker rmi "$STAGE_IMG" >/dev/null 2>&1 || true; fi; if [ -n "$STAGE_F" ]; then rm -f "\${STAGE_F#-f }"; fi; if [ -n "$DFR_DIR" ] && [ "$DFR_DIR" != "\${DFR_FINAL:-}" ]; then rm -rf "$DFR_DIR"; fi; if [ -n "$PREVF" ]; then rm -f "$PREVF"; fi; rm -f "\${__ffo:-}"; tg_stop; if [ "$rc" -ne 0 ]; then echo "__POWDER_FAIL__ step=$LAST_STEP code=$rc"; fi' EXIT; ` +
+		// Drain on: drain_trap_first deletes the drain rules before anything prints, then
+		// survives a dead stdout (B_DEAD=1). A dead stdout before the swap counts as a
+		// failure (release_restore runs) and keeps the abort record PREVF, so the worker's
+		// restoreSharedTagAfterAbort still runs as when the trap died there.
+		`trap 'rc=$?; ${drain ? `drain_trap_first; if [ "$B_DEAD" = 1 ] && [ "$SWAPPED" != 1 ] && [ "$rc" -eq 0 ]; then rc=1; fi; bridge_restore_old; ` : ''}bridge_stop; ${swapOn ? 'swap_stop; ' : ''}release_stop; if [ "$rc" -ne 0 ] && [ "$SWAPPED" != 1 ]; then release_restore; fi; if [ -n "$STAGE_IMG" ] && [ "$CG_RECHECK" != 1 ]; then docker rmi "$STAGE_IMG" >/dev/null 2>&1 || true; fi; if [ -n "$STAGE_F" ]; then rm -f "\${STAGE_F#-f }"; fi; if [ -n "$DFR_DIR" ] && [ "$DFR_DIR" != "\${DFR_FINAL:-}" ]; then rm -rf "$DFR_DIR"; fi; if [ -n "$PREVF" ]${drain ? ` && { [ "$B_DEAD" != 1 ] || [ "$SWAPPED" = 1 ]; }` : ''}; then rm -f "$PREVF"; fi; rm -f "\${__ffo:-}"; tg_stop; if [ "$rc" -ne 0 ]; then echo "__POWDER_FAIL__ step=$LAST_STEP code=$rc"; fi' EXIT; ` +
 		// ONE deadline for the whole script (the outer `timeout` in
 		// runDeployScript enforces it; see DEPLOY_BUDGET_SEC). Every wait inside
 		// - lock waits, the build, the test gate - draws from what is LEFT of it
@@ -174,7 +205,7 @@ export function buildDeployScript(p: {
 		fontFetchRetryShellFunctions(`[ "$(left 240)" -ge 300 ]`, 'el_guard') +
 		// Zero-downtime bridge helpers (see bridgeShellFunctions). bridge_stop is
 		// also called from the EXIT trap above, so every exit path removes the bridge.
-		bridgeShellFunctions(cf, service, workingDir, shaNonce) +
+		bridgeShellFunctions(cf, service, workingDir, shaNonce, stabilityMarkerFor(shaNonce), drain) +
 		(swapOn ? swapCheckShellFunctions(cfb, service, workingDir, p.migrateApp ?? service, swapOn) : '') +
 		dockerfileRewriteFunctions(app) +
 		// PER-APP DEPLOY LOCK (build + swap), held until the script exits. Two
@@ -257,13 +288,14 @@ export function buildDeployScript(p: {
 		// ls-remote exercises exactly the credentials the fetch will use (KEY is
 		// already exported above when present), so it also catches a revoked key
 		// or token - which no file check ever could.
-		`if [ -L src ]; then echo "preflight: refusing, src is a symlink (repo-controlled link; the src/ checkout must be a real directory)"; exit 1; fi && PF_GITDIR=""; if [ -d src/.git ]; then PF_GITDIR=src; elif [ -d .git ]; then PF_GITDIR=.; fi && ` +
+		// where the checkout is: one authority (lib/app-checkout.ts), shared with the dashboard
+		`if ${APP_SRC_LINK_TEST}; then echo "preflight: refusing, src is a symlink (repo-controlled link; the src/ checkout must be a real directory)"; exit 1; fi && ${appCheckoutDirShell('PF_GITDIR')} && ` +
 		`if [ -n "$PF_GITDIR" ]; then ` +
 		`  PF_REMOTE=$(${gitCmd(shq('*'), '"$PF_GITDIR"')} remote get-url origin 2>/dev/null || echo "") && ` +
 		`  if [ -n "$PF_REMOTE" ]; then ` +
 		`    step "preflight git auth" && ` +
 		`    if ! PF_LS=$(${gitCmd(shq('*'), '"$PF_GITDIR"')} ls-remote --heads origin 2>&1); then ` +
-		`      echo "preflight: cannot read the git remote - the deploy would build whatever is already on disk instead of your push. remote=$(printf '%s' "$PF_REMOTE" | sed -E 's#://[^@/]*@#://***@#') :: $(printf '%s' "$PF_LS" | tail -2 | tr '\n' ' ')"; ` +
+		`      echo "${GIT_REMOTE_UNREADABLE} - the deploy would build whatever is already on disk instead of your push. remote=$(printf '%s' "$PF_REMOTE" | sed -E 's#://[^@/]*@#://***@#') :: $(printf '%s' "$PF_LS" | tail -2 | tr '\n' ' ')"; ` +
 		`      echo "preflight: check the deploy key at $KEY, the ssh-config Host alias, or the token in the remote URL."; ` +
 		`      exit 1; ` +
 		`    fi; ` +
@@ -313,9 +345,15 @@ export function buildDeployScript(p: {
 		// Easy to miss: a compose edit can sit dead in git for hours. Warn loudly,
 		// never fail the deploy. Skip when the runtime compose IS the repo file.
 		`  if [ -f src/docker-compose.yml ] && [ "$(readlink -f src/docker-compose.yml)" != "$(readlink -f ${shq(configFile)})" ] && ! diff -q src/docker-compose.yml ${shq(configFile)} >/dev/null 2>&1; then ` +
-		`    echo "[compose-drift] WARNING: the repo docker-compose.yml differs from the runtime compose ("${shq(configFile)}"). Committed compose changes DO NOT deploy - apply them to the runtime file on the server too, or they silently never go live."; ` +
-		// the nonce-tagged marker for the compose-drift card (deploy/stability.ts).
-		(shaNonce ? `    ${stabilityMarkShell(shaNonce, 'compose-drift', 'drift')}else ${stabilityMarkShell(shaNonce, 'compose-drift', 'ok')}` : '') +
+		// Only a compose change in this deploy's commit range is a WARNING + 'drift'
+		// mark (the compose-drift card, deploy/stability.ts); standing drift is info + 'standing'.
+		composeDriftShell(
+			gitCmd(shq('*'), 'src'),
+			p.baseSha ?? null,
+			shaNonce,
+			`[compose-drift] WARNING: the repo docker-compose.yml differs from the runtime compose (${configFile}). Committed compose changes DO NOT deploy - apply them to the runtime file on the server too, or they silently never go live.`,
+		) +
+		(shaNonce ? `else ${stabilityMarkShell(shaNonce, 'compose-drift', 'ok')}` : '') +
 		`  fi; ` +
 		`elif [ -d .git ]; then ` +
 		// WORKDIR layout (no src/: the app dir is the checkout). Force the SOURCE to match GitHub
@@ -349,8 +387,13 @@ export function buildDeployScript(p: {
 		// compose is TRACKED, so a post-restore diff vs HEAD means the repo's
 		// committed compose is not what actually runs. Warn, never fail.
 		`  (if ! ${gitCmd(shq(workingDir))} diff --no-ext-diff --no-textconv --quiet HEAD -- docker-compose.yml 2>/dev/null; then ` +
-		`    echo "[compose-drift] WARNING: the repo's committed docker-compose.yml differs from the runtime compose this deploy preserved. Committed compose changes DO NOT deploy - apply them to the server file too, or they silently never go live."; ` +
-		(shaNonce ? `    ${stabilityMarkShell(shaNonce, 'compose-drift', 'drift')}else ${stabilityMarkShell(shaNonce, 'compose-drift', 'ok')}` : '') +
+		composeDriftShell(
+			gitCmd(shq(workingDir)),
+			p.baseSha ?? null,
+			shaNonce,
+			"[compose-drift] WARNING: the repo's committed docker-compose.yml differs from the runtime compose this deploy preserved. Committed compose changes DO NOT deploy - apply them to the server file too, or they silently never go live.",
+		) +
+		(shaNonce ? `else ${stabilityMarkShell(shaNonce, 'compose-drift', 'ok')}` : '') +
 		`  fi) && ` +
 		// the workdir IS the build context in this layout (and in a preview's),
 		// next to .deploy-key and the env. The hard reset puts back a tracked
@@ -553,8 +596,9 @@ export function buildDeployScript(p: {
 			app: p.migrateApp ?? service,
 			loginSelf: p.dockerfileAuthority?.self || (p.migrateApp ?? service),
 			loginHosts: p.dockerfileAuthority?.loginHosts ?? [],
+			resultMark: testGateResultMark(shaNonce),
 		}) +
-		`else echo "[test-gate] no .powder/test.sh in $TG_DIR - skipped (opt-in test/typecheck gate; see /docs/deploys#steps-in-order)"; ${stabilityMarkShell(shaNonce, 'test-gate', 'absent')}fi && `) +
+		`else echo "[test-gate] no .powder/test.sh in $TG_DIR - skipped (opt-in test/typecheck gate; see /docs/deploys#steps-in-order)"; ${stabilityMarkShell(shaNonce, 'test-gate', 'absent')}${stabilityMarkShell(shaNonce, 'test-gate-result', 'none')}fi && `) +
 		// Run pending DB migrations BEFORE swapping the new container in (Vercel
 		// order: migrate, then promote). powder-migrate is tracked + auto-baselines
 		// an existing DB on first run, so it never re-applies an already-applied
@@ -691,6 +735,11 @@ export function buildDeployScript(p: {
 		//     old retry only force-removed the primary service.
 		//   - Has-infra ($TARGETS = the app service): surgical rm of just the
 		//     app container + its orphans, leaving db/kv running.
+		// Bridged swap: refuse new connections to the old container, let its requests in
+		// flight finish, then stop it (bridge_drain_old, fragments.ts drainShellFunctions),
+		// so the recreate below finds it stopped. After the guard on purpose: a refusal
+		// must leave the old container serving. No bridge: a no-op, compose stops it.
+		(drain ? `el_guard && { bridge_drain_old || true; } && ` : '') +
 		`el_guard && (docker compose ${cfb} up -d --force-recreate \${TARGETS:+--no-deps} $TARGETS 2>&1 || ` +
 		// Every retry re-runs the guard before it removes anything and again right before
 		// its up (el_guard exits this subshell on a refusal, so no later attempt runs).

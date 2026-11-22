@@ -28,6 +28,10 @@ describe('getGitStatus dir check', () => {
 			currentSha: null,
 			upstreamSha: null,
 			dirty: false,
+			checkout: 'unknown',
+			checkoutDir: null,
+			staleWorkdirGit: false,
+			upstreamError: null,
 		})
 		expect(runCommand).not.toHaveBeenCalled()
 	})

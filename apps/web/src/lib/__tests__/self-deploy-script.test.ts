@@ -39,7 +39,7 @@ case "$2" in
 esac
 case "$*" in
   *"env-pin-report.ts"*) [ -n "$STUB_PIN_FAIL" ] && { echo "[env-pin-report] failed: connect ECONNREFUSED"; exit 1; }; echo "[env-pin-report] 0 apps need attention"; exit 0;;
-  *"check-config"*) [ -n "$STUB_CONFIG_BAD" ] && { echo "__POWDER_CONFIG_BAD__ the new powder would refuse to start:"; echo " - BETTER_AUTH_SECRET is only 8 characters"; exit 1; }; echo "[config-check] powder.env passes"; exit 0;;
+  *"check-config"*) [ -n "$STUB_CONFIG_BROKEN" ] && { echo 'exec: "pnpm": executable file not found in $PATH'; exit 127; }; [ -n "$STUB_CONFIG_BAD" ] && { echo "__POWDER_CONFIG_BAD__ the new powder would refuse to start:"; echo " - BETTER_AUTH_SECRET is only 8 characters"; exit 1; }; echo "[config-check] powder.env passes"; exit 0;;
   *".powder-build-cache-id"*) printf '%s' 0123456789abcdef0123456789abcdef; exit 0;;
   *"powder-pgdata"*) [ "$STUB_LAYOUT_SSH_FAIL" = 1 ] && exit 255; [ -n "$STUB_BANNER" ] && echo "$STUB_BANNER"; echo "\${STUB_LAYOUT:-private}"; exit 0;;
   *"docker inspect -f ok powder-postgres"*) [ -n "$STUB_PG_NEW" ] && echo ok; exit 0;;
@@ -304,23 +304,30 @@ describe('bin/self-deploy.sh (stubbed)', () => {
 		expect(bad.res.stderr).toContain('refusing to recreate')
 		// built, checked in the NEW worker image, never recreated
 		expect(bad.log).toContain('build worker')
-		expect(bad.log).toContain('run --rm --no-deps -T --entrypoint pnpm worker -F @powder/web exec tsx src/check-config.ts')
+		expect(bad.log).toContain('run --rm --no-deps -T --entrypoint node worker --import tsx src/check-config.ts')
 		expect(bad.log).not.toContain('force-recreate')
 		const good = run(['--skip-migrations'], FILES)
 		expect(good.res.status).toBe(0)
 		expect(good.log.indexOf('check-config')).toBeLessThan(good.log.indexOf('force-recreate'))
 	})
 
+	it('a config check that cannot run stops the deploy too (never skipped silently)', () => {
+		const r = run(['--skip-migrations'], FILES, { STUB_CONFIG_BROKEN: '1' })
+		expect(r.res.status).toBe(1)
+		expect(r.res.stderr).toContain('could not run the config check')
+		expect(r.log).not.toContain('force-recreate')
+	})
+
 	it('--pin-report builds and prints the env target report, then stops', () => {
 		const r = run(['--pin-report'], FILES)
 		expect(r.res.status).toBe(0)
 		expect(r.log).toContain('build worker')
-		expect(r.log).toContain('exec tsx src/env-pin-report.ts')
+		expect(r.log).toContain('--import tsx src/env-pin-report.ts')
 		expect(r.log).not.toContain('force-recreate')
 		expect(r.log).not.toContain('powder_deploy_migrations')
 		// its own image tags: docker-compose.pin-report.yml on the build and the report run
 		expect(r.log).toContain('-f docker-compose.yml -f docker-compose.pin-report.yml build worker')
-		expect(r.log).toMatch(/-f docker-compose\.pin-report\.yml run --rm --no-deps -T --entrypoint pnpm worker -F @powder\/web exec tsx src\/env-pin-report\.ts/)
+		expect(r.log).toMatch(/-f docker-compose\.pin-report\.yml run --rm --no-deps -T --entrypoint node worker --import tsx src\/env-pin-report\.ts/)
 		// a normal run prints the report before the recreate
 		const full = run(['--skip-migrations'], FILES)
 		expect(full.log.indexOf('env-pin-report')).toBeGreaterThan(-1)

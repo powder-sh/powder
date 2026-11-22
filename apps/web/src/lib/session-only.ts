@@ -124,6 +124,8 @@ export const TOKEN_ROUTES: readonly string[] = [
 	'GET /api/projects/*/ci',
 	'GET /api/projects/*/context',
 	'GET /api/projects/*/domains',
+	// the www / apex probe of the app's own live domains: a read, no secret
+	'GET /api/projects/*/domains/www',
 	'GET /api/projects/*/env/*/history',
 	'POST /api/projects/*/env/*/rollback',
 	'DELETE /api/projects/*/env/*',

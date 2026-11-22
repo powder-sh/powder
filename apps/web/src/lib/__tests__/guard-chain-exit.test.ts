@@ -76,7 +76,7 @@ esac`,
 	return { rc: r.status, out: `${r.stdout}${r.stderr}`, log: existsSync(calls) ? readFileSync(calls, 'utf8') : '' }
 }
 
-describe('a guard that returns non-zero stops the deploy', { timeout: 30_000 }, () => {
+describe('a guard that returns non-zero stops the deploy', () => {
 	for (const ordinal of [true, false]) {
 		it(`compose hash guard returns 3 without exit (${ordinal ? 'ordinal' : 'legacy'} script)`, () => {
 			const r = run(true, ordinal)

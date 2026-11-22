@@ -1,9 +1,9 @@
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { type ExpectStatic, describe, expect, it } from 'vitest'
 import { pathWithout } from './hermetic'
 import {
 	type BootstrapFacts,
@@ -11,7 +11,12 @@ import {
 	DOCKER_APT_KEY_FINGERPRINT,
 	DOCKER_MAJOR,
 	DOCKER_VERSION,
+	DYNAMIC_DIR_MISSING,
+	DYNAMIC_DIR_UNUSED,
 	INSPECT_MARKER,
+	NETWORK_INTERNAL_ABSENT,
+	NETWORK_WEB_ABSENT,
+	NETWORK_WEB_MISSING,
 	PRUNE_CRON_FILE,
 	PRUNE_CRON_LINE,
 	TRAEFIK_IMAGE,
@@ -26,13 +31,21 @@ import {
 	installPruneCronCommand,
 	installTraefikLogrotateCommand,
 	isCheckGreen,
+	missingPieces,
 	mkdirCommand,
+	networkCommand,
 	parseCheckOutput,
 	planApply,
 	renderCheckScript,
 	startTraefikCommand,
+	fileProviderUnused,
+	networkWebNotUsed,
 	traefikBlocker,
+	traefikNetworkMissing,
+	traefikNotAttached,
 } from '../server-bootstrap'
+import { type InspectJson, traefikConfigHostPath, traefikNetworkFrom } from '../traefik-network'
+import { renderComposeYaml } from '../compose-render'
 import { shq } from '../shell'
 
 const DYN = '/opt/infra/traefik/dynamic'
@@ -158,15 +171,65 @@ describe('checkItems', () => {
 		expect(isCheckGreen(items)).toBe(true)
 		expect(items.find((i) => i.id === 'ufw')?.state).toBe('info')
 	})
-	it('a missing file provider or network fails the check on a traefik server', () => {
+	it('a missing file provider or network web fails the check on a traefik server', () => {
 		expect(
 			isCheckGreen(checkItems(facts({ traefikFileProvider: 'missing' }), DYN, 'traefik')),
 		).toBe(false)
 		expect(
 			isCheckGreen(
-				checkItems(facts({ networks: { web: 'present', internal: 'absent' } }), DYN, 'traefik'),
+				checkItems(facts({ networks: { web: 'absent', internal: 'present' } }), DYN, 'traefik'),
 			),
 		).toBe(false)
+	})
+	it('network web is required on traefik servers only (the new-app flow creates it elsewhere); internal is optional everywhere', () => {
+		const traefikNoWeb = checkItems(facts({ networks: { web: 'absent', internal: 'present' } }), DYN, 'traefik')
+		// on a Traefik server web is its routing network here (nothing names another)
+		expect(traefikNoWeb.find((i) => i.id === 'traefik-network')).toMatchObject({
+			label: 'network web',
+			state: 'missing',
+			detail: NETWORK_WEB_MISSING,
+		})
+		expect(isCheckGreen(traefikNoWeb)).toBe(false)
+		for (const proxy of ['nginx', 'nginx-container'] as const) {
+			const nginxNoNets = checkItems(
+				facts({ traefik: 'absent', traefikFileProvider: 'n/a', dynamicDir: 'absent', networks: { web: 'absent', internal: 'absent' } }),
+				DYN,
+				proxy,
+			)
+			expect(nginxNoNets.find((i) => i.id === 'network-web'), proxy).toMatchObject({ state: 'info', detail: NETWORK_WEB_ABSENT })
+			expect(isCheckGreen(nginxNoNets), proxy).toBe(true)
+			expect(missingPieces(nginxNoNets), proxy).toEqual([])
+		}
+		for (const proxy of ['traefik', 'nginx', 'nginx-container'] as const) {
+			const noInternal = checkItems(facts({ networks: { web: 'present', internal: 'absent' } }), DYN, proxy)
+			expect(noInternal.find((i) => i.id === 'network-internal'), proxy).toMatchObject({
+				state: 'info',
+				detail: NETWORK_INTERNAL_ABSENT,
+			})
+			expect(isCheckGreen(noInternal), proxy).toBe(true)
+			expect(missingPieces(noInternal), proxy).toEqual([])
+		}
+		// the template really names web on every proxy, and internal only on opt-in
+		for (const traefik of [true, false]) {
+			const yml = renderComposeYaml({
+				name: 'demo',
+				dockerfilePath: 'Dockerfile',
+				hostPort: traefik ? null : 3100,
+				containerPort: 3000,
+				envFilePath: '/opt/apps/demo.env',
+				publicHost: traefik ? 'demo.apps.example.com' : null,
+				traefik,
+				postgres: null,
+				kv: null,
+			})
+			expect(yml, String(traefik)).toMatch(/^networks:\n {2}web:\n {4}external: true\n/m)
+			expect(yml, String(traefik)).not.toMatch(/^ {2}internal:/m)
+		}
+	})
+	it('the dynamic dir is required on traefik servers, for domain redirects', () => {
+		const items = checkItems(facts({ dynamicDir: 'absent' }), DYN, 'traefik')
+		expect(items.find((i) => i.id === 'dynamic-dir')).toMatchObject({ state: 'missing', detail: DYNAMIC_DIR_MISSING })
+		expect(missingPieces(items)).toEqual([{ id: 'dynamic-dir', label: DYN, detail: DYNAMIC_DIR_MISSING }])
 	})
 	it('nginx servers: no traefik, file provider or dynamic dir is info, never missing', () => {
 		for (const proxy of ['nginx', 'nginx-container'] as const) {
@@ -423,7 +486,7 @@ describe('planApply never touches existing infrastructure', () => {
 			if (!f.root && steps.length > 0) bad.push(`non-root steps: ${tag()}`)
 		}
 		expect(bad.slice(0, 5)).toEqual([])
-	}, 30_000)
+	})
 })
 
 // Port detection and the runtime guard under a real shell with stub tools:
@@ -574,6 +637,7 @@ describe('bin/server-bootstrap.sh stays in sync', () => {
 			installTraefikLogrotateCommand(),
 			createNetworkCommand('web'),
 			createNetworkCommand('internal'),
+			networkCommand('"$TNET"'),
 			mkdirCommand(shq('/opt/apps')),
 			mkdirCommand(SH),
 			startTraefikCommand(SH),
@@ -583,6 +647,352 @@ describe('bin/server-bootstrap.sh stays in sync', () => {
 		]) {
 			for (const l of norm(cmd)) expect(lines.has(l), l).toBe(true)
 		}
+	})
+	// The script's req / treq / info lines and checkItems() are two renderings of one
+	// rule set: run the real script (check mode, stub docker) and compare the state of
+	// every proxy-dependent item with checkItems() on the same facts. The stub docker
+	// answers from env: STUB_NETS (networks that exist: name, name:internal or
+	// name:internal:project), STUB_TRAEFIK (running/absent), STUB_TATT (networks traefik
+	// is attached to), STUB_TPROJ (its compose project) and STUB_ARGS (its command
+	// line, as a JSON array body).
+	function stubDocker(): string {
+		const root = mkdtempSync(join(tmpdir(), 'bs-parity-'))
+		const bin = join(root, 'bin')
+		mkdirSync(bin)
+		writeFileSync(join(bin, 'id'), '#!/bin/sh\necho "${STUB_UID:-1000}"\n', { mode: 0o755 })
+		writeFileSync(
+			join(bin, 'docker'),
+			[
+				'#!/bin/sh',
+				'case "$1" in',
+				'info) exit 0 ;;',
+				'version) echo 29.0.0 ;;',
+				'compose) exit 0 ;;',
+				'network)',
+				'  if [ "$2" = ls ]; then for n in $STUB_NETS; do case "$n" in *:*:*) echo "$n" ;; *:*) echo "$n:" ;; *) echo "$n:false:" ;; esac; done; exit 0; fi',
+				'  for n in $STUB_NETS; do [ "${n%%:*}" = "$3" ] && exit 0; done; exit 1 ;;',
+				'inspect)',
+				'  [ "$STUB_TRAEFIK" = running ] || exit 1',
+				'  case "$*" in',
+				'  *NetworkSettings*) echo "$STUB_TATT " ;;',
+				'  *compose.project*) echo "${STUB_TPROJ:-}" ;;',
+				'  *-f*) echo true ;;',
+				'  *) printf \'[\\n  {\\n    "Args": [%s],\\n    "Mounts": [{"Source": "%s", "Destination": "/etc/traefik/dynamic"}%s]\\n  }\\n]\\n\' "$STUB_ARGS" "$POWDER_TRAEFIK_DYNAMIC_DIR" "${STUB_MOUNTS:-}" ;;',
+				'  esac ;;',
+				'esac',
+				'exit 0',
+			].join('\n'),
+			{ mode: 0o755 },
+		)
+		return root
+	}
+	const SCRIPT = join(__dirname, '../../../../../bin/server-bootstrap.sh')
+	// One script run forks a few hundred times and does little else, so on a loaded
+	// machine its wall time is mostly waiting to be scheduled. The parity cases below
+	// run it without blocking the event loop (spawn, not spawnSync) as concurrent tests,
+	// each case its own test with its own time limit, so the waits overlap.
+	const bash = (args: string[], env: NodeJS.ProcessEnv) =>
+		new Promise<{ status: number | null; stdout: string }>((resolve, reject) => {
+			const p = spawn('bash', args, { env, stdio: ['ignore', 'pipe', 'ignore'] })
+			let stdout = ''
+			p.stdout.setEncoding('utf8').on('data', (d: string) => {
+				stdout += d
+			})
+			p.on('error', reject)
+			p.on('close', (status) => resolve({ status, stdout }))
+		})
+	// a stub shared by the whole describe: it only reads env, so concurrent cases can use it
+	const STUB = stubDocker()
+	const lineStates = (out: string, label: string) =>
+		out
+			.split('\n')
+			.map((l) => /^ {2}(ok|missing|info|warn) +(.*)$/.exec(l))
+			.filter((m): m is RegExpExecArray => !!m && m[2].startsWith(`${label} `))
+			.map((m) => m[1])
+	// What the dashboard computes from the same stub: the shared check body run under
+	// it, parsed, the Traefik network resolved (traefikNetworkFrom), then checkItems().
+	async function dashboardItems(env: NodeJS.ProcessEnv, proxy: BootstrapProxy, dyn: string, redirects: boolean) {
+		const out = (await bash(['-c', renderCheckScript(shq(dyn))], env)).stdout
+		const { facts: partial, inspectJson } = parseCheckOutput(out)
+		let inspect: InspectJson | null = null
+		try {
+			inspect = (JSON.parse(inspectJson) as InspectJson[])[0] ?? null
+		} catch {
+			inspect = null
+		}
+		// the config file the dashboard reads (the same lookup, then cat)
+		const cfgPath = inspect ? traefikConfigHostPath(inspect) : null
+		const config = cfgPath && existsSync(cfgPath) ? { text: readFileSync(cfgPath, 'utf8'), path: cfgPath } : null
+		const f: BootstrapFacts = {
+			...partial,
+			// the stub mounts the dir; the flag is in its args or not
+			traefikFileProvider:
+				partial.traefik === 'absent' ? 'n/a' : inspectJson.includes('providers.file.directory') ? 'ok' : 'missing',
+			traefikNetwork: traefikNetworkFrom({
+				traefik: partial.traefik !== 'absent',
+				inspect,
+				networks: partial.dockerNetworks ?? null,
+				attached: partial.traefikAttached ?? null,
+				project: partial.traefikProject ?? null,
+				config,
+			}),
+		}
+		return { f, items: checkItems(f, dyn, proxy, {}, redirects), plan: planApply(f, shq(dyn), proxy, {}, redirects) }
+	}
+	// The same facts built by hand (no second shell run), for the wide matrix.
+	function handItems(o: Opts, dyn: string) {
+		const names = o.nets.split(/\s+/).filter(Boolean)
+		const running = o.traefik === 'running'
+		const inspect: InspectJson | null = running ? (JSON.parse(`[{"Args": [${o.args}]}]`) as InspectJson[])[0] ?? null : null
+		const dockerNetworks = names.map((n) => ({ name: n.split(':')[0] ?? n, internal: n.split(':')[1] === 'true' }))
+		const attached = running ? o.tatt.split(/\s+/).filter(Boolean) : null
+		const f = facts({
+			networks: {
+				web: dockerNetworks.some((n) => n.name === 'web') ? 'present' : 'absent',
+				internal: dockerNetworks.some((n) => n.name === 'internal') ? 'present' : 'absent',
+			},
+			dockerNetworks,
+			traefik: o.traefik,
+			traefikAttached: attached,
+			traefikFileProvider: running ? (o.args.includes('providers.file.directory') ? 'ok' : 'missing') : 'n/a',
+			traefikNetwork: traefikNetworkFrom({ traefik: running, inspect, networks: dockerNetworks, attached }),
+			dynamicDir: o.dir ? 'present' : 'absent',
+		})
+		return { f, items: checkItems(f, dyn, o.proxy, {}, o.redirects) }
+	}
+	type Opts = { proxy: BootstrapProxy; nets: string; traefik: 'running' | 'absent'; tatt: string; args: string; dir: boolean; redirects: boolean; tproj?: string; mounts?: string }
+	// unsure: the script cannot read the mounted config with certainty, so its network
+	// lines are informational and are not compared with the dashboard's
+	// ex: the calling test's own expect (concurrent tests must not share the global one)
+	async function compare(ex: ExpectStatic, where: string, o: Opts, byHand = false, uid = '1000', unsure = false) {
+		// a fresh dynamic dir per case, so concurrent cases never see each other's
+		const dyn = join(mkdtempSync(join(STUB, 'case-')), 'dynamic')
+		if (o.dir) mkdirSync(dyn)
+		const env = {
+			...process.env,
+			PATH: `${join(STUB, 'bin')}:${process.env.PATH}`,
+			POWDER_TRAEFIK_DYNAMIC_DIR: dyn,
+			STUB_NETS: o.nets,
+			STUB_TRAEFIK: o.traefik,
+			STUB_TATT: o.tatt,
+			STUB_ARGS: o.args,
+			STUB_TPROJ: o.tproj ?? '',
+			STUB_MOUNTS: o.mounts ?? '',
+			STUB_UID: uid,
+		}
+		const [r, dash] = await Promise.all([
+			bash([SCRIPT, '--proxy', o.proxy, '--redirects', o.redirects ? 'yes' : 'no'], env),
+			byHand ? null : dashboardItems(env, o.proxy, dyn, o.redirects),
+		])
+		const { f, items, plan } = dash ?? { ...handItems(o, dyn), plan: null }
+		// every item the two renderings share, by label
+		for (const i of items) {
+			if (unsure && /^(network |traefik on |traefik networks)/.test(i.label)) continue
+			if (!/^(network |traefik on |traefik container|traefik file provider|traefik networks)/.test(i.label) && i.label !== dyn) continue
+			ex(lineStates(r.stdout, i.label), `${where}: ${i.label}`).toEqual([i.state])
+		}
+		// and no line the dashboard does not have
+		for (const label of unsure ? ['network internal', 'traefik file provider', dyn] : ['network web', 'network internal', 'traefik file provider', 'traefik networks', dyn]) {
+			const want = items.filter((i) => i.label === label).map((i) => i.state)
+			ex(lineStates(r.stdout, label), `${where}: ${label}`).toEqual(want)
+		}
+		return { r, f, items, plan }
+	}
+	const POWDER_ARGS = '"--providers.docker.network=web", "--providers.file.directory=/etc/traefik/dynamic"'
+	// The script marks each piece required, optional or n/a exactly as checkItems() does:
+	// every combination of proxy, networks, traefik, dynamic dir and redirects.
+	const matrix: Opts[] = []
+	for (const proxy of ['traefik', 'nginx', 'nginx-container'] as const) {
+		for (const nets of ['web internal', 'web', 'internal', '']) {
+			for (const traefik of ['running', 'absent'] as const) {
+				for (const dir of [true, false]) {
+					// the redirects fact only changes anything on traefik servers
+					for (const redirects of proxy === 'traefik' ? [true, false] : [true]) {
+						matrix.push({ proxy, nets, traefik, tatt: 'web', args: POWDER_ARGS, dir, redirects })
+					}
+				}
+			}
+		}
+	}
+	const where = (o: Opts) => `${o.proxy} nets=[${o.nets}] traefik=${o.traefik} dir=${o.dir} redirects=${o.redirects}`
+	it.concurrent.for(matrix.map((o) => [where(o), o] as const))(
+		'the script marks each piece required, optional or n/a exactly as checkItems() does: %s',
+		async ([name, o], { expect: ex }) => {
+			await compare(ex, name, o, true)
+		},
+	)
+	it('the matrix covers all 64 combinations, in the same words', () => {
+		expect(matrix).toHaveLength(64)
+		expect(new Set(matrix.map(where)).size).toBe(64)
+		// and the same words
+		expect(script).toContain(`req missing 'network web' '${NETWORK_WEB_MISSING}'`)
+		expect(script).toContain(`line info 'network web' '${NETWORK_WEB_ABSENT}'`)
+		expect(script).toContain(`line info 'network internal' '${NETWORK_INTERNAL_ABSENT}'`)
+		expect(script).toContain(`'${DYNAMIC_DIR_MISSING}' '${DYNAMIC_DIR_UNUSED}'`)
+		expect(script).toContain(`"${traefikNetworkMissing('$TNET')}"`)
+		expect(script).toContain(`"${networkWebNotUsed('$TNET', true)}"`)
+		expect(script).toContain(`"${networkWebNotUsed('$TNET', false)}"`)
+		expect(script).toContain(`"${traefikNotAttached('$TNET')}"`)
+		// with --redirects no the script cannot see a file provider set in a traefik.yml:
+		// it never says "not configured", only "not found in its flags"
+		expect(script).not.toContain(`"${fileProviderUnused('$DYN')}"`)
+		expect(script).toContain('"not found in its flags: no file provider on $DYN in the traefik flags (a traefik.yml config is only checked by the dashboard)')
+	})
+	describe('both renderings resolve the same Traefik network; only a declared one is routed over', () => {
+		// resolved: what traefikNetworkFrom reports; route: what powder uses (flag or config, else web)
+		const cases: Array<{ name: string; nets: string; tatt: string; args: string; resolved: string; route: string; green: boolean; hint: boolean; tproj?: string }> = [
+			// the flag names a network other than web; web does not exist
+			{ name: 'flag', nets: 'edge internal', tatt: 'edge', args: '"--providers.docker.network=edge", "--providers.file.directory=/etc/traefik/dynamic"', resolved: 'edge', route: 'edge', green: true, hint: false },
+			// the flag as two arguments
+			{ name: 'flag, two args', nets: 'edge', tatt: 'edge', args: '\n      "--providers.docker.network",\n      "edge"\n    ', resolved: 'edge', route: 'edge', green: true, hint: false },
+			// no flag, attached to one non-web network (and an internal one): reported, powder keeps web
+			{ name: 'attached', nets: 'shared private:true', tatt: 'private shared', args: '"--providers.docker=true"', resolved: 'shared', route: 'web', green: false, hint: true },
+			// attached to web and others: web
+			{ name: 'several with web', nets: 'web zeta', tatt: 'zeta web', args: '"--providers.docker=true"', resolved: 'web', route: 'web', green: true, hint: false },
+			// attached to several non-web: the first by name is reported, powder keeps web
+			{ name: 'several', nets: 'zeta alpha web', tatt: 'zeta alpha', args: '"--providers.docker=true"', resolved: 'alpha', route: 'web', green: false, hint: true },
+			// a network of another compose project (an app's own) is never picked
+			{ name: 'other project', nets: 'appnet:false:shop proxynet:false:edge', tatt: 'appnet proxynet', args: '"--providers.docker=true"', resolved: 'proxynet', route: 'web', green: false, hint: true, tproj: 'edge' },
+			{ name: 'only another project', nets: 'appnet:false:shop web', tatt: 'appnet web', args: '"--providers.docker=true"', resolved: 'web', route: 'web', green: true, hint: false },
+			// the flag names a network traefik is not attached to: required, missing
+			{ name: 'not attached', nets: 'edge other', tatt: 'other', args: '"--providers.docker.network=edge"', resolved: 'edge', route: 'edge', green: false, hint: false },
+			// the flag names a network that does not exist
+			{ name: 'network gone', nets: 'other', tatt: 'other', args: '"--providers.docker.network=edge"', resolved: 'edge', route: 'edge', green: false, hint: false },
+		]
+		it.concurrent.for(cases.map((c) => [c.name, c] as const))('%s', async ([, c], { expect }) => {
+			const o = { proxy: 'traefik' as const, nets: c.nets, traefik: 'running' as const, tatt: c.tatt, args: c.args, dir: true, redirects: false, tproj: c.tproj }
+			// the plan, as root: the same network steps, never web when Traefik routes over
+			// another network, and the attach left to the operator
+			const [{ r, f, items }, asRoot] = await Promise.all([compare(expect, c.name, o), compare(expect, `${c.name} (root)`, o, false, '0')])
+			expect(f.traefikNetwork?.name, c.name).toBe(c.resolved)
+			expect(items.find((i) => i.id === 'traefik-network')?.label, c.name).toBe(`network ${c.route}`)
+			expect(r.stdout, c.name).toMatch(new RegExp(`^ {2}(ok|missing) +network ${c.route} `, 'm'))
+			expect(items.some((i) => i.id === 'traefik-network-undeclared'), c.name).toBe(c.hint)
+			const routing = items.filter((i) => ['traefik-network', 'traefik-attached', 'network-web'].includes(i.id))
+			expect(routing.every((i) => i.state !== 'missing'), c.name).toBe(c.green)
+			const tsSteps = (asRoot.plan?.steps ?? []).map((st) => st.id).filter((id) => id.startsWith('network-') || id === 'mkdir-dynamic')
+			const shSteps = [...asRoot.r.stdout.matchAll(/^--- (network_\w+|mkdir_dynamic)$/gm)].map((m) => (m[1] ?? '').replaceAll('_', '-'))
+			expect(shSteps, c.name).toEqual(tsSteps)
+			if (c.route !== 'web') expect(tsSteps, c.name).not.toContain('network-web')
+			const exists = c.nets.split(' ').some((n) => n.split(':')[0] === c.route)
+			expect(tsSteps.includes(c.route === 'web' ? 'network-web' : 'network-traefik'), c.name).toBe(!exists)
+			const attachSkipped = (asRoot.plan?.skipped ?? []).some((k) => k.id === 'traefik-network')
+			expect(attachSkipped, c.name).toBe(!c.tatt.split(' ').includes(c.route))
+			expect(asRoot.r.stdout.includes('not done automatically: traefik-network:'), c.name).toBe(attachSkipped)
+		})
+		// no traefik yet: web, what powder's own Traefik runs on
+		it.concurrent('no traefik', async ({ expect }) => {
+			const none = await compare(expect, 'no traefik', { proxy: 'traefik', nets: 'web', traefik: 'absent', tatt: '', args: '', dir: true, redirects: false })
+			expect(none.f.traefikNetwork?.name).toBe('web')
+			expect(none.f.traefikNetwork?.source).toBe('default')
+		})
+	})
+	// A network declared only in a mounted config file: the script reads it when the
+	// form leaves no doubt, else says the dashboard reads it and gives no network advice.
+	it.concurrent('a network declared in a mounted traefik config: the script reads a plain form, else stays silent', async ({ expect }) => {
+		const box = mkdtempSync(join(tmpdir(), 'bs-cfg-'))
+		const mount = (file: string, dest = '/etc/traefik/traefik.yml') =>
+			`,\n      {\n        "Type": "bind",\n        "Source": "${file}",\n        "Destination": "${dest}",\n        "Mode": "ro",\n        "RW": false\n      }`
+		const write = (name: string, text: string) => {
+			const f = join(box, name)
+			writeFileSync(f, text)
+			return f
+		}
+		const base = { proxy: 'traefik' as const, nets: 'infra backplane:true', traefik: 'running' as const, tatt: 'infra backplane', args: '"--providers.file.directory=/etc/traefik/dynamic"', dir: true, redirects: false }
+		const ADVICE = /docker network connect|set providers\.docker\.network/
+		const readable: Array<[string, string, string]> = [
+			// block style, sibling keys before and after network, comments
+			['block', 'traefik.yml', '# static\nentryPoints:\n  web:\n    address: ":80"\nproviders:\n  docker:\n    endpoint: "unix:///var/run/docker.sock"\n    exposedByDefault: false\n    network: infra # routing\n    watch: true\n  file:\n    directory: /etc/traefik/dynamic\n    watch: true\n'],
+			// flow mapping for docker
+			['flow', 'traefik.yml', 'providers:\n  docker: { endpoint: "unix:///var/run/docker.sock", exposedByDefault: false, network: "infra" }\n  file:\n    directory: /etc/traefik/dynamic\n'],
+			// TOML
+			['toml', 'traefik.toml', '[providers.docker]\n  exposedByDefault = false\n  network = "infra"\n\n[providers.file]\n  directory = "/etc/traefik/dynamic"\n'],
+		]
+		const readRuns = readable.map(async ([name, file, text]) => {
+			const f = write(`${name}-${file}`, text)
+			const { r, f: facts_, items } = await compare(expect, `config ${name}`, { ...base, mounts: mount(f, `/etc/traefik/${file}`) })
+			expect(facts_.traefikNetwork, name).toMatchObject({ name: 'infra', source: 'config' })
+			expect(items.filter((i) => i.state === 'missing').map((i) => i.id), name).not.toContain('traefik-network')
+			expect(lineStates(r.stdout, 'network infra'), name).toEqual(['ok'])
+			expect(lineStates(r.stdout, 'traefik on infra'), name).toEqual(['ok'])
+			expect(r.stdout, name).toContain(`exists; Traefik routes over it (providers.docker.network in ${f})`)
+			expect(r.stdout, name).not.toMatch(ADVICE)
+		})
+		// a form the script cannot read with certainty (anchors and a merge key): the
+		// dashboard resolves it, the script gives the caveat and no network advice
+		const unsure = [
+			['merge', write('merge.yml', 'x-docker: &docker\n  network: infra\nproviders:\n  docker:\n    <<: *docker\n    exposedByDefault: false\n')],
+			['missing file', join(box, 'gone.yml')],
+		] as const
+		const unsureRuns = unsure.map(async ([name, f]) => {
+			const { r, f: facts_ } = await compare(expect, `config ${name}`, { ...base, mounts: mount(f) }, false, '0', true)
+			if (name === 'merge') expect(facts_.traefikNetwork, name).toMatchObject({ name: 'infra', source: 'config' })
+			expect(r.stdout, name).toContain(`a static config file is mounted (${f}) that only the dashboard reads fully`)
+			expect(r.stdout, name).not.toMatch(ADVICE)
+			expect(r.stdout, name).not.toMatch(/^ {2}missing +(network |traefik on )/m)
+			expect(r.stdout, name).not.toMatch(/^--- network_(web|traefik)$/m)
+		})
+		// a mounted config without a docker network: the attached rule, as without one
+		const plain = write('plain.yml', 'providers:\n  file:\n    directory: /etc/traefik/dynamic\n    watch: true\n')
+		const [{ r, f: facts_ }] = await Promise.all([compare(expect, 'config without network', { ...base, mounts: mount(plain) }), ...readRuns, ...unsureRuns])
+		expect(facts_.traefikNetwork).toMatchObject({ name: 'infra', source: 'attached' })
+		expect(lineStates(r.stdout, 'network web')).toEqual(['missing'])
+		expect(r.stdout).toContain('traefik is attached to infra; set providers.docker.network')
+	}, 90_000)
+	// "Handled elsewhere" counts only files cron and logrotate really load: the real
+	// script and the dashboard (shared check body, parsed) under a sandboxed /etc.
+	describe('only files the daemons load count as handled elsewhere: script and dashboard agree', () => {
+		const LIVE = '17 * * * * root /usr/local/bin/powder-image-prune >> /var/log/powder-image-prune.log 2>&1\n'
+		const STANZA = '/var/log/traefik/*.log {\n  weekly\n}\n'
+		const cases: Array<{ name: string; files: Record<string, string>; cron: string; cronStep: boolean; lr: string; lrStep: boolean }> = [
+			// a backup copy (a dotted name cron skips) next to the live file: no warning
+			{ name: 'cron .bak copy next to the live file', files: { 'cron.d/powder-image-prune': LIVE, 'cron.d/powder-image-prune.bak-old': LIVE }, cron: 'ok', cronStep: false, lr: 'warn', lrStep: true },
+			// only the backup copy: not handled, the install is planned
+			{ name: 'only a cron .bak copy', files: { 'cron.d/powder-image-prune.bak-old': LIVE }, cron: 'warn', cronStep: true, lr: 'warn', lrStep: true },
+			// a live line in /etc/crontab counts
+			{ name: 'crontab line', files: { crontab: LIVE }, cron: 'ok', cronStep: false, lr: 'warn', lrStep: true },
+			// a .dpkg-old logrotate file only (a taboo extension logrotate skips): not handled
+			{ name: 'only a .dpkg-old logrotate file', files: { 'logrotate.d/traefik.dpkg-old': STANZA }, cron: 'warn', cronStep: true, lr: 'warn', lrStep: true },
+			// a commented-out stanza: not handled
+			{ name: 'commented-out stanza', files: { 'logrotate.d/traefik': STANZA.split('\n').map((l) => (l ? `# ${l}` : l)).join('\n') }, cron: 'warn', cronStep: true, lr: 'warn', lrStep: true },
+			// a live stanza: handled, no second file
+			{ name: 'live stanza', files: { 'logrotate.d/traefik': STANZA }, cron: 'warn', cronStep: true, lr: 'ok', lrStep: false },
+			// logrotate loads a .bak file (not a taboo extension): it counts
+			{ name: 'logrotate .bak', files: { 'logrotate.d/traefik.bak': STANZA }, cron: 'warn', cronStep: true, lr: 'ok', lrStep: false },
+			// and a hidden file (it skips only . and ..)
+			{ name: 'logrotate dotfile', files: { 'logrotate.d/.traefik': STANZA }, cron: 'warn', cronStep: true, lr: 'ok', lrStep: false },
+			// .dpkg-tmp is in logrotate's built-in taboo table
+			{ name: 'logrotate .dpkg-tmp', files: { 'logrotate.d/traefik.dpkg-tmp': STANZA }, cron: 'warn', cronStep: true, lr: 'warn', lrStep: true },
+		]
+		it.concurrent.for(cases.map((c) => [c.name, c] as const))('%s', async ([, c], { expect }) => {
+			const box = mkdtempSync(join(tmpdir(), 'bs-etc-'))
+			const etc = join(box, 'etc')
+			const ubin = join(box, 'usrbin')
+			for (const d of ['cron.d', 'logrotate.d']) mkdirSync(join(etc, d), { recursive: true })
+			mkdirSync(ubin)
+			for (const h of ['powder-migrate', 'powder-image-prune']) writeFileSync(join(ubin, h), '#!/bin/sh\n', { mode: 0o755 })
+			const sandbox = (t: string) => t.replaceAll('/etc/', `${etc}/`).replaceAll('/usr/local/bin/', `${ubin}/`)
+			for (const [f, text] of Object.entries(c.files)) writeFileSync(join(etc, f), sandbox(text))
+			mkdirSync(join(box, 'bin'))
+			const sh = join(box, 'bin/server-bootstrap.sh')
+			writeFileSync(sh, sandbox(script), { mode: 0o755 })
+			const env = { ...process.env, PATH: `${join(STUB, 'bin')}:${process.env.PATH}`, STUB_UID: '0', STUB_TRAEFIK: 'absent', STUB_NETS: 'web internal', POWDER_TRAEFIK_DYNAMIC_DIR: join(box, 'dyn') }
+			const [r, { stdout: out }] = await Promise.all([
+				bash([sh, '--proxy', 'traefik', '--redirects', 'no'], env),
+				bash(['-c', sandbox(renderCheckScript(shq(join(box, 'dyn'))))], env),
+			])
+			const f: BootstrapFacts = { ...parseCheckOutput(out).facts, traefikFileProvider: 'n/a' }
+			const items = checkItems(f, join(box, 'dyn'), 'traefik', {}, false)
+			const plan = planApply(f, shq(join(box, 'dyn')), 'traefik', {}, false).steps.map((st) => st.id)
+			expect(items.find((i) => i.id === 'image-prune-cron')?.state, c.name).toBe(c.cron)
+			expect(lineStates(r.stdout, 'image prune cron'), c.name).toEqual([c.cron])
+			expect(items.find((i) => i.id === 'traefik-logrotate')?.state, c.name).toBe(c.lr)
+			expect(lineStates(r.stdout, 'traefik log rotation'), c.name).toEqual([c.lr])
+			expect(plan.includes('install-image-prune-cron'), c.name).toBe(c.cronStep)
+			expect(/^--- install_image_prune_cron$/m.test(r.stdout), c.name).toBe(c.cronStep)
+			expect(plan.includes('install-traefik-logrotate'), c.name).toBe(c.lrStep)
+			expect(/^--- install_traefik_logrotate$/m.test(r.stdout), c.name).toBe(c.lrStep)
+		})
 	})
 	it('--apply without --proxy refuses before checking anything', () => {
 		const r = spawnSync(
@@ -622,7 +1032,8 @@ describe('bin/server-bootstrap.sh stays in sync', () => {
 		expect(script).toContain('if [ "$PROXY" != traefik ]; then echo')
 		expect(script).toContain('[ "$(get nginx_bin)" != absent ]')
 		expect(script).toContain('case "$(get port_bindings)" in')
-		expect(script).toContain('[ "$PROXY" = traefik ] && STEPS+=(mkdir_dynamic)')
+		expect(script).toContain('[ "$PROXY" = traefik ] && [ "$REDIRECTS" = yes ] && STEPS+=(mkdir_dynamic)')
+		expect(script).toMatch(/^REDIRECTS=yes$/m)
 	})
 })
 
@@ -813,6 +1224,7 @@ describe('image prune cron', () => {
 			prep(cron, bin)
 			const cmd = installPruneCronCommand()
 				.replaceAll('/etc/cron.d', cron)
+				.replaceAll('/etc/crontab', join(dir, 'crontab'))
 				.replaceAll("'/usr/local/bin/powder-image-prune'", `'${bin}/powder-image-prune'`)
 				.replace('chown root:root "$C" && ', '')
 			return { r: spawnSync('bash', ['-c', cmd], { encoding: 'utf8' }), file: join(cron, 'powder-image-prune'), cron }
@@ -921,6 +1333,78 @@ describe('traefik access log', () => {
 		expect(again.stdout).toContain('exists, left as is')
 		expect(readFileSync(file, 'utf8')).toBe('mine\n')
 		expect(TRAEFIK_LOGROTATE_FILE).toBe('/etc/logrotate.d/powder-traefik')
+	})
+})
+
+describe('a helper the operator already has elsewhere is never added twice', () => {
+	const tmpEtc = () => {
+		const etc = join(mkdtempSync(join(tmpdir(), 'dup-')), 'etc')
+		mkdirSync(join(etc, 'logrotate.d'), { recursive: true })
+		mkdirSync(join(etc, 'cron.d'), { recursive: true })
+		return etc
+	}
+	const sub = (etc: string, c: string) => c.replaceAll('/etc/', `${etc}/`).replace('chown root:root "$C" && ', '')
+	const checkLine = (key: string) => renderCheckScript(W).split('\n').find((l) => l.includes(`echo "${key}=`)) ?? ''
+	it('logrotate: another file naming /var/log/traefik is found by the path, not the file name', () => {
+		const etc = tmpEtc()
+		const run = () => spawnSync('bash', ['-c', sub(etc, checkLine('traefik_logrotate_other'))], { encoding: 'utf8' }).stdout.trim()
+		expect(run()).toBe('traefik_logrotate_other=')
+		writeFileSync(join(etc, 'logrotate.d/proxy'), '# rotates /var/log/traefik/access.log\n')
+		expect(run()).toBe('traefik_logrotate_other=')
+		writeFileSync(join(etc, 'logrotate.d/proxy'), '/var/log/traefik/access.log {\n  weekly\n}\n')
+		expect(run()).toBe('traefik_logrotate_other=proxy')
+		// powder's own file is not "another" one
+		spawnSync('rm', [join(etc, 'logrotate.d/proxy')])
+		writeFileSync(join(etc, 'logrotate.d/powder-traefik'), `${TRAEFIK_LOGROTATE_LINES.join('\n')}\n`)
+		expect(run()).toBe('traefik_logrotate_other=')
+	})
+	it('logrotate: handled elsewhere is ok and planned nowhere; both files is a warning; the step re-checks', () => {
+		const f = (traefikLogrotate: BootstrapFacts['traefikLogrotate'], other: string | null) =>
+			facts({ traefikLogrotate, traefikLogrotateOther: other })
+		const item = (x: BootstrapFacts) => checkItems(x, DYN, 'traefik').find((i) => i.id === 'traefik-logrotate')
+		expect(item(f('absent', 'proxy'))).toMatchObject({ state: 'ok' })
+		expect(item(f('absent', 'proxy'))?.detail).toContain('/etc/logrotate.d/proxy already rotates /var/log/traefik')
+		expect(planApply(f('absent', 'proxy'), W, 'traefik').steps.map((s) => s.id)).not.toContain('install-traefik-logrotate')
+		expect(item(f('current', 'proxy'))).toMatchObject({ state: 'warn' })
+		expect(item(f('current', 'proxy'))?.detail).toContain('duplicate entry')
+		expect(parseCheckOutput('traefik_logrotate_other=proxy\n').facts.traefikLogrotateOther).toBe('proxy')
+		expect(parseCheckOutput('traefik_logrotate_other=\n').facts.traefikLogrotateOther).toBeNull()
+		expect(parseCheckOutput('traefik_logrotate_other=../x\n').facts.traefikLogrotateOther).toBeNull()
+		// the step itself: another file appeared since the check, so nothing is written
+		const etc = tmpEtc()
+		writeFileSync(join(etc, 'logrotate.d/proxy'), '/var/log/traefik/*.log {\n  daily\n}\n')
+		const r = spawnSync('bash', ['-c', sub(etc, installTraefikLogrotateCommand())], { encoding: 'utf8' })
+		expect(r.status).toBe(0)
+		expect(r.stdout).toContain('already rotates /var/log/traefik')
+		expect(existsSync(join(etc, 'logrotate.d/powder-traefik'))).toBe(false)
+	})
+	it('image prune cron: a line in /etc/crontab or another cron.d file counts as handled', () => {
+		const etc = tmpEtc()
+		const run = () => spawnSync('bash', ['-c', sub(etc, checkLine('prune_cron_other'))], { encoding: 'utf8' }).stdout.trim()
+		expect(run()).toBe('prune_cron_other=')
+		writeFileSync(join(etc, 'crontab'), '# 17 * * * * root /usr/local/bin/powder-image-prune\n')
+		expect(run()).toBe('prune_cron_other=')
+		writeFileSync(join(etc, 'cron.d/maintenance'), '5 * * * * root /usr/local/bin/powder-image-prune\n')
+		expect(run()).toBe('prune_cron_other=cron.d/maintenance')
+		const f = (pruneCron: BootstrapFacts['pruneCron']) =>
+			facts({
+				helpers: { migrate: 'present', imagePrune: 'present', resourceGuard: 'absent' },
+				pruneCron,
+				pruneCronOther: 'cron.d/maintenance',
+			})
+		const item = (x: BootstrapFacts) => checkItems(x, DYN, 'traefik').find((i) => i.id === 'image-prune-cron')
+		expect(item(f('absent'))).toMatchObject({ state: 'ok' })
+		expect(planApply(f('absent'), W, 'traefik').steps.map((s) => s.id)).not.toContain('install-image-prune-cron')
+		expect(planApply(f('no-crond'), W, 'traefik').skipped.map((s) => s.id)).not.toContain('image-prune-cron')
+		expect(item(f('current'))).toMatchObject({ state: 'warn' })
+		// the step re-checks: no second line
+		const bin = mkdtempSync(join(tmpdir(), 'dupbin-'))
+		writeFileSync(join(bin, 'powder-image-prune'), '#!/bin/sh\n', { mode: 0o755 })
+		const cmd = sub(etc, installPruneCronCommand()).replaceAll("'/usr/local/bin/powder-image-prune'", `'${bin}/powder-image-prune'`)
+		const r = spawnSync('bash', ['-c', cmd], { encoding: 'utf8' })
+		expect(r.status).toBe(0)
+		expect(r.stdout).toContain('already runs powder-image-prune')
+		expect(existsSync(join(etc, 'cron.d/powder-image-prune'))).toBe(false)
 	})
 })
 

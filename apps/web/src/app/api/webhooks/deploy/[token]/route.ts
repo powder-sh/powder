@@ -4,9 +4,10 @@ import { runInWeb } from '@/lib/deploy-runner'
 import { pushIsUrgent, settleNote } from '@/lib/deploy-settle'
 import { AppBeingDeletedError, DeployInFlightError, appDeleteInFlight, deployWorkerEnabled, recentSuccessfulGitShas, startDeploy } from '@/lib/deploys'
 import { pathsMatch } from '@/lib/paths-match'
+import { deployFailureFromError } from '@/lib/deploy-failure'
 import { onlyDeploymentMdChanged } from '@/lib/deployment-md-push'
 import { schedulePendingRedeploy } from '@/lib/pending-redeploy'
-import { commentPreviewOnPR, notifyDeploymentStarted } from '@/lib/github-deployments'
+import { commentPreviewOnPR, notifyDeploymentStarted, notifyPreviewCommit } from '@/lib/github-deployments'
 import { previewBuildInputs, previewLastSha, previewSkipReason, spinOrRedeployPreview } from '@/lib/preview-deploys'
 import { checkRateLimit } from '@/lib/rate-limit'
 import { rateLimitedResponse, unknownTokenResponse, webhookClientIp, webhookEventGate, webhookLimitKeys } from '@/lib/webhook-gate'
@@ -154,11 +155,17 @@ export async function POST(req: Request, ctx: { params: Promise<{ token: string 
 		}
 		// fire-and-forget; github gets 202 immediately
 		;(async () => {
+			const pushed = payload.after ?? null
+			// powder/deploy + powder/test-gate on the pushed commit (and so on its PR).
+			// Never throws; awaited before the result so the result is the last status.
+			const pending = notifyPreviewCommit(repo, pushed, { phase: 'pending' })
 			try {
 				// The app's own Dockerfile and port, not ./Dockerfile:3000.
 				const { containerPort, dockerfilePath } = await previewBuildInputs(repo)
-				const result = await spinOrRedeployPreview(repo, branch, containerPort, dockerfilePath, payload.after ?? null)
+				const result = await spinOrRedeployPreview(repo, branch, containerPort, dockerfilePath, pushed)
 				console.log(`[preview] ${repo.containerName}/${branch} → ${result.url}`)
+				await pending
+				await notifyPreviewCommit(repo, pushed, { phase: 'done', ok: true, builtSha: result.builtSha, failedStep: null, errorSummary: null, testGate: result.testGate })
 				// Sticky comment on the open PR. Best-effort: silent if no PR yet
 				// or no GH integration. Re-runs every push, edits the same comment.
 				const host = result.url.replace(/^https?:\/\//, '')
@@ -169,6 +176,17 @@ export async function POST(req: Request, ctx: { params: Promise<{ token: string 
 				})
 			} catch (err) {
 				console.error(`[preview] ${repo.containerName}/${branch} failed:`, err)
+				const fail = deployFailureFromError(err)
+				await pending
+				await notifyPreviewCommit(repo, pushed, {
+					phase: 'done',
+					ok: false,
+					// the commit the failed spin built (a newer branch tip): its status goes there
+					builtSha: fail.builtSha,
+					failedStep: fail.failedStep,
+					errorSummary: fail.errorSummary,
+					testGate: fail.testGate,
+				})
 			}
 		})()
 		// an accepted preview push is remembered like a main-branch one, so a

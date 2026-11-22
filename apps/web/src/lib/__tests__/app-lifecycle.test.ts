@@ -104,6 +104,7 @@ vi.mock('@/lib/preview-deploys', () => ({
 	tearDownPreview: async (pid: string) => {
 		h.torn.push(pid)
 		h.order.push('preview')
+		return { note: null }
 	},
 }))
 vi.mock('@/lib/db', () => {

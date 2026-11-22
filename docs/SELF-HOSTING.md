@@ -134,10 +134,14 @@ After a successful deploy powder can commit a `DEPLOYMENT.md` (server id, live h
 ## Server bootstrap (check first)
 
 "check server" on the server's page is read-only. Over SSH it reports, in
-this order: the Docker engine and the compose plugin, the docker networks `web`
-and `internal`, a container named `traefik` running the file provider on
-`POWDER_TRAEFIK_DYNAMIC_DIR` (traefik servers), `/opt/apps` and the dynamic
-dir, ufw (report only), free disk on `/` and memory (warnings under 10 GB free
+this order: the Docker engine and the compose plugin; on traefik servers the
+docker network Traefik routes over and the `traefik` container attached to it
+(both required); the network `web` (on traefik servers whose Traefik routes over
+another network, and on nginx servers, informational: `/new` creates it for the
+first app there) and `internal` (optional: only apps that opt into the shared
+internal network use it, and `/new` creates it for them); a container named
+`traefik` (traefik servers) with the file provider on `POWDER_TRAEFIK_DYNAMIC_DIR`;
+`/opt/apps` and the dynamic dir; ufw (report only), free disk on `/` and memory (warnings under 10 GB free
 or 2 GB total), `git` and `flock` (required; "fix missing pieces" does not
 install them: use the distro's package manager, packages `git` and
 `util-linux`), the helpers `powder-migrate` and `powder-image-prune` (a warning
@@ -148,13 +152,50 @@ installed). On `nginx` / `nginx-container` servers the Traefik pieces are
 informational and never count as missing. The check and the fix follow the
 server's saved `proxy`.
 
+The network Traefik routes over comes from the running `traefik` container, in
+this order (`lib/traefik-network.ts`, the one rule): its
+`--providers.docker.network` flag (Entrypoint, Cmd or Args); else
+`providers.docker.network` in its mounted static config (`--configFile`, else a
+mounted `/etc/traefik/traefik.yml`, `.yaml` or `.toml`, the same file the file
+provider check reads; YAML merge keys and TOML literal strings are read, keys
+in any case). Those two are the operator's declaration and the only sources that
+move powder off `web`. Without either, the network Traefik is attached to is only
+reported, with "set providers.docker.network to let powder route apps over it":
+`web` when it is one of them, else the first by name, leaving out Docker's
+`bridge`/`host`/`none`, networks created with `--internal` and networks of another
+compose project than Traefik's own (an app's own network, which Traefik may have
+been attached to by hand). Powder keeps routing over `web` there, and the check
+requires `web`. No Traefik yet: `web`. A name is used only when it is a valid
+Docker network name. The answer is cached for ten minutes per server and stored
+with its source in `servers.traefik_network` and `servers.traefik_network_source`
+(migration `0069`), which the deploy's compose guard reads without an SSH call;
+only a flag or config source widens it. New apps (`/new`), previews, URL snapshots and the
+rollback bridge join that network; on a network other than `web` the template and
+previews also set `traefik.docker.network`, so Traefik picks it among the
+container's networks (an app's db/kv networks, a preview's default network),
+and the compose guard accepts the network for that server's apps (no
+`POWDER_SHARED_NETWORKS` entry needed). Where Traefik runs on `web`, the rendered
+compose and the commands are what they always were.
+
+The Traefik file provider and the dynamic dir are only used by domain
+redirects. On a traefik server they are required while a `domain_redirects` row
+for that server has a www mode other than `none` or custom redirects; otherwise
+they are information lines (domain redirects stay unavailable there until Traefik
+has a watched file provider on the dir), and "fix missing pieces" does not
+create the dir. `bin/server-bootstrap.sh` cannot read the database: it takes
+`--redirects yes|no` and defaults to `yes`.
+
 "fix missing pieces" shows the exact commands first, then re-checks the server and
-runs only those still needed. It only adds: missing networks, missing
-directories (the dynamic dir only on traefik servers), Docker 29.x from
+runs only those still needed. It only adds: the missing routing network
+(the declared Traefik network on traefik servers, never `web` where Traefik is
+declared to route over another network, else `web`) and `internal`, missing directories (the dynamic dir only
+on traefik servers with a domain redirect set up), Docker 29.x from
 Docker's apt repository only when docker is absent, the helpers `powder-migrate` and `powder-image-prune` when absent,
 `/etc/cron.d/powder-image-prune` (root:root 0644, the line from the script's
-header) when absent and the helper is there or being installed,
-`/etc/logrotate.d/powder-traefik` on traefik servers when absent (see "Traefik
+header) when absent, the helper is there or being installed, and neither
+`/etc/crontab` nor another `/etc/cron.d` file runs `powder-image-prune` already,
+`/etc/logrotate.d/powder-traefik` on traefik servers when absent and no other
+file in `/etc/logrotate.d` names `/var/log/traefik` (see "Traefik
 access log" below), and a
 `traefik:v3.6` container pinned by registry digest (file provider on the dynamic dir,
 `le` ACME resolver over HTTP-01, JSON access log at
@@ -199,7 +240,19 @@ token in a deploy webhook URL (`/api/webhooks/deploy/<token>`), so treat the fil
 keep it off shared backups. `/etc/logrotate.d/powder-traefik` rotates it daily
 (sooner past 100 MB), keeps 7 compressed copies and uses `copytruncate`, so
 Traefik keeps writing to the same file. An existing file at that path is left
-as is.
+as is. Another file in `/etc/logrotate.d` that names `/var/log/traefik` outside a
+comment (found by the path, not the file name) counts as handled, unless its name
+has one of logrotate's default taboo extensions (`,v`, `.cfsaved`, `.disabled`,
+`.dpkg-bak`, `.dpkg-del`, `.dpkg-dist`, `.dpkg-new`, `.dpkg-old`, `.dpkg-tmp`,
+`.rhn-cfg-tmp-*`, `.rpmnew`, `.rpmorig`, `.rpmsave`, `.swp`, `.ucf-dist`,
+`.ucf-new`, `.ucf-old`, `~`), which logrotate skips. The prune cron works the same
+way: `/etc/crontab` always counts, a file in `/etc/cron.d` only when its name is
+letters, digits, `_` and `-` (cron's run-parts rule; a dotted backup copy is not
+loaded): powder writes no second
+stanza, since two stanzas for one log make logrotate report a duplicate entry
+and exit non-zero. When both exist, the check warns and names them. An existing
+Traefik not attached to the network it routes over is reported with the
+`docker network connect` command and never changed.
 
 It never restarts or modifies an existing container, Traefik or nginx, never
 runs ufw, and does nothing when the SSH user is not root. Installing Docker
@@ -237,6 +290,33 @@ override (published ports on 127.0.0.1, domain labels) lives outside the app dir
 as `docker-compose.powder.yml` under `/var/lib/powder/compose/`. An app adopted
 from a running container keeps its own layout (often the checkout in `src/` and
 `build: { context: ./src }`).
+
+Where an app's checkout is, for deploys and the dashboard alike: `src/` in the app
+dir when `src/.git` is a directory, else the app dir itself when it holds a `.git`
+directory, else none; a `src` symlink is refused. A `.git` left in the app dir next
+to a `src/` checkout is ignored. When a connected app has no checkout at all, the
+**clone** action on its page clones the repo into a new `src/` and changes nothing
+else in the app dir; it refuses when a checkout exists or when `src` exists in any
+form, except that when `src/` is a checkout of the app's repo and only
+`.deploy-key` is missing, it writes only the key.
+
+A clone powder makes for `/new` or a preview records its owner in
+`.git/powder-clone-target` (a temp clone dir names its owner in `.powder-clone-owner`,
+written before git runs). Nothing is ever moved or removed by its name alone: only a
+directory whose marker names the exact owner, checked right before. Every refusal
+check runs before the first change, so a refused clone leaves the app directories as
+they were; a clone that fails after its temp clone exists (the link check) removes
+only that marked temp clone. An app's clone only ever goes into a path that does not
+exist. A preview's re-clone moves its own marked directory aside to
+`<dir>.before-powder.<digits>` and keeps only the newest such copy. A failed first
+spin removes only the directory that spin put in place. Tearing a preview down
+removes its containers, its directory and its marked copies only when the marker
+names that preview; any other directory, and its containers, stay, and the page says
+"left <dir> in place: powder cannot prove it created it; remove it by hand if it is
+not needed", followed, when containers of the preview's compose project are still
+there, by how many and the `docker ps -a --filter label=com.docker.compose.project=<name>`
+command to find them. The adopt flows refuse a container whose compose directory is under
+`/opt/apps/pv-*`.
 
 Optional server-wide memory cap: put a size such as `2g` in `/opt/apps/.mem-cap` on an app server (`echo 2g > /opt/apps/.mem-cap`). With that file present and non-empty, every deploy caps each app container at that size (`docker update --memory --memory-swap`), overriding a compose `mem_limit` (the file is the operator's server-wide opt-in), and sets `restart: unless-stopped` on one whose restart policy is none; an explicit restart policy wins. Without the file a deploy leaves memory limits and restart policies as compose set them; the optional `powder-resource-guard`, if you install it, still caps every container that has no limit at 2g. Only a deploy applies the file: a container recreated by a rollback or a domain change runs with its compose settings until the next deploy.
 
@@ -319,7 +399,8 @@ next to `base_domain` and `ingress_ip`. They are the columns `servers.proxy`,
 Redirects precondition: the server's Traefik container (named `traefik`) must run the
 file provider on a directory mounted from `/opt/infra/traefik/dynamic`, with watch
 on (`--providers.file.directory=...` plus `--providers.file.watch=true`, or the same
-under `providers.file` in a mounted `traefik.yml`). Powder checks this with
+under `providers.file` in a mounted `traefik.yml` or `traefik.yaml`). The server
+check requires it only while a redirect is set up on that server. Powder checks this with
 `docker inspect traefik` before each write and fails the apply with `Traefik on
 <server> has no file provider for /opt/infra/traefik/dynamic (add
 providers.file.directory + watch and mount it)` otherwise. A docker-provider-only
@@ -385,8 +466,10 @@ deploy key (a new app or a preview) and one app deploy. Any failure: set
 
 `POWDER_WEB_READONLY=true` (opt-in) adds `docker-compose.web-readonly.yml`: a
 read-only root filesystem for `powder`, with tmpfs `/tmp` and
-`/app/apps/web/.next/cache`. The worker is never read-only (pnpm/corepack and tsx
-write caches at start).
+`/app/apps/web/.next/cache`. The worker is never read-only (tsx writes its cache
+under `/tmp` at start). Neither image has a package manager: the worker runs
+`node --import tsx src/worker.ts`, and one-off checks run the same way
+(`docker compose run --rm --no-deps --entrypoint node worker --import tsx src/check-config.ts`).
 
 ### powder on the web network
 
@@ -589,6 +672,15 @@ download but not restore from the dashboard.
   keep the dashboard behind HTTPS.
 - A deploy watchdog reaps rows stuck in `running`/`queued` so a wedged SSH
   session can't hold an app's deploy lock forever.
+- Kill switch for the builder's "your build failed on this commit" verdict: when a dedicated builder's build fails on what powder takes for the commit's own failure (a test, lint or type check step, a rejected lockfile, a TypeScript error, a missing Dockerfile or `COPY` source), the deploy fails at step `build` with no local rebuild. If such a verdict is wrong (the same commit builds on the app server), set `POWDER_BUILDER_APP_VERDICT=off` in `/opt/apps/powder.env` and recreate powder's web and worker containers so they read the file again (no build of powder is needed): every failed builder build then falls back to a local build as before. The deploy log says `[builder] POWDER_BUILDER_APP_VERDICT=off: falling back although ...` for each verdict it skipped. Report the log of the wrong verdict.
+- A prune of your own on a dedicated build host (a cron that runs `docker builder prune` or `docker image prune`) must take powder's pull lock, `/run/powder-builder-pull.lock`, exclusively. A prune that overlaps an image pull makes dockerd fail the pull (`failed to lease content: NotFound: lease ... not found`); the test gate then reports a registry that did not answer and the deploy falls back to a local build. powder's own cap prune takes the lock, and so does every image pull of a builder script (shared). Wrap each cron line in `flock -x -w 60` (a prune that cannot get the lock within a minute is skipped until its next run):
+
+  ```
+  17 3 * * * root flock -x -w 60 /run/powder-builder-pull.lock sh -c 'docker builder prune -af --filter until=24h; docker image prune -af --filter until=24h' >>/var/log/builder-prune.log 2>&1
+  47 * * * * root flock -x -w 60 /run/powder-builder-pull.lock docker builder prune -af --max-used-space 100GB --min-free-space 120GB >>/var/log/builder-prune.log 2>&1
+  ```
+
+  Keep a free-space floor like `--min-free-space` in such a cron: it also holds when powder's cap prune (soft cap `POWDER_BUILDER_CACHE_CAP_GB`) is skipped or returns no result.
 
 ### Restrict the master SSH key
 
@@ -647,10 +739,13 @@ Error texts are masked (secrets redacted) before they leave powder.
 | `app` | the app's container name |
 | `server` | the server's id in powder |
 | `status` | `"success"` or `"failure"` |
-| `sha`, `branch` | the deployed commit and branch (optional) |
+| `sha`, `branch` | the deploy's commit and branch (optional): on a success the commit now live; on a failure the commit it built, else the commit the push requested |
+| `shaSource` | what `sha` is: `built` (the commit the deploy built), `requested` (only the requested commit is known), or `null` |
 | `durationMs` | deploy duration (optional, success only) |
-| `error` | the failure summary, at most 500 characters (failure only) |
-| `deployId` | powder's deploy id, `null` for a queued catch-up deploy that never started; `GET /api/internal/deploys` lists the same ids, so a receiver can find events it missed |
+| `error` | the failure summary, at most 500 characters (failure only). When the step is known it reads `failed during: <step> · <summary>` (just `failed during: <step>` when there is nothing more to say), so the step can be read up to the `·`: a deploy that failed in one of its steps, and a deploy the watchdog stopped (step `watchdog`, or `queue` for one that was never picked up). Any failure with no known step (a catch-up deploy given up before it started, an SSH or setup error before the deploy script ran) carries the summary alone |
+| `failedStep` | the step the deploy stopped at (`watchdog` or `queue` for a deploy the watchdog stopped), lower case with anything outside `[a-z0-9 _:-]` turned into a space, the same text as in `error`; `null` when unknown (failure only) |
+| `exitCode` | the failed step's exit code; `null` when unknown (always for a watchdog stop) (failure only) |
+| `deployId` | powder's deploy id, `null` for a queued catch-up deploy that never started; `GET /api/internal/deploys` lists the same ids (with `errorSummary`, `failedStep` and `exitCode`), so a receiver can find events it missed |
 | `deployKind` | the deploy kind, e.g. a rollback (optional) |
 
 **Cron results** (`POWDER_HQ_CRON_URL`), for jobs powder runs itself (backups):
@@ -675,9 +770,10 @@ receiver keys open cards on that pair:
 |---|---|
 | `source` | `powder-deploy-warn`, `powder-build-host-disk` or `powder-swap-check` |
 | `source_ref` | the card key, see below |
-| `project` | the app name for `powder-deploy-warn` (`"powder"` for `nginx-upstream`), `"powder"` for the others (open cards only) |
-| `severity` | always `"warn"` (open cards only) |
-| `channel` | always `"general"` (open cards only) |
+| `project` | the app name for `powder-deploy-warn` (`"powder"` for `nginx-upstream`), `"powder"` for the others (open cards only; missing on the `compose-drift-standing:fleet` inventory) |
+| `severity` | `"warn"` (open cards only); `"info"` on the `compose-drift-standing:fleet` inventory |
+| `channel` | `"general"` (open cards only); missing on the `compose-drift-standing:fleet` inventory, which is an HQ task with no chat line |
+| `refresh_text`, `reopen` | on the `compose-drift-standing:fleet` inventory only: `refresh_text` is `true` (its text is replaced on every post); `reopen` is `true` on the post of a deploy that added an app to the list, so a closed inventory opens again, and `false` on every other post, so a closed one stays closed |
 | `resolve` | `true` on a closing event, missing on an open card |
 | `title`, `body` | human-readable text |
 
@@ -690,7 +786,7 @@ whose deploy swap could not be bridged, so it 502s during every recreate),
 upstream that lists the bridge port as backup), `nginx-upstream:<server>` (host
 nginx upstreams with a backup server and a single primary without
 `max_fails=0`), `build-host-disk:<build host>` (a build host's disk is at risk
-after the prune, or its cache prune has been skipped for hours) and
+after the prune, or its cache prune has been skipped for a day) and
 `swap-check-leftover:<server>` (a swap-check candidate container is left
 running).
 
@@ -702,10 +798,12 @@ With the switch off powder logs each card it would open as
 | `source_ref` | Opened when |
 |---|---|
 | `no-bridge:<server>/<app>` | also for the bridge verdicts `nginx-unbridged` (host nginx proxies to the app's `127.0.0.1` port, no bridge label) and `host-network` (`network_mode: host`); with the switch off these two close it, as `not-routed` does |
-| `compose-drift:<server>/<app>` | the repo's `docker-compose.yml` differs from the runtime compose on the server |
+| `compose-drift:<server>/<app>` | a commit in this deploy's range (since the last successful deploy) changed the repo's `docker-compose.yml`, and it differs from the runtime compose on the server; closed only by a deploy where both match |
+| `compose-drift-standing:fleet` | one inventory task (see the fields above) listing every `<server>/<app>` whose repo compose differs from the runtime compose with no card raised for it under this rule (no commit since the app's last deploy changed it); closed when the list is empty. State per app in `powder_meta` (`compose_drift:<server>/<app>`, `drift` or `standing`; a deleted app's row is dropped). A `drift` row stays until a deploy where both files match, also when it came from the no-base fallback. The cards opened before this rule close on each app's next deploy, or at once with `infra/scripts/compose-drift-retire-old-cards.js` |
 | `migrate-path:<server>/<app>` | schema changes bypass `powder-migrate`; the title names the cases (`stray-sql`, `boot-cmd`, `release-cmd` = a schema push in the release label, `start-script`) |
 | `health-url:<server>/<app>` | the app has no health URL, so the health gate only proves it answers HTTP |
 | `test-gate:<server>/<app>` | the build context has no `.powder/test.sh` |
+| `stop-drain:<server>/<app>` | in a bridged swap the old container could not be routed away from before its stop, ignored SIGTERM, or was killed with requests in flight |
 
 A deploy that reports the condition gone closes the card; a check that could
 not finish opens and closes nothing.

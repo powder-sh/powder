@@ -8,8 +8,13 @@ import {
 	getContainerHostNetInfo,
 	getNginxRoutes,
 	listContainers,
+	runCommand,
 } from '@/lib/ssh'
 import { getPinnedFingerprint } from '@/lib/ssh-host-keys'
+import { countLiveAppsWithoutUrl, liveHostsByApp, rowUrls } from '@/lib/server-url-gaps'
+import { parseImageIds, reconcileTarget, shouldReconcile } from '@/lib/stale-failure-reconcile'
+import { SAFE_NAME, shq } from '@/lib/shell'
+import type { ServerConfig } from '@/lib/servers'
 
 // Server list + discovery sync, shared by GET /api/servers (sync=false, no
 // writes) and POST /api/servers/sync (sync=true: server status, discovered
@@ -18,6 +23,22 @@ import { getPinnedFingerprint } from '@/lib/ssh-host-keys'
 
 export async function buildServerList(sync: boolean): Promise<Response> {
 	const allServers = await listAllServers()
+	// powder's own record of each app's routed domains (one query for all servers): a
+	// row whose discovery finds no URL shows these instead of a dash (server-url-gaps.ts)
+	// (no servers: no query)
+	const liveHosts = liveHostsByApp(
+		allServers.length === 0
+			? []
+			: ((await db
+					.select({
+						appRepoId: appDomains.appRepoId,
+						hostname: appDomains.hostname,
+						status: appDomains.status,
+						previewDeployId: appDomains.previewDeployId,
+					})
+					.from(appDomains)
+					.where(eq(appDomains.status, 'live'))) ?? []),
+	)
 	const results = await Promise.all(
 		allServers.map(async (server) => {
 			try {
@@ -36,7 +57,7 @@ export async function buildServerList(sync: boolean): Promise<Response> {
 
 				// latest deploy per container - single query using DISTINCT ON
 				const latestDeploys = (await db.execute(sql`
-					SELECT DISTINCT ON (container_name) container_name, id, status, kind, started_at, finished_at, git_sha
+					SELECT DISTINCT ON (container_name) container_name, id, status, kind, started_at, finished_at, git_sha, image_tag
 					FROM deploys
 					WHERE server_id = ${server.id}
 					ORDER BY container_name, started_at DESC
@@ -48,6 +69,7 @@ export async function buildServerList(sync: boolean): Promise<Response> {
 					started_at: string
 					finished_at: string | null
 					git_sha: string | null
+					image_tag: string | null
 				}>
 				const latestByContainer = new Map(latestDeploys.map((r) => [r.container_name, r]))
 
@@ -83,6 +105,9 @@ export async function buildServerList(sync: boolean): Promise<Response> {
 						/^[a-z0-9]+(?:-[a-z0-9]+)*-(nginx|postgres|redis|kuma)-\d+$/,
 						/^(nginx|traefik|postgres|redis|kuma|prometheus|grafana)$/,
 						/^(nginx|postgres|redis)-\d+$/,
+						// `<app>-db` sidecars: once their image tag is re-pulled, docker ps
+						// shows a bare image id, so the image check above misses them.
+						/^[a-z0-9]+(?:-[a-z0-9]+)*-(db|postgres|redis)$/,
 					]
 					return infraNamePatterns.some((re) => re.test(n))
 				}
@@ -125,10 +150,16 @@ export async function buildServerList(sync: boolean): Promise<Response> {
 
 					const repo = repoByContainer.get(c.name)
 					const ld = latestByContainer.get(c.name)
+					const shown = rowUrls({
+						discovered: dedupeWwwVariants([...urls]),
+						isApp: !!repo,
+						liveHosts: repo ? (liveHosts.get(repo.id) ?? []) : [],
+					})
 
 					return {
 						...c,
-						urls: dedupeWwwVariants([...urls]),
+						urls: shown.urls,
+						urlSource: shown.urlSource,
 						persistUrls: dedupeWwwVariants(persistable),
 						repo: repo
 							? {
@@ -155,12 +186,23 @@ export async function buildServerList(sync: boolean): Promise<Response> {
 				// truth (not only the ones the custom-domain wizard adds).
 				// Fire-and-forget: a failed write must not break the dashboard render.
 				if (sync) void persistDiscoveredDomains(containersWithUrls).catch(() => {})
-				// Reconcile dashboard truth with reality. If the running image is a
-				// registry-mode image (ghcr.io/...) but the last deploys row is failed,
-				// the failure log is misleading - the container actually rolled forward
-				// (manual fix, an image pushed after the deploy failed, etc). Write a synthetic
-				// success row so the dashboard stops showing red on a working app.
-				if (sync) void reconcileStaleFailures(server.id, containersWithUrls).catch(() => {})
+				// A failed last deploy of a registry-mode app whose running image provably
+				// differs from the image that deploy targeted is stale: record a synthetic
+				// success (lib/stale-failure-reconcile.ts). Never keyed on the image name.
+				if (sync)
+					void reconcileStaleFailures(
+						server,
+						containersWithUrls.map((c) => {
+							const r = repoByContainer.get(c.name)
+							const ld = latestByContainer.get(c.name)
+							return {
+								name: c.name,
+								image: c.image,
+								buildMode: r?.buildMode ?? null,
+								lastDeploy: ld ? { status: ld.status, imageTag: ld.image_tag } : null,
+							}
+						}),
+					).catch(() => {})
 				// Keep the server check fresh without anyone pressing "check now": a sync
 				// that reached the server re-runs the read-only check once a day (persisted); one run per server at a
 				// time, and a failed attempt waits BACKGROUND_RETRY_MS before the next.
@@ -176,7 +218,16 @@ export async function buildServerList(sync: boolean): Promise<Response> {
 					baseDomain: server.baseDomain ?? null,
 					status: 'connected' as const,
 					reachable: true,
+					// the host nginx config was not read because a file of it resolves into
+					// app space or cannot be checked (fail closed, lib/ssh/discovery.ts), or the
+					// proxy config output was cut: the page says so
+					hostProxyConfig:
+						nginxRoutes.hostSkipped === 'app-space' || nginxRoutes.hostSkipped === 'unverifiable'
+							? nginxRoutes.hostSkipped
+							: null,
+					proxyConfigTooLarge: nginxRoutes.tooLarge === true,
 					containers: containersWithUrls.map(({ persistUrls: _p, ...c }) => c),
+					liveAppsWithoutUrl: countLiveAppsWithoutUrl(containersWithUrls),
 				}
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : 'unknown error'
@@ -194,45 +245,72 @@ export async function buildServerList(sync: boolean): Promise<Response> {
 					reachable: false,
 					error: msg,
 					containers: [],
+					liveAppsWithoutUrl: 0,
 				}
 			}
 		}),
 	)
 
-	return Response.json({ servers: results })
+	// the invariant across all reachable servers: powder apps with a live domain for
+	// which discovery found no URL (near zero when discovery reads every proxy layout)
+	return Response.json({
+		servers: results,
+		liveAppsWithoutUrl: results.reduce((n, s) => n + s.liveAppsWithoutUrl, 0),
+	})
 }
 
-// If a container is running a registry image (ghcr.io/...) but the most recent
-// deploys row says `failed`, the failed log is misleading - reality moved on.
-// Write a synthetic success row tagged kind=image_update, triggered_by=reconcile.
-// Idempotent: only emits one reconcile per (server, container) until the next
-// real deploy arrives. Identified by the synthetic `triggered_by` value.
-async function reconcileStaleFailures(
-	serverId: string,
+// Write a synthetic success row tagged kind=image_update, triggered_by=reconcile,
+// only where shouldReconcile holds: build_mode 'registry', the last deploy failed, it
+// recorded an image reference, and the running container's image id differs from that
+// reference's image id on the server. One SSH call, only when a candidate exists.
+// Idempotent: only emits one reconcile per (server, container) until the next real
+// deploy arrives. Identified by the synthetic `triggered_by` value. Runs on
+// POST /api/servers/sync only (sync=true), never on the read-only GET.
+export async function reconcileStaleFailures(
+	server: ServerConfig,
 	containers: Array<{
 		name: string
 		image: string
-		repo: { repoUrl: string; branch: string } | null
-		lastDeploy: { id: string; status: string; kind: string } | null
+		buildMode: string | null
+		lastDeploy: { status: string; imageTag: string | null } | null
 	}>,
 ): Promise<void> {
-	for (const c of containers) {
-		if (!c.repo) continue
-		if (!c.image.startsWith('ghcr.io/')) continue
-		if (!c.lastDeploy || c.lastDeploy.status !== 'failed') continue
+	const candidates = containers.flatMap((c) => {
+		const ref = reconcileTarget(c)
+		return ref && SAFE_NAME.test(c.name) ? [{ c, ref }] : []
+	})
+	if (candidates.length === 0) return
+	const cmd = candidates
+		.map(
+			({ c, ref }) =>
+				`printf '%s\\t%s\\t%s\\n' ${shq(c.name)} "$(docker inspect -f '{{.Image}}' -- ${shq(c.name)} 2>/dev/null)" "$(docker image inspect -f '{{.Id}}' -- ${shq(ref)} 2>/dev/null)"`,
+		)
+		.join('; ')
+	const { stdout } = await runCommand(server, cmd, 10_000)
+	const ids = parseImageIds(stdout)
+	for (const { c } of candidates) {
+		const id = ids.get(c.name)
+		if (
+			!shouldReconcile({
+				...c,
+				runningImageId: id?.running ?? null,
+				targetImageId: id?.target ?? null,
+			})
+		)
+			continue
 
 		// Already reconciled? Don't pile up duplicate rows.
 		const [recent] = await db
 			.select({ triggeredBy: deploys.triggeredBy })
 			.from(deploys)
-			.where(and(eq(deploys.serverId, serverId), eq(deploys.containerName, c.name)))
+			.where(and(eq(deploys.serverId, server.id), eq(deploys.containerName, c.name)))
 			.orderBy(desc(deploys.startedAt))
 			.limit(1)
 		if (recent?.triggeredBy === 'reconcile') continue
 
 		await db.insert(deploys).values({
 			id: createId(prefixes.deploy),
-			serverId,
+			serverId: server.id,
 			containerName: c.name,
 			kind: 'image_update',
 			status: 'success',
@@ -240,7 +318,7 @@ async function reconcileStaleFailures(
 			finishedAt: new Date(),
 			triggeredBy: 'reconcile',
 			imageTag: c.image,
-			output: `dashboard reconcile: container is running ${c.image} but last deploy log was failed. Reality wins - recording synthetic success so the row reflects the live state.`,
+			output: `dashboard reconcile: the container runs image ${id?.running} (${c.image}), not ${id?.target}, the image the failed deploy targeted. Recording a synthetic success so the row reflects the live state.`,
 		})
 	}
 }

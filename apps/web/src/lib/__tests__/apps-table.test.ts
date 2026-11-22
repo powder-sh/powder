@@ -7,6 +7,7 @@ import {
 	filterApps,
 	fleetHeartbeat,
 	parseStatusFilter,
+	redeployHint,
 	shortSha,
 	sortApps,
 } from '../apps-table'
@@ -189,5 +190,15 @@ describe('fleetHeartbeat', () => {
 		expect(h).toMatchObject({ up: 1, down: 1, unchecked: 2 })
 		expect(h.last).toEqual({ app: 'b', status: 'success', startedAt: iso(5) })
 		expect(fleetHeartbeat([], NOW)).toEqual({ up: 0, down: 0, unchecked: 0, last: null })
+	})
+})
+
+describe('redeployHint', () => {
+	it('names the branch and promises the running version only when there is one', () => {
+		expect(redeployHint('main', false)).toBe(
+			'pull the latest commit of main, rebuild and swap. if the build or a check before the swap fails, the running version keeps serving.',
+		)
+		expect(redeployHint('main', true)).toBe('pull the latest commit of main, build and start it.')
+		expect(redeployHint('', true)).toBe('pull the latest commit of its branch, build and start it.')
 	})
 })

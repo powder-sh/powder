@@ -5,7 +5,8 @@
 // - Env: a preview reads only the preview env file (/opt/apps/<parent>.preview.env),
 //   never the parent's production env. It reaches a database only if the preview
 //   env names one (e.g. a DATABASE_URL set there).
-// - Networks: `web` (Traefik routing) plus the preview's own
+// - Networks: the server's Traefik network (`web` unless its Traefik is declared
+//   to route over another, traefik-network.ts routingNetwork) plus the preview's own
 //   project network, never the shared `internal`: branch code must not reach
 //   other apps' containers and databases. A parent DB reachable only over
 //   `internal` is therefore NOT reachable from its previews.
@@ -13,9 +14,13 @@
 //   if the user runs them — warned in the UI)
 // - Cleanup: manual via UI; no auto on branch-delete in v1.
 
-import { NO_BASE_DOMAIN_MESSAGE, branchSlug, readableBranchSlug, healthPathFor, hostForLabel, previewContainerName } from './app-hosts'
+import type { TestGate } from '@powder/db/schema'
+import { NO_BASE_DOMAIN_MESSAGE, branchSlug, readableBranchSlug, healthPathFor, hostForLabel, previewContainerName, traefikRetryLabels } from './app-hosts'
+import { drainActiveFor } from './drain-mode'
 import type { HostServer } from './app-hosts'
 import { isTraefikServer } from './traefik-servers'
+import { DEFAULT_TRAEFIK_NETWORK, assertDockerNetworkName } from './traefik-network'
+import { resolveRoutingNetwork } from './traefik-network-run'
 import { readAppContainerPort, routeHostsFor } from './app-domains'
 import { writeRuntimeFilesShell } from './app-runtime-files'
 import { randomTempPath } from './temp-path'
@@ -33,6 +38,8 @@ import {
 	writeFileViaSftp,
 } from './ssh'
 import { shq } from './shell'
+import { CloneError, cloneNonce, nonceReadShell } from './ssh/git'
+import { cloneMarkerMatchShell, cloneMarkerMatchVarShell, clonePurposeSlug, cloneTargetOk, cloneTmpMarkerMatchVarShell } from './clone-marker'
 import { traefikRouterTlsLabel } from './traefik-tls'
 
 // Previews need (a) a Traefik server and (b) a base domain on that server
@@ -110,6 +117,157 @@ export async function assertPreviewNameFree(deps: {
 	}
 }
 
+/** The clone purpose of a preview row (lib/clone-marker.ts). */
+export function previewClonePurpose(previewId: string): string {
+	return `preview:${previewId}`
+}
+
+/** Shell (never fails): remove a preview's working dir only when its marker
+ *  (`.git/powder-clone-target`) names this preview row, checked right before the
+ *  removal. Never by name alone: an unmarked dir, or one marked for another owner,
+ *  is left, and so are the containers of the preview's compose project: they are torn
+ *  down (by label, previewTeardownShell) only together with the proven dir. With
+ *  `siblings`, also this row's copies next to it, each only with the exact name shape
+ *  and the marker naming this row: kept copies `<dir>.before-powder.<digits>` (clone
+ *  marker) and dead temp clones `<dir>.clone.preview-<row id>.<digits>` (temp marker).
+ *  Then it counts the containers of the project that are still there.
+ *  Reports through the clone scripts' channel: the nonce comes on stdin, everything
+ *  runs with stdout moved to stderr and fd 3 closed, and fd 3 (the real stdout) gets
+ *  only `__PV_<nonce>__ dir=<removed|left|absent> containers=<n|unknown>`
+ *  (parsePreviewDirStatus). A path that is not one plain segment below the apps root
+ *  is never touched. */
+export function previewDirRemoveShell(
+	/** the preview's compose project: its containers go only together with its proven dir */
+	name: string,
+	workingDir: string,
+	previewId: string,
+	opts: { siblings?: boolean; appsRoot?: string } = {},
+): string {
+	const purpose = previewClonePurpose(previewId)
+	const wd = shq(workingDir)
+	const exact = (prefix: string, test: string) =>
+		`for __d in ${shq(prefix)}*; do __r=\${__d##*.}; case "$__r" in ''|*[!0-9]*) continue ;; esac; ` +
+		`[ "$__d" = ${shq(prefix)}"$__r" ] || continue; if ${test}; then rm -rf -- "$__d"; fi; done; `
+	const act = cloneTargetOk(workingDir, opts.appsRoot)
+		? (opts.siblings
+				? exact(`${workingDir}.before-powder.`, cloneMarkerMatchVarShell('__d', purpose)) +
+					exact(`${workingDir}.clone.${clonePurposeSlug(purpose)}.`, cloneTmpMarkerMatchVarShell('__d', purpose))
+				: '') +
+			`if ${cloneMarkerMatchShell(workingDir, purpose)}; then ${previewTeardownShell(name)}; rm -rf -- ${wd}; __PV_D=removed; ` +
+			`elif [ -e ${wd} ] || [ -L ${wd} ]; then __PV_D=left; else __PV_D=absent; fi; `
+		: `__PV_D=left; `
+	return (
+		`exec 3>&1 1>&2; ` +
+		// refused before any action unless this call's nonce came on stdin
+		nonceReadShell('__PV_N', 'preview removal') +
+		`__PV_D=left; __PV_C=unknown; ` +
+		`{ ${act}} 3>&-; ` +
+		`if __PV_O=$(docker ps -aq --filter ${shq(`label=com.docker.compose.project=${name}`)} 2>/dev/null 3>&-); then __PV_C=$(printf '%s' "$__PV_O" | grep -c . || true); fi; ` +
+		`printf '__PV_%s__ dir=%s containers=%s\\n' "$__PV_N" "$__PV_D" "$__PV_C" >&3; true`
+	)
+}
+
+export interface PreviewDirStatus {
+	dir: 'removed' | 'left' | 'absent'
+	/** containers of the preview's compose project still there afterwards; null = unknown */
+	containers: number | null
+}
+
+/** The outcome of previewDirRemoveShell run with `nonce`: stdout must be exactly that
+ *  one line, else null: the removal did not run or did not answer, so nothing is known
+ *  about the dir. Pure. */
+export function parsePreviewDirStatus(stdout: string, nonce: string): PreviewDirStatus | null {
+	const only = stdout.replace(/\n$/, '')
+	const m =
+		/^[0-9a-f]{32}$/.test(nonce) && !only.includes('\n')
+			? only.match(new RegExp(`^__PV_${nonce}__ dir=(removed|left|absent) containers=(\\d{1,5}|unknown)$`))
+			: null
+	if (!m) return null
+	return { dir: m[1] as PreviewDirStatus['dir'], containers: m[2] === 'unknown' ? null : Number(m[2]) }
+}
+
+/** What the page says after a preview's removal; null when nothing is left. Pure. */
+export function previewRemovalNote(name: string, workingDir: string, st: PreviewDirStatus | null): string | null {
+	if (!st) return previewRemovalUnknownNote(workingDir)
+	const list = `docker ps -a --filter label=com.docker.compose.project=${name}`
+	const n = st.containers
+	const ctr = n === 1 ? '1 container' : `${n} containers`
+	const uncounted = `powder could not count the containers of project ${name}; check by hand: ${list}`
+	if (st.dir === 'removed') {
+		if (n === 0) return null
+		if (n === null) return uncounted
+		return `${ctr} of project ${name} ${n === 1 ? 'is' : 'are'} still there after the teardown: remove ${n === 1 ? 'it' : 'them'} by hand (${list})`
+	}
+	if (st.dir === 'absent') {
+		if (n === 0) return null
+		if (n === null) return `no directory at ${workingDir}; ${uncounted}`
+		return `no directory at ${workingDir}; ${ctr} of project ${name} ${n === 1 ? 'was' : 'were'} left: powder cannot prove ${n === 1 ? 'it is' : 'they are'} this preview's, so remove ${n === 1 ? 'it' : 'them'} by hand if not needed (${list})`
+	}
+	const left = previewDirLeftNote(workingDir)
+	if (n === 0) return left
+	if (n === null) return `${left}. ${uncounted}`
+	return `${left}. ${ctr} of project ${name} ${n === 1 ? 'was' : 'were'} left too and may still serve the preview's address: stop and remove ${n === 1 ? 'it' : 'them'} by hand if not needed (${list})`
+}
+
+/** What the page says when the removal did not run or did not answer. */
+export function previewRemovalUnknownNote(workingDir: string): string {
+	return `the removal did not run or did not answer: nothing is known about ${workingDir} or the preview's containers; check the server`
+}
+
+/** What the page says about a preview dir powder left in place. */
+export function previewDirLeftNote(workingDir: string): string {
+	return `left ${workingDir} in place: powder cannot prove it created it; remove it by hand if it is not needed`
+}
+
+/** Run the preview's removal script; the note for the page (null when nothing is
+ *  left). */
+async function removePreviewDir(
+	server: ServerConfig,
+	name: string,
+	workingDir: string,
+	previewId: string,
+	siblings: boolean,
+	/** also /opt/apps/<name>.env, only once the dir was proven this preview's and removed */
+	envFile = false,
+): Promise<string | null> {
+	const nonce = cloneNonce()
+	const r = await runCommand(server, previewDirRemoveShell(name, workingDir, previewId, { siblings }), 60_000, undefined, {
+		stdin: `${nonce}\n`,
+	})
+	const st = parsePreviewDirStatus(r.stdout, nonce)
+	if (st?.dir === 'removed' && envFile) await runCommand(server, `rm -f ${shq(`/opt/apps/${name}.env`)}`, 10_000).catch(() => {})
+	return previewRemovalNote(name, workingDir, st)
+}
+
+/** An existing preview row about to be cloned again: the same name checks as a new
+ *  row (no app of that name on the server, no other preview row), and its directory
+ *  is either absent or this row's own marked clone. Throws PreviewNameCollisionError. */
+async function assertFirstSpinFree(
+	server: ServerConfig,
+	serverId: string,
+	previewId: string,
+	name: string,
+	workingDir: string,
+): Promise<void> {
+	const apps = await db.select({ containerName: appRepos.containerName }).from(appRepos).where(eq(appRepos.serverId, serverId))
+	const previews = await db.select({ id: previewDeploys.id, containerName: previewDeploys.containerName }).from(previewDeploys)
+	if (apps.some((a) => a.containerName === name))
+		throw new PreviewNameCollisionError(
+			`preview name "${name}" is now an app's name; the preview was not set up again and nothing on the server was touched. Delete this preview in powder: its teardown leaves ${workingDir} (the app's) in place, nothing else to do.`,
+		)
+	if (previews.some((p) => p.id !== previewId && p.containerName === name))
+		throw new PreviewNameCollisionError(`preview name "${name}" collides with another preview`)
+	const r = await runCommand(
+		server,
+		`if { [ -e ${shq(workingDir)} ] || [ -L ${shq(workingDir)} ]; } && ! ${cloneMarkerMatchShell(workingDir, previewClonePurpose(previewId))}; then echo foreign; else echo ok; fi`,
+		5_000,
+	)
+	if (r.stdout.trim() !== 'ok')
+		throw new PreviewNameCollisionError(
+			`${workingDir} exists on the server and is not this preview's own clone; the preview was not set up again and ${workingDir} was not touched. If nothing needs ${workingDir}, move it away by hand on the server and push the branch again; if something else uses it, delete this preview in powder (its teardown leaves ${workingDir} in place).`,
+		)
+}
+
 export function previewWorkingDir(name: string): string {
 	return `/opt/apps/${name}`
 }
@@ -140,6 +298,10 @@ export interface SpinResult {
 	containerName: string
 	url: string
 	deployOutput: string
+	/** the commit the spin built (nonced marker), null when unknown */
+	builtSha: string | null
+	/** the test gate's outcome from the nonced mark (as deploys.test_gate) */
+	testGate: TestGate | null
 }
 
 // Idempotent: if a preview row already exists for (repo, branchSlug), reuses
@@ -268,17 +430,31 @@ async function spinPreviewLocked(
 	// A failed first spin (row left 'failed', clone or compose never completed)
 	// or a missing compose file is a FIRST spin: the preview was never set up.
 	let isFirstSpin = !existing || existing.status === 'failed'
+	// true once THIS spin's clone is in place at workingDir: the only case in which a
+	// failed first spin removes anything (a refused or failed clone never placed it)
+	let placedByThisSpin = false
 	try {
 		if (!isFirstSpin) {
 			const have = await runCommand(server, `[ -f ${shq(composeFilePath)} ] && echo ok || echo missing`, 5_000)
 			isFirstSpin = have.stdout.trim() !== 'ok'
 		}
 		if (isFirstSpin) {
+			// An existing row treated as new (a failed first spin, a missing compose):
+			// the name and directory checks run again, as for a new row. An app may have
+			// taken the name since; the row's own directory passes only with its marker.
+			if (existing) await assertFirstSpinFree(server, repo.serverId, previewId, name, workingDir)
 			// 1) Plant the parent's deploy key in /tmp, clone the branch, then move
-			//    key into the working dir for future pulls.
+			//    key into the working dir for future pulls. The clone replaces an existing
+			//    dir only when its marker says powder cloned it for this preview row.
 			keyPlanted = true
 			await writeFileSecret(server, tmpKey, decryptDeployKey(repo))
-			await gitCloneRepo(server, workingDir, repo.repoUrl, branch, tmpKey)
+			try {
+				await gitCloneRepo(server, workingDir, repo.repoUrl, branch, tmpKey, previewClonePurpose(previewId))
+			} catch (err) {
+				if (err instanceof CloneError && err.placed) placedByThisSpin = true
+				throw err
+			}
+			placedByThisSpin = true
 		}
 
 		// 2) The preview runs with the preview env file ONLY: it never reads the
@@ -297,6 +473,7 @@ async function spinPreviewLocked(
 			host: url.replace(/^https?:\/\//, ''),
 			healthUrl: repo.healthUrl,
 			tlsMode: server.tlsMode,
+			traefikNetwork: await resolveRoutingNetwork(server),
 		})
 		// SFTP at 0600, not base64 in argv.
 		await writeFileViaSftp(server, composeTmp, composeYaml, 0o600, 30_000, true, true)
@@ -313,7 +490,7 @@ async function spinPreviewLocked(
 
 		// 4) Build + recreate (same code path as a real deploy, gives us
 		//    rollback-tagging + the streaming output handler).
-		const { output } = await rebuildDeploy(
+		const { output, sha: builtSha, testGate } = await rebuildDeploy(
 			server,
 			workingDir,
 			composeFilePath,
@@ -353,7 +530,7 @@ async function spinPreviewLocked(
 			.set({ status: 'running', lastDeployedAt: new Date(), lastError: null, branch, lastSha: sha && /^[0-9a-f]{40}$/.test(sha) ? sha : null })
 			.where(eq(previewDeploys.id, previewId))
 
-		return { previewId, containerName: name, url, deployOutput: output }
+		return { previewId, containerName: name, url, deployOutput: output, builtSha, testGate: testGate ?? null }
 	} catch (err) {
 		// already cleaned up above
 		if (err instanceof PreviewParentGoneError) throw err
@@ -362,10 +539,12 @@ async function spinPreviewLocked(
 			.update(previewDeploys)
 			.set({ status: 'failed', lastError: msg })
 			.where(eq(previewDeploys.id, previewId))
-		// a failed FIRST spin leaves no checkout behind (a refused clone would
-		// otherwise stay on the server until a teardown). Its containers go by label; the dir
-		// only when it is no registered app's dir (a `<parent>-<slug>` preview name can alias one).
-		if (isFirstSpin) {
+		// a failed FIRST spin leaves no checkout behind, but it removes only what THIS
+		// spin created: nothing at all when its clone was refused, failed or never ran
+		// (the directory there, and any containers of that name, are not this spin's).
+		// Then the dir only by its marker (no pre-marker rule here), and never when the
+		// name is a registered app's.
+		if (isFirstSpin && placedByThisSpin) {
 			const aliased = (
 				await db
 					.select({ n: appRepos.containerName })
@@ -374,7 +553,7 @@ async function spinPreviewLocked(
 					.catch(() => [{ n: name }])
 			).some((r) => r.n === name)
 			if (!aliased)
-				await runCommand(server, `${previewTeardownShell(name)}; rm -rf ${shq(workingDir)}`, 60_000).catch(() => {})
+				await removePreviewDir(server, name, workingDir, previewId, false).catch(() => null)
 		}
 		throw err
 	} finally {
@@ -385,8 +564,9 @@ async function spinPreviewLocked(
 }
 
 /** A preview whose app is gone: its containers and checkout (never when the name is
- *  a registered app's, like tearDownPreview) and its row. The parent row may be gone, so the server
- *  comes from the caller, not from tearDownPreview's lookup through the app. */
+ *  a registered app's, like tearDownPreview; the dir only by its marker) and its row.
+ *  The parent row may be gone, so the server comes from the caller, not from
+ *  tearDownPreview's lookup through the app. */
 async function removeOrphanPreview(
 	server: ServerConfig,
 	serverId: string,
@@ -401,25 +581,28 @@ async function removeOrphanPreview(
 			.where(eq(appRepos.serverId, serverId))
 			.catch(() => [{ n: name }])
 	).some((r) => r.n === name)
-	if (!aliased) await runCommand(server, `${previewTeardownShell(name)}; rm -rf ${shq(workingDir)}`, 60_000).catch(() => {})
+	if (!aliased) await removePreviewDir(server, name, workingDir, previewId, true).catch(() => null)
 	await db.delete(previewDeploys).where(eq(previewDeploys.id, previewId))
 }
 
-export async function tearDownPreview(previewId: string): Promise<void> {
+/** Tear a preview down: its containers, its dir and this row's marked copies next to
+ *  it (only by marker), and its row. `note` says when the dir was left in place
+ *  (unmarked, or marked for another owner): the page shows it. */
+export async function tearDownPreview(previewId: string): Promise<{ note: string | null }> {
 	const [preview] = await db
 		.select()
 		.from(previewDeploys)
 		.where(eq(previewDeploys.id, previewId))
-	if (!preview) return
+	if (!preview) return { note: null }
 
 	// Find the parent app_repo to resolve which server it lives on.
 	const [repo] = await db.select().from(appRepos).where(eq(appRepos.id, preview.appRepoId))
 	if (!repo) {
 		await db.delete(previewDeploys).where(eq(previewDeploys.id, previewId))
-		return
+		return { note: null }
 	}
 	const server = await getServer(repo.serverId)
-	// Never rm -rf a directory that belongs to a registered app (a preview
+	// Never touch a directory that belongs to a registered app (a preview
 	// row named `<parent>-<slug>` could alias another app).
 	const aliased = (
 		await db
@@ -427,16 +610,14 @@ export async function tearDownPreview(previewId: string): Promise<void> {
 			.from(appRepos)
 			.where(eq(appRepos.serverId, repo.serverId))
 	).some((r) => r.n === preview.containerName)
+	let note: string | null = aliased ? `left ${preview.workingDir} in place: it is the app ${preview.containerName}'s directory` : null
 	if (server && !aliased) {
-		await runCommand(
-			server,
-			`${previewTeardownShell(preview.containerName)}; rm -rf ${shq(preview.workingDir)} ${shq(`/opt/apps/${preview.containerName}.env`)}`,
-			60_000,
-		).catch(() => {
-			// best-effort cleanup; row is removed regardless
-		})
+		note = await removePreviewDir(server, preview.containerName, preview.workingDir, preview.id, true, true).catch(
+			() => previewRemovalUnknownNote(preview.workingDir),
+		)
 	}
 	await db.delete(previewDeploys).where(eq(previewDeploys.id, previewId))
+	return { note }
 }
 
 /** remove a preview's containers and its default network by the compose project
@@ -463,8 +644,17 @@ export function renderPreviewCompose(opts: {
 	healthUrl?: string | null
 	/** servers.tls_mode of the server: origin-cert routers serve the default-store cert. */
 	tlsMode?: 'acme' | 'origin-cert'
+	/** The network powder routes over on the server (resolveRoutingNetwork). Absent or
+	 *  `web`: the compose is exactly what it always was. Another network: the preview
+	 *  joins it instead of `web`, with traefik.docker.network, since a preview is on
+	 *  two networks (that one and its own default) and Traefik must pick the right one. */
+	traefikNetwork?: string
 }): string {
 	const envFileBlock = opts.envFiles.map((p) => `      - ${p}`).join('\n')
+	const net = assertDockerNetworkName(opts.traefikNetwork ?? DEFAULT_TRAEFIK_NETWORK)
+	// branch code never joins the shared `internal` network (see the header)
+	if (net === 'internal') throw new Error('previews refused: this server\'s Traefik routes over the shared internal network, which a preview must not join')
+	const netLabel = net !== DEFAULT_TRAEFIK_NETWORK ? `      - traefik.docker.network=${net}\n` : ''
 	return `name: ${opts.name}
 
 services:
@@ -479,7 +669,7 @@ services:
 ${envFileBlock}
     labels:
       - traefik.enable=true
-      - traefik.http.routers.${opts.name}.rule=Host(\`${opts.host}\`)
+${netLabel}      - traefik.http.routers.${opts.name}.rule=Host(\`${opts.host}\`)
       - traefik.http.routers.${opts.name}.entrypoints=websecure
       - ${traefikRouterTlsLabel(opts.name, opts.tlsMode)}
       - traefik.http.services.${opts.name}.loadbalancer.server.port=${opts.containerPort}
@@ -488,13 +678,13 @@ ${envFileBlock}
       - traefik.http.services.${opts.name}.loadbalancer.healthcheck.timeout=3s
       - traefik.http.middlewares.${opts.name}-diag.headers.customresponseheaders.X-Powder-App=${opts.name}
       - traefik.http.middlewares.${opts.name}-diag.headers.customresponseheaders.X-Powder-Preview=true
-      - traefik.http.routers.${opts.name}.middlewares=${opts.name}-diag
+${drainActiveFor(opts.name) ? traefikRetryLabels(opts.name).labels.map((l) => `      - ${l}\n`).join('') : ''}      - traefik.http.routers.${opts.name}.middlewares=${opts.name}-diag${drainActiveFor(opts.name) ? `,${traefikRetryLabels(opts.name).middleware}` : ''}
     networks:
-      - web
+      - ${net}
       - default
 
 networks:
-  web:
+  ${net}:
     external: true
 `
 }

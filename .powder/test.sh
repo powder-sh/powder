@@ -12,7 +12,8 @@ cd apps/web
 # "test gate" in the Deploys docs), but these tests read those committed files. Skip
 # them only when the files are missing; a full checkout and bin/self-deploy.sh still
 # run them. A new test that reads an excluded file fails here with ENOENT on that
-# path: add it to this list.
+# path: add it to this list, or guard the read with it.skipIf(!existsSync(...))
+# (src/lib/__tests__/gate-excluded-reads-guard.test.ts checks both).
 skip=""
 if [ ! -f ../../docker-compose.yml ] || [ ! -f .env.example ] || [ ! -f ../../docker/powder.env.example ]; then
   for t in db-image-pin env-docs-coverage production-startup-guard install-script web-network-docs \

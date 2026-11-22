@@ -42,7 +42,7 @@ function container(labels: Record<string, string>) {
 		// a real address: bridge_http curls it. With none, docker 29 prints `invalid IP`
 		// (non-empty, so the stub curl answered) and docker 28 prints nothing (the wait
 		// ran its full 60 s and the test timed out on a Mac with Docker Desktop's CLI).
-		NetworkSettings: { Networks: { web: { IPAddress: '172.18.0.5' } } },
+		NetworkSettings: { Networks: { web: { IPAddress: '172.18.0.5', Aliases: ['demo', 'app'] } } },
 	}
 }
 
@@ -77,7 +77,7 @@ async function runBridge(l: Record<string, string>) {
 		`#!/bin/bash
 case "$1" in
  inspect) DOCKER_HOST=unix://${sock} exec ${JSON.stringify(DOCKER)} "$@";;
- create) while [ $# -gt 0 ]; do if [ "$1" = --label-file ]; then cp "$2" ${dir}/created-labels; fi; if [ "$1" = --env-file ]; then cp "$2" ${dir}/created-env; fi; shift; done;;
+ create) echo "$*" > ${dir}/created-args; while [ $# -gt 0 ]; do if [ "$1" = --label-file ]; then cp "$2" ${dir}/created-labels; fi; if [ "$1" = --env-file ]; then cp "$2" ${dir}/created-env; fi; shift; done;;
  compose) case "$*" in *"ps -q"*) echo oldid;; esac;;
 esac
 exit 0
@@ -91,7 +91,7 @@ exit 0
 		env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, DOCKER_CONFIG: dir },
 	})
 	const read = (f: string) => (existsSync(join(dir, f)) ? readFileSync(join(dir, f), 'utf8') : null)
-	return { out: stdout, created: read('created-labels'), env: read('created-env') }
+	return { out: stdout, created: read('created-labels'), env: read('created-env'), args: read('created-args') }
 }
 
 const TRAEFIK = {
@@ -114,6 +114,20 @@ describe.skipIf(!DOCKER)('bridge prelude against the real docker CLI', () => {
 		expect(r.created).not.toContain('com.docker.compose.')
 		expect(r.created?.split('\n').filter(Boolean)).toHaveLength(24)
 		expect(r.env).toBe('NODE_ENV=production\nPORT=3000\n')
+	})
+	it('dns-alias mode: aliases and port read through the real CLI templates', async () => {
+		const r = await runBridge({
+			'com.docker.compose.project': 'demo',
+			'com.docker.compose.service': 'app',
+			'powder.bridge.enabled': 'true',
+			'powder.bridge.dns-alias': 'true',
+		})
+		expect(r.out).not.toMatch(/skipped/)
+		expect(parseBridgeVerdict(r.out, NONCE)).toBe('bridged')
+		expect(r.out).toContain('answering on :3000 (DNS-alias mode: docker DNS also answers demo app with the bridge)')
+		expect(r.args).toContain('--network web ')
+		expect(r.args).toContain('--network-alias demo --network-alias app ')
+		expect(r.created).toContain('traefik.enable=false\n')
 	})
 	it('refuses a label value with an LF or CR', async () => {
 		for (const v of ['a\ntraefik.http.routers.evil.rule=Host(`x`)', 'a\rb']) {

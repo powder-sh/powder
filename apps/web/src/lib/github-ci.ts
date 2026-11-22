@@ -6,6 +6,8 @@ const GITHUB_API = 'https://api.github.com'
 
 export interface GhRun {
 	id: number
+	/** The workflow file this run belongs to (GET /actions/workflows ids). */
+	workflow_id: number
 	name: string
 	display_title: string
 	status: 'queued' | 'in_progress' | 'completed' | 'waiting' | 'requested' | 'pending'
@@ -34,7 +36,12 @@ interface CacheEntry<T> {
 }
 
 const CACHE_TTL_MS = 60_000
+/** Time limit of one GitHub call made for the ci tab: a hung GitHub must not hold the page. */
+export const CI_GH_TIMEOUT_MS = 5_000
+// Only answers are cached: a failure (error status, rate limit, timeout) is not, so the
+// next load asks again instead of showing "nothing" for a minute.
 const runsCache = new Map<string, CacheEntry<GhRun[]>>()
+const workflowsCache = new Map<string, CacheEntry<GhWorkflow[]>>()
 const logCache = new Map<string, CacheEntry<string>>()
 
 function headers(token: string): HeadersInit {
@@ -46,16 +53,49 @@ function headers(token: string): HeadersInit {
 	}
 }
 
-// Recent workflow runs for a repo on a given branch. We over-fetch (10) so the
-// CI tab can show a small history, but the projects-list pill only ever uses
-// the first one. Errors become an empty list — a 404/403 just means the user
-// doesn't have access or no Actions are configured, not a hard failure.
+export interface GhWorkflow {
+	id: number
+	name: string
+	path: string
+	/** "active", or "deleted" / "disabled_manually" / "disabled_inactivity" / "disabled_fork". */
+	state: string
+}
+
+// The repo's workflows, deleted and disabled ones included (GitHub keeps them so old
+// runs still resolve). Cached like the runs. null = could not read (error status, rate
+// limit, network, timeout): the caller cannot tell which runs count and shows none.
+export async function listWorkflowsForRepo(
+	token: string,
+	owner: string,
+	repo: string,
+): Promise<GhWorkflow[] | null> {
+	const key = `${owner}/${repo}`
+	const cached = workflowsCache.get(key)
+	if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.value
+	try {
+		const res = await fetch(`${GITHUB_API}/repos/${owner}/${repo}/actions/workflows?per_page=100`, {
+			headers: headers(token),
+			signal: AbortSignal.timeout(CI_GH_TIMEOUT_MS),
+		})
+		if (!res.ok) return null
+		const data = (await res.json()) as { workflows?: GhWorkflow[] }
+		const value = data.workflows ?? []
+		workflowsCache.set(key, { at: Date.now(), value })
+		return value
+	} catch {
+		return null
+	}
+}
+
+// Recent workflow runs for a repo on a given branch. Which of them count (active
+// workflow, deployed commit) is decided in one place: lib/ci-runs.ts. null = could not
+// read (error status, rate limit, network, timeout), never mistaken for "no runs".
 export async function listRunsForRepo(
 	token: string,
 	owner: string,
 	repo: string,
 	opts: { branch?: string; perPage?: number } = {},
-): Promise<GhRun[]> {
+): Promise<GhRun[] | null> {
 	const perPage = opts.perPage ?? 10
 	const key = `${owner}/${repo}@${opts.branch ?? '*'}:${perPage}`
 	const cached = runsCache.get(key)
@@ -67,19 +107,15 @@ export async function listRunsForRepo(
 	try {
 		const res = await fetch(
 			`${GITHUB_API}/repos/${owner}/${repo}/actions/runs?${params.toString()}`,
-			{ headers: headers(token) },
+			{ headers: headers(token), signal: AbortSignal.timeout(CI_GH_TIMEOUT_MS) },
 		)
-		if (!res.ok) {
-			runsCache.set(key, { at: Date.now(), value: [] })
-			return []
-		}
+		if (!res.ok) return null
 		const data = (await res.json()) as { workflow_runs: GhRun[] }
 		const value = data.workflow_runs ?? []
 		runsCache.set(key, { at: Date.now(), value })
 		return value
 	} catch {
-		runsCache.set(key, { at: Date.now(), value: [] })
-		return []
+		return null
 	}
 }
 
@@ -95,7 +131,9 @@ export async function getRunFailureTail(
 	repo: string,
 	runId: number,
 	tailBytes = 8000,
+	opts: { timeoutMs?: number } = {},
 ): Promise<string> {
+	const signal = () => (opts.timeoutMs ? AbortSignal.timeout(opts.timeoutMs) : undefined)
 	const key = `${owner}/${repo}:${runId}:${tailBytes}`
 	const cached = logCache.get(key)
 	if (cached && Date.now() - cached.at < CACHE_TTL_MS * 10) return cached.value
@@ -104,11 +142,11 @@ export async function getRunFailureTail(
 		// /jobs first — pick the failed one(s) and grab their step logs.
 		const jobsRes = await fetch(`${GITHUB_API}/repos/${owner}/${repo}/actions/runs/${runId}/jobs`, {
 			headers: headers(token),
+			signal: signal(),
 		})
 		if (!jobsRes.ok) {
-			const fallback = `(jobs api ${jobsRes.status})`
-			logCache.set(key, { at: Date.now(), value: fallback })
-			return fallback
+			// not cached: a 403 / rate limit or server error is asked again next time
+			return `(jobs api ${jobsRes.status})`
 		}
 		const jobsBody = (await jobsRes.json()) as {
 			jobs: {
@@ -124,12 +162,11 @@ export async function getRunFailureTail(
 		// /logs returns plain text for a single job (no zip dance). Bytes-limited.
 		const logRes = await fetch(
 			`${GITHUB_API}/repos/${owner}/${repo}/actions/jobs/${failedJob.id}/logs`,
-			{ headers: headers(token), redirect: 'follow' },
+			{ headers: headers(token), redirect: 'follow', signal: signal() },
 		)
 		if (!logRes.ok) {
-			const fallback = `(log api ${logRes.status})`
-			logCache.set(key, { at: Date.now(), value: fallback })
-			return fallback
+			// not cached, like the jobs answer above
+			return `(log api ${logRes.status})`
 		}
 		const text = await logRes.text()
 		const tail = text.length > tailBytes ? text.slice(-tailBytes) : text
@@ -137,7 +174,7 @@ export async function getRunFailureTail(
 		return tail
 	} catch (err) {
 		const fallback = `(log fetch failed: ${err instanceof Error ? err.message : 'unknown'})`
-		logCache.set(key, { at: Date.now(), value: fallback })
+		// not cached: a timeout or network error is asked again next time
 		return fallback
 	}
 }
@@ -172,6 +209,7 @@ export async function getCommitBySha(
 	owner: string,
 	repo: string,
 	sha: string,
+	opts: { timeoutMs?: number } = {},
 ): Promise<GhCommit | null> {
 	const key = `${owner}/${repo}/${sha}`
 	const cached = shaCommitCache.get(key)
@@ -179,10 +217,14 @@ export async function getCommitBySha(
 	try {
 		const res = await fetch(
 			`${GITHUB_API}/repos/${owner}/${repo}/commits/${encodeURIComponent(sha)}`,
-			{ headers: headers(token) },
+			{
+				headers: headers(token),
+				signal: opts.timeoutMs ? AbortSignal.timeout(opts.timeoutMs) : undefined,
+			},
 		)
 		if (!res.ok) {
-			shaCommitCache.set(key, null)
+			// a missing commit stays missing; a rate limit or server error is asked again
+			if (res.status === 404 || res.status === 422) shaCommitCache.set(key, null)
 			return null
 		}
 		const data = (await res.json()) as {
@@ -202,7 +244,7 @@ export async function getCommitBySha(
 		shaCommitCache.set(key, value)
 		return value
 	} catch {
-		shaCommitCache.set(key, null)
+		// a timeout or network error: not cached, asked again next time
 		return null
 	}
 }

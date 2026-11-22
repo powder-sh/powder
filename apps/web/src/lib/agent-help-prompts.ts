@@ -1,5 +1,6 @@
 import { redactSecrets } from './llm-redact'
 import { SITE_URL } from './site'
+import { formatCommitLabel } from './deploy-commit'
 
 // Contextual prompts for the dashboard's "ask your agent" panels. Each builder
 // takes only what is already on screen and returns a prompt the user pastes
@@ -102,7 +103,7 @@ export function logTail(text: string, lines = 80): string {
 
 /** a code fence longer than the longest backtick run in `text`, so
  *  the log cannot close the block and continue as prompt text. */
-function fenceFor(text: string): string {
+export function fenceFor(text: string): string {
 	let longest = 0
 	for (const m of text.matchAll(/`+/g)) longest = Math.max(longest, m[0].length)
 	return '`'.repeat(Math.max(3, longest + 1))
@@ -112,6 +113,8 @@ export function debugDeployPrompt(o: {
 	app: string
 	branch?: string | null
 	sha?: string | null
+	/** true when `sha` is only the commit the push requested (lib/deploy-commit.ts) */
+	shaRequested?: boolean
 	failedStep?: string | null
 	exitCode?: number | null
 	summary?: string | null
@@ -119,7 +122,7 @@ export function debugDeployPrompt(o: {
 }): string {
 	const where = [
 		o.branch ? `branch ${o.branch}` : null,
-		o.sha ? `commit ${o.sha.slice(0, 7)}` : null,
+		o.sha ? `commit ${formatCommitLabel({ short: o.sha.slice(0, 7), requested: o.shaRequested === true })}` : null,
 	]
 		.filter(Boolean)
 		.join(', ')

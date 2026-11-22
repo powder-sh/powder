@@ -1,5 +1,7 @@
 import { posix } from 'node:path'
+import { GIT_REMOTE_UNREADABLE } from './tool-lines'
 import { gitCmd, gitHardenShellFunctions } from '../git-harden'
+import { appCheckoutDirShell } from '../app-checkout'
 import { composeProjectNameFor, selfDeployNames } from '../compose-safety'
 
 import { DeployStepError } from '../deploy-failure'
@@ -11,6 +13,7 @@ import { lockedPruneShell } from './prune-lock'
 import { targetLinkGuardShell } from '../target-links'
 import { parseDeployedImage, runDeployScript } from './run'
 import { shq } from '../shell'
+import { OS_PATCH_WEEK_SH } from '../build-cache'
 import { buildLockShell } from '../build-lock'
 import { runCommand } from '../ssh/connection'
 import { GITHUB_KNOWN_HOSTS_SETUP, GIT_SSH_HOSTKEY_OPTS, workdirSyncShell } from '../ssh/git'
@@ -160,17 +163,19 @@ export function selfComposeFileArgs(
  *  NEW worker image with powder.env, so a weak BETTER_AUTH_SECRET or
  *  POWDER_ENCRYPTION_KEY stops the deploy while the old containers still serve,
  *  instead of recreating into a crash loop. Only a config finding (CONFIG_BAD_MARKER)
- *  refuses; a probe that could not run is a warning. No worker service: skipped.
+ *  refuses, and so does a probe that could not run (the gate is never skipped
+ *  silently). No worker service: skipped. The worker image has no package manager:
+ *  node loads tsx itself (WORKDIR /app/apps/web).
  *  Ends with `&& ` so it chains. Same check as CONFIG_PREFLIGHT in bin/self-deploy.sh. */
 export function selfConfigPreflightShell(F: string, workerSvc: string): string {
 	const w = shq(workerSvc)
 	return (
 		`step "config preflight" && ` +
 		`if docker compose ${F} config --services 2>/dev/null | grep -qx ${w}; then ` +
-		`  CFG_OUT=$(docker compose ${F} run --rm --no-deps -T --entrypoint pnpm ${w} -F @powder/web exec tsx src/check-config.ts 2>&1) || true; ` +
+		`  CFG_OUT=$(docker compose ${F} run --rm --no-deps -T --entrypoint node ${w} --import tsx src/check-config.ts 2>&1) || true; ` +
 		`  if printf '%s' "$CFG_OUT" | grep -q ${shq(CONFIG_BAD_MARKER)}; then printf '%s\\n' "$CFG_OUT" | grep -v '^$'; echo "self-deploy: refusing to recreate, fix powder.env first (the running powder keeps serving)"; exit 1; ` +
 		`  elif printf '%s' "$CFG_OUT" | grep -q '\\[config-check\\]'; then echo "[config-check] ok"; ` +
-		`  else echo "[config-check] WARN could not run the config check in the new image, continuing: $(printf '%s' "$CFG_OUT" | tail -2 | tr '\\n' ' ')"; fi; ` +
+		`  else echo "self-deploy: refusing to recreate, could not run the config check in the new image: $(printf '%s' "$CFG_OUT" | tail -2 | tr '\\n' ' ')"; exit 1; fi; ` +
 		`else echo "[config-check] no ${workerSvc} service, skipped"; fi && `
 	)
 }
@@ -298,13 +303,13 @@ export async function runSelfDeploy(
 		// ls-remote exercises exactly the credentials the fetch will use (KEY is
 		// already exported above when present), so it also catches a revoked key
 		// or token - which no file check ever could.
-		`PF_GITDIR=""; if [ -d src/.git ]; then PF_GITDIR=src; elif [ -d .git ]; then PF_GITDIR=.; fi && ` +
+		`${appCheckoutDirShell('PF_GITDIR')} && ` +
 		`if [ -n "$PF_GITDIR" ]; then ` +
 		`  PF_REMOTE=$(${gitCmd(shq('*'), '"$PF_GITDIR"')} remote get-url origin 2>/dev/null || echo "") && ` +
 		`  if [ -n "$PF_REMOTE" ]; then ` +
 		`    step "preflight git auth" && ` +
 		`    if ! PF_LS=$(${gitCmd(shq('*'), '"$PF_GITDIR"')} ls-remote --heads origin 2>&1); then ` +
-		`      echo "preflight: cannot read the git remote - the deploy would build whatever is already on disk instead of your push. remote=$(printf '%s' "$PF_REMOTE" | sed -E 's#://[^@/]*@#://***@#') :: $(printf '%s' "$PF_LS" | tail -2 | tr '\n' ' ')"; ` +
+		`      echo "${GIT_REMOTE_UNREADABLE} - the deploy would build whatever is already on disk instead of your push. remote=$(printf '%s' "$PF_REMOTE" | sed -E 's#://[^@/]*@#://***@#') :: $(printf '%s' "$PF_LS" | tail -2 | tr '\n' ' ')"; ` +
 		`      echo "preflight: check the deploy key at $KEY, the ssh-config Host alias, or the token in the remote URL."; ` +
 		`      exit 1; ` +
 		`    fi; ` +
@@ -379,6 +384,8 @@ export async function runSelfDeploy(
 		// host build-lock (see rebuildDeploy) - never two concurrent builds per server
 		`SELF_TARGETS=${shq(service)}; if ${hasWorkerShell(configFile)} && [ ${shq(workerSvc)} != ${shq(service)} ]; then SELF_TARGETS="$SELF_TARGETS "${shq(workerSvc)}; fi; ` +
 		`export POWDER_BUILD_CACHE_ID="$(${BUILD_CACHE_ID_SH})"; case "$POWDER_BUILD_CACHE_ID" in *[!0-9a-f]*) POWDER_BUILD_CACHE_ID= ;; esac; ` +
+		// docker/web.Dockerfile refreshes its OS upgrade layers once per ISO week.
+		`${OS_PATCH_WEEK_SH}; export OS_PATCH_WEEK; ` +
 		`flock -w 2400 ${buildLockShell()} docker compose ${F} build $SELF_TARGETS 2>&1 && ` +
 		`step "resolve image" && ` +
 		`IMG=$(docker compose ${F} config --images ${shq(service)} 2>/dev/null | head -1) && ` +

@@ -8,8 +8,11 @@ import {
 	cacheNamespace,
 	composeDockerfileRewriteShell,
 	dockerfileRewriteFunctions,
+	OS_PATCH_WEEK_SH,
+	osPatchWeek,
 	rewrittenCacheId,
 	runNamespaceArgName,
+	withOsPatchWeek,
 } from '../build-cache'
 import { buildBuilderScript } from '../builder'
 import { buildDeployScript } from '../deploy/script'
@@ -268,7 +271,8 @@ describe('wiring', () => {
 		expect(r.status).toBe(0)
 		expect(r.stdout).toMatch(
 			// each service's build.context is pinned to its resolved path too
-			/services:\n {2}app:\n {4}build:\n {6}dockerfile: \/.*\/1\.Dockerfile\n {6}context: \/.*\/src\n {2}worker:\n {4}build:\n {6}dockerfile: \/.*\/2\.Dockerfile\n {6}context: \/.*\/src\/worker\n/,
+			// and carries this week's OS_PATCH_WEEK build arg
+			/services:\n {2}app:\n {4}build:\n {6}dockerfile: \/.*\/1\.Dockerfile\n {6}args:\n {8}OS_PATCH_WEEK: "\d{4}-W\d{2}"\n {6}context: \/.*\/src\n {2}worker:\n {4}build:\n {6}dockerfile: \/.*\/2\.Dockerfile\n {6}args:\n {8}OS_PATCH_WEEK: "\d{4}-W\d{2}"\n {6}context: \/.*\/src\/worker\n/,
 		)
 		expect(r.stdout).toMatch(/F=-f \/.*\/override\.yml/)
 		expect(r.stdout).toContain(id('/a'))
@@ -334,5 +338,92 @@ describe('wiring', () => {
 		expect(s).toMatch(/docker build [^&]*-f "\$DFR_DIR\/Dockerfile"/)
 		expect(s).not.toContain("-f '/opt/builds/s-shop/src/Dockerfile'")
 		expect(spawnSync('bash', ['-n', '-c', s]).status).toBe(0)
+	})
+})
+
+// Pinned or unchanged base images keep an `apt-get upgrade` layer cached forever.
+// powder passes OS_PATCH_WEEK=<ISO week> to every build, so a Dockerfile that
+// declares the ARG before its upgrade line refreshes that layer once a week.
+describe('OS patch week build arg', () => {
+	const REPO = join(__dirname, '../../../../..')
+
+	it('osPatchWeek is the ISO 8601 week in UTC', () => {
+		expect(osPatchWeek(new Date('2026-11-19T12:00:00Z'))).toBe('2026-W47')
+		expect(osPatchWeek(new Date('2026-11-22T23:59:59Z'))).toBe('2026-W47') // Sunday
+		expect(osPatchWeek(new Date('2026-11-23T00:00:00Z'))).toBe('2026-W48') // Monday
+		expect(osPatchWeek(new Date('2021-01-01T00:00:00Z'))).toBe('2020-W53')
+		expect(osPatchWeek(new Date('2024-12-30T00:00:00Z'))).toBe('2025-W01')
+		expect(osPatchWeek(new Date('2027-01-04T00:00:00Z'))).toBe('2027-W01')
+	})
+
+	it('the shell snippet prints the same week as osPatchWeek, and empty when date fails', () => {
+		const ok = spawnSync('bash', ['-c', `set -eu; ${OS_PATCH_WEEK_SH}; printf %s "$OS_PATCH_WEEK"`], { encoding: 'utf8' })
+		expect(ok.status).toBe(0)
+		expect(ok.stdout).toBe(osPatchWeek())
+		const noDate = join(root, 'nodate')
+		mkdirSync(noDate, { recursive: true })
+		writeFileSync(join(noDate, 'date'), '#!/bin/sh\necho garbage; exit 1\n', { mode: 0o755 })
+		const bad = spawnSync('bash', ['-c', `set -eu; ${OS_PATCH_WEEK_SH}; printf '[%s]' "$OS_PATCH_WEEK"`], {
+			encoding: 'utf8',
+			env: { ...process.env, PATH: `${noDate}:${process.env.PATH}` },
+		})
+		expect(bad.status).toBe(0)
+		expect(bad.stdout).toBe('[]')
+	})
+
+	it('builder path: powder sets the week, over any compose value', () => {
+		const d = new Date('2026-11-19T00:00:00Z')
+		expect(withOsPatchWeek({ A: '1' }, d)).toEqual({ A: '1', OS_PATCH_WEEK: '2026-W47' })
+		expect(withOsPatchWeek({ OS_PATCH_WEEK: 'never' }, d)).toEqual({ OS_PATCH_WEEK: '2026-W47' })
+	})
+
+	it('compose path: the Dockerfile check sees the week as a build arg; no week, no arg', () => {
+		const dir = join(root, 'patchweek')
+		mkdirSync(join(dir, 'src'), { recursive: true })
+		// an image ref only the build arg resolves: the check refuses it as unresolved
+		// unless it knows the value the build passes
+		writeFileSync(join(dir, 'src', 'Dockerfile'), 'ARG OS_PATCH_WEEK\nFROM node:${OS_PATCH_WEEK}\nRUN true\n')
+		const cfg = join(root, 'patchweek.yml')
+		writeFileSync(cfg, `name: pw\nservices:\n  app:\n    build:\n      context: ${dir}/src\n      dockerfile: Dockerfile\n    image: pw:latest\n`)
+		const run = (path: string) =>
+			spawnSync(
+				'bash',
+				['-c', `DFR_NS=${NS}; DFR_APP=pw; DFR_DIR=$(mktemp -d); DFR_MODE=enforce; DFR_PULL=0; DFR_OWN=""; CP_PROJ=pw; ${dockerfileRewriteFunctions('pw')}${composeDockerfileRewriteShell("-f 'x.yml'", protectExistingIgnoreShell)}cat "$DFR_DIR/override.yml"`],
+				{ encoding: 'utf8', env: { ...process.env, PATH: path, CFG: cfg, IMGS: `node:${osPatchWeek()}=1` } },
+			)
+		const withWeek = run(`${bin}:${process.env.PATH}`)
+		expect(withWeek.stdout).not.toContain('no ARG default or build arg')
+		expect(withWeek.stdout).toContain(`OS_PATCH_WEEK: "${osPatchWeek()}"`)
+		const noDate = join(root, 'nodate2')
+		mkdirSync(noDate, { recursive: true })
+		writeFileSync(join(noDate, 'date'), '#!/bin/sh\nexit 1\n', { mode: 0o755 })
+		const without = run(`${noDate}:${bin}:${process.env.PATH}`)
+		expect(without.stdout).toContain('no ARG default or build arg')
+		expect(without.stdout).not.toContain('OS_PATCH_WEEK:')
+	})
+
+	it("powder's own build: every OS upgrade layer is keyed on the week, and every self-deploy path passes it", () => {
+		const df = readFileSync(join(REPO, 'docker/web.Dockerfile'), 'utf8').split('\n')
+		const upgrades = df.flatMap((l, i) => (/\b(apt-get|apk) upgrade\b/.test(l) && !l.startsWith('#') ? [i] : []))
+		expect(upgrades.length).toBeGreaterThan(0)
+		for (const i of upgrades) {
+			expect(df[i]).toContain('${OS_PATCH_WEEK')
+			const stageStart = df.slice(0, i).findLastIndex((l) => /^FROM /.test(l))
+			expect(df.slice(stageStart, i).some((l) => /^ARG OS_PATCH_WEEK\b/.test(l))).toBe(true)
+		}
+		for (const f of ['bin/self-deploy.sh', 'bin/install.sh'])
+			expect(readFileSync(join(REPO, f), 'utf8')).toContain(`OS_PATCH_WEEK_SH='${OS_PATCH_WEEK_SH}'`)
+		const sd = readFileSync(join(REPO, 'bin/self-deploy.sh'), 'utf8')
+		expect(sd).toContain('OS_PATCH_WEEK=$OS_PATCH_WEEK $DC build powder')
+		expect(sd).toContain('OS_PATCH_WEEK=$OS_PATCH_WEEK $DC build worker')
+		expect(readFileSync(join(REPO, 'bin/install.sh'), 'utf8')).toContain('POWDER_BUILD_CACHE_ID|OS_PATCH_WEEK) continue')
+	})
+
+	// powder's push gate copies the tree without docker-compose.yml (.powder/test.sh):
+	// only this compose check skips there; a full checkout and bin/self-deploy.sh run it.
+	const COMPOSE = join(REPO, 'docker-compose.yml')
+	it.skipIf(!existsSync(COMPOSE))("powder's own compose file passes the week to both builds", () => {
+		const compose = readFileSync(COMPOSE, 'utf8')
+		expect(compose.match(/OS_PATCH_WEEK: \$\{OS_PATCH_WEEK:-\}/g)?.length).toBe(2)
 	})
 })

@@ -26,6 +26,7 @@ import {
 	sql,
 	user,
 } from '@/lib/db'
+import { deployListOrder } from '@/lib/deploy-order-db'
 
 // Queries for the /activity feed. One query per source, each bounded by the
 // time window [since, before) and a hard LIMIT (LEG_LIMIT), merged in
@@ -56,17 +57,20 @@ async function deployLeg(mode: DeployLegMode, since: Date, before: Date): Promis
 			startedAt: deploys.startedAt,
 			triggeredBy: deploys.triggeredBy,
 			gitSha: deploys.gitSha,
+			builtSha: deploys.builtSha,
+			requestedSha: deploys.requestedSha,
 			errorSummary: deploys.errorSummary,
 		})
 		.from(deploys)
 		.where(
 			and(
 				deployWhere(mode),
-				sql`${deploys.startedAt} >= ${since.toISOString()}::timestamptz`,
-				sql`${deploys.startedAt} < ${before.toISOString()}::timestamptz`,
+				// the same time the event shows (lib/deploy-order.ts): when the deploy was asked for
+				sql`${deploys.queuedAt} >= ${since.toISOString()}::timestamptz`,
+				sql`${deploys.queuedAt} < ${before.toISOString()}::timestamptz`,
 			),
 		)
-		.orderBy(desc(deploys.startedAt))
+		.orderBy(...deployListOrder())
 		.limit(LEG_LIMIT)
 	return rows.map(deployEvent)
 }

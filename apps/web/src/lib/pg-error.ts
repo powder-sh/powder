@@ -34,6 +34,28 @@ export function isDbError(err: unknown): boolean {
 	return false
 }
 
+// SQLSTATEs that mean "try again" rather than "this statement is wrong":
+// 57014 statement timeout, 57P01-03 admin/crash shutdown or cannot connect now,
+// class 08 connection exceptions, 53300 too many connections, 40001/40P01 retryable txn conflicts.
+const TRANSIENT_SQLSTATE = /^(57014|57P0[123]|08[0-9A-Z]{3}|53300|40001|40P01)$/
+// postgres.js and Node socket errors (no SQLSTATE).
+const TRANSIENT_DRIVER_CODE = /^(CONNECTION_(CLOSED|ENDED|DESTROYED)|CONNECT_TIMEOUT|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|EAI_AGAIN)$/
+
+/** A DB error worth retrying: statement timeout, connection loss, pool/connect timeout,
+ *  anywhere on the cause chain. Pure. */
+export function isTransientDbError(err: unknown): boolean {
+	const state = pgErrorCode(err)
+	if (state && TRANSIENT_SQLSTATE.test(state)) return true
+	let cur: unknown = err
+	for (let i = 0; i < MAX_DEPTH && cur && typeof cur === 'object'; i++) {
+		const e = cur as { code?: unknown; message?: unknown; cause?: unknown }
+		if (typeof e.code === 'string' && TRANSIENT_DRIVER_CODE.test(e.code)) return true
+		if (typeof e.message === 'string' && /canceling statement due to statement timeout/i.test(e.message)) return true
+		cur = e.cause
+	}
+	return false
+}
+
 export const DB_ERROR_MESSAGE = 'database error'
 
 /** The message a route may show for `err`: its own message, or `fallback` for a

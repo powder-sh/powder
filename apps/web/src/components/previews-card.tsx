@@ -1,9 +1,10 @@
 'use client'
 
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import { CopyButton } from '@/components/ui/copy-button'
 import { SkeletonList } from '@/components/ui/skeleton'
 import { useEffect, useState } from 'react'
-import { Copy, ExternalLink, GitBranch, Globe, Plus, RefreshCw, Trash2 } from 'lucide-react'
+import { ExternalLink, GitBranch, Globe, Plus, RefreshCw, Trash2 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -39,6 +40,8 @@ export function PreviewsCard({
 }) {
 	const [previews, setPreviews] = useState<Preview[] | null>(null)
 	const [confirmRemove, setConfirmRemove] = useState<string | null>(null)
+	// what the last removal left on the server, when powder could not prove it its own
+	const [removeNote, setRemoveNote] = useState<string | null>(null)
 	const [allDomains, setAllDomains] = useState<PreviewDomain[]>([])
 	const [ingressIp, setIngressIp] = useState<string | null>(null)
 	const [baseDomain, setBaseDomain] = useState<string | null | undefined>(undefined)
@@ -68,7 +71,9 @@ export function PreviewsCard({
 
 	async function remove(id: string) {
 		setConfirmRemove(null)
-		await fetch(`${base}/${id}`, { method: 'DELETE' })
+		const res = await fetch(`${base}/${id}`, { method: 'DELETE' })
+		const data = (await res.json().catch(() => ({}))) as { note?: string | null; error?: string }
+		setRemoveNote(data.note ?? data.error ?? null)
 		await load()
 	}
 
@@ -88,6 +93,9 @@ export function PreviewsCard({
 				</div>
 			</CardHeader>
 			<CardContent>
+				{removeNote && (
+					<p className="mb-3 rounded-md border border-warning/40 bg-warning/10 p-3 text-2xs text-muted-foreground">{removeNote}</p>
+				)}
 				{previews === null ? (
 					<SkeletonList rows={2} bare />
 				) : previews.length === 0 ? (
@@ -159,7 +167,7 @@ function PreviewRow({
 }) {
 	const [showAddDomain, setShowAddDomain] = useState(false)
 	return (
-		<div className="px-3 py-2.5 text-xs">
+		<div className="group px-3 py-2.5 text-xs">
 			<div className="grid grid-cols-12 gap-3">
 				<div className="col-span-4 min-w-0">
 					<div className="flex items-center gap-1.5 truncate font-mono">
@@ -185,7 +193,12 @@ function PreviewRow({
 						<span className="text-2xs text-muted-foreground">-</span>
 					)}
 					{preview.lastError && (
-						<div className="mt-0.5 truncate text-2xs text-destructive">{preview.lastError}</div>
+						<div className="mt-0.5 flex items-center gap-1">
+							<div className="ph-no-capture min-w-0 truncate text-2xs text-destructive" title={preview.lastError}>
+								{preview.lastError}
+							</div>
+							<CopyButton value={preview.lastError} label="copy the error" reveal className="-my-1" />
+						</div>
 					)}
 				</div>
 				<div className="col-span-2">
@@ -290,15 +303,7 @@ function PreviewDomains({
 						{d.status !== 'live' && d.verifyChallenge && (
 							<span className="flex items-center gap-1 font-mono text-2xs text-muted-foreground">
 								TXT _powder-verify.{d.hostname} = {d.verifyChallenge}
-								<button
-									type="button"
-									onClick={() => navigator.clipboard?.writeText(d.verifyChallenge ?? '')}
-									aria-label="copy TXT value"
-									title="copy TXT value"
-									className="rounded-md p-1 hover:bg-accent"
-								>
-									<Copy className="h-3 w-3" />
-								</button>
+								<CopyButton value={d.verifyChallenge} label="copy TXT value" />
 							</span>
 						)}
 					</div>

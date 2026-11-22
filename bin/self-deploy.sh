@@ -321,6 +321,11 @@ echo "── build powder AND worker (under the server build lock) ──"
 # distinct from every app's cache id, just not secret) instead of failing.
 BCID=$(ssh "$HOST" "$BUILD_CACHE_ID_SH" 2>/dev/null || true)
 case "$BCID" in *[!0-9a-f]*|'') echo "⚠ no build cache id on the server (/opt/apps/.powder-build-cache-id); building with an empty one" >&2; BCID= ;; esac
+# The ISO week the build passes as OS_PATCH_WEEK (docker/web.Dockerfile): the OS
+# upgrade layers re-run once a week instead of staying cached forever. Same snippet
+# as OS_PATCH_WEEK_SH in apps/web/src/lib/build-cache.ts.
+OS_PATCH_WEEK_SH='OS_PATCH_WEEK=$(date -u +%G-W%V 2>/dev/null || true); case "$OS_PATCH_WEEK" in [0-9][0-9][0-9][0-9]-W[0-9][0-9]) ;; *) OS_PATCH_WEEK= ;; esac'
+eval "$OS_PATCH_WEEK_SH"
 # The server build lock (BUILD_LOCK in apps/web/src/lib/build-lock.ts). The build also
 # waits on the lock at the older path (OLDER_BUILD_LOCK below) when it is a regular
 # root-owned file (only root can create or remove it in sticky /tmp), so an upgrade
@@ -329,16 +334,18 @@ BUILD_LOCK=/run/powder-build.lock
 OLDER_BUILD_LOCK=/tmp/powder-build.lock
 ssh "$HOST" "cd $SRC && PBL=; if [ -f $OLDER_BUILD_LOCK ] && [ ! -L $OLDER_BUILD_LOCK ] && [ \"\$(stat -c %u $OLDER_BUILD_LOCK 2>/dev/null)\" = 0 ]; then PBL='flock -w 2400 $OLDER_BUILD_LOCK'; fi; flock -w 2400 $BUILD_LOCK \$PBL bash -lc '\
   set -eo pipefail; \
-  POWDER_BUILD_CACHE_ID=$BCID $DC build powder 2>&1 | tail -8; \
-  POWDER_BUILD_CACHE_ID=$BCID $DC build worker 2>&1 | tail -8'"
+  POWDER_BUILD_CACHE_ID=$BCID OS_PATCH_WEEK=$OS_PATCH_WEEK $DC build powder 2>&1 | tail -8; \
+  POWDER_BUILD_CACHE_ID=$BCID OS_PATCH_WEEK=$OS_PATCH_WEEK $DC build worker 2>&1 | tail -8'"
 
 # Config preflight: the NEW worker image checks powder.env with the same
 # rules the new containers refuse to start on (apps/web/src/check-config.ts), BEFORE
 # anything is recreated: a weak BETTER_AUTH_SECRET / POWDER_ENCRYPTION_KEY aborts here
 # with the old containers still serving, instead of a crash loop after the recreate.
-# Only a config finding (__POWDER_CONFIG_BAD__) refuses; a probe that cannot run warns.
+# A config finding (__POWDER_CONFIG_BAD__) refuses, and so does a probe that cannot run:
+# the weak-secret gate must never be skipped silently. The worker image has no package
+# manager: node loads tsx itself (WORKDIR /app/apps/web).
 echo "── config preflight (new image, $ENVF) ──"
-CFG_OUT=$(ssh "$HOST" "cd $SRC && $DC run --rm --no-deps -T --entrypoint pnpm worker -F @powder/web exec tsx src/check-config.ts 2>&1" 2>&1 || true)
+CFG_OUT=$(ssh "$HOST" "cd $SRC && $DC run --rm --no-deps -T --entrypoint node worker --import tsx src/check-config.ts 2>&1" 2>&1 || true)
 if printf '%s' "$CFG_OUT" | grep -q '__POWDER_CONFIG_BAD__'; then
   printf '%s\n' "$CFG_OUT" | grep -v '^$' >&2
   echo "✗ refusing to recreate: fix $ENVF first (the running powder and worker are untouched)." >&2
@@ -346,7 +353,9 @@ if printf '%s' "$CFG_OUT" | grep -q '__POWDER_CONFIG_BAD__'; then
 elif printf '%s' "$CFG_OUT" | grep -q '\[config-check\]'; then
   echo "  ok"
 else
-  echo "⚠ could not run the config check in the new image, continuing: $(printf '%s' "$CFG_OUT" | tail -2 | tr '\n' ' ')" >&2
+  echo "✗ refusing to recreate: could not run the config check in the new image: $(printf '%s' "$CFG_OUT" | tail -2 | tr '\n' ' ')" >&2
+  echo "  (the running powder and worker are untouched)" >&2
+  exit 1
 fi
 
 # Env render targets: which apps render their env outside their own dir and
@@ -354,7 +363,7 @@ fi
 # normal run; --pin-report stops here.
 echo "── env render targets (new image) ──"
 PIN_RC=0
-PIN_OUT=$(ssh "$HOST" "cd $SRC && $DC run --rm --no-deps -T --entrypoint pnpm worker -F @powder/web exec tsx src/env-pin-report.ts 2>&1" 2>&1) || PIN_RC=$?
+PIN_OUT=$(ssh "$HOST" "cd $SRC && $DC run --rm --no-deps -T --entrypoint node worker --import tsx src/env-pin-report.ts 2>&1" 2>&1) || PIN_RC=$?
 printf '%s\n' "$PIN_OUT" | grep -v '^$' || true
 if [ "$PIN_REPORT" = "1" ]; then
   if [ "$PIN_RC" != "0" ]; then

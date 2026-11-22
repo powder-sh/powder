@@ -7,11 +7,9 @@ import { ServerUnreachable } from '@/components/server-unreachable'
 
 import { useCallback, useEffect, useId, useState } from 'react'
 import {
-	Check,
 	ChevronDown,
 	ChevronRight,
 	Clock,
-	Copy,
 	Pencil,
 	Play,
 	Plus,
@@ -19,6 +17,7 @@ import {
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { CopyButton } from '@/components/ui/copy-button'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Field, FieldRow, Input, Select } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -658,9 +657,22 @@ function RunsList({ runs }: { runs: Run[] }) {
 							</span>
 						</button>
 						{expanded === r.id && (
-							<pre className="ph-no-capture mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded border border-border bg-background/60 p-2 font-mono text-2xs">
-								{r.output ? tail(r.output) : '(no output)'}
-							</pre>
+							<div className="relative mt-1">
+								<pre
+									id={`cron-run-${r.id}`}
+									className="ph-no-capture max-h-64 overflow-auto whitespace-pre-wrap break-words rounded border border-border bg-background/60 p-2 pr-10 font-mono text-2xs"
+								>
+									{r.output ? tail(r.output) : '(no output)'}
+								</pre>
+								{(r.error || r.output) && (
+									<CopyButton
+										value={() => [r.error, r.output ? tail(r.output) : null].filter(Boolean).join('\n\n')}
+										label={r.error ? 'copy the error and output' : 'copy the output'}
+										targetId={`cron-run-${r.id}`}
+										className="absolute right-1 top-1"
+									/>
+								)}
+							</div>
 						)}
 					</div>
 				))}
@@ -695,7 +707,12 @@ function HostSection({
 					reading the server's crontab over SSH…
 				</p>
 			) : error ? (
-				<p className="mt-1 text-xs text-destructive">couldn't read the crontab: {error}</p>
+				<div className="mt-1 flex items-start gap-1">
+					<p className="ph-no-capture min-w-0 text-xs text-destructive [overflow-wrap:anywhere]">
+						couldn't read the crontab: {error}
+					</p>
+					<CopyButton value={error} label="copy the error" className="-mt-0.5" />
+				</div>
 			) : jobs.length === 0 ? (
 				<p className="mt-1 text-xs text-muted-foreground">
 					no host crons match this container.
@@ -957,23 +974,17 @@ function JobForm({
 }
 
 function CronTokenBanner({ token, onDismiss }: { token: string; onDismiss: () => void }) {
-	const [copied, setCopied] = useState(false)
-	function copy() {
-		navigator.clipboard.writeText(token).then(() => {
-			setCopied(true)
-			setTimeout(() => setCopied(false), 1500)
-		})
-	}
 	return (
 		<div className="space-y-2 rounded-md border border-powder/40 bg-powder/5 p-3 text-xs">
 			<div className="font-medium">your app needs this token to verify powder's cron pings:</div>
 			<div className="flex items-center gap-2">
-				<pre className="ph-no-capture flex-1 overflow-auto rounded-md bg-background px-2 py-1.5 font-mono text-2xs">
+				<pre
+					id="cron-token"
+					className="ph-no-capture flex-1 overflow-auto rounded-md bg-background px-2 py-1.5 font-mono text-2xs"
+				>
 					POWDER_CRON_TOKEN={token}
 				</pre>
-				<Button variant="outline" size="icon" onClick={copy} title="copy">
-					{copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-				</Button>
+				<CopyButton value={token} label="copy the token" targetId="cron-token" size="sm" />
 			</div>
 			<div className="text-2xs text-muted-foreground">
 				paste into your app's env vars, then redeploy. your endpoint should reject requests whose{' '}

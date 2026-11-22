@@ -21,7 +21,7 @@ You need one Linux server with root and a public hostname for the dashboard (Git
 3. **Install.** On the server:
 
    ```bash
-   sudo git clone --branch v0.10.0 https://github.com/powder-sh/powder /opt/apps/powder/src
+   sudo git clone --branch v0.11.0 https://github.com/powder-sh/powder /opt/apps/powder/src
    cd /opt/apps/powder/src
    sudo bin/install.sh
    ```

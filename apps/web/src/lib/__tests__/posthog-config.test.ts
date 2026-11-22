@@ -41,10 +41,6 @@ describe('PostHog build-time variables reach the build', () => {
 			expect(df).toContain(`ENV ${v}=$${v}`)
 		}
 	})
-	it('both compose builds pass each as a build arg', () => {
-		const compose = read('docker-compose.yml')
-		for (const v of VARS) {
-			expect(compose.split(`${v}: \${${v}:-}`).length - 1, v).toBe(2)
-		}
-	})
+	// Both compose builds passing each as a build arg is checked in compose-db-vars.test.ts:
+	// powder's test gate copy leaves docker-compose.yml out.
 })

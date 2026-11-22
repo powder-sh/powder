@@ -1,6 +1,8 @@
+import type { TestGate } from '@powder/db/schema'
 import { gitCmd, gitHardenShellFunctions } from '../git-harden'
 import { randomBytes } from 'node:crypto'
 import { BUILDER_SCRIPT_RESERVE_SEC, DEPLOY_BUDGET_SEC, budgetExhausted, outerTimeoutSec, remainingBudgetSec, sshWallMs, TIMEOUT_KILL_SEC } from '../deploy-budget'
+import { BuilderAppBuildFailedError } from '../builder-failure'
 import { BuilderTestGateFailedError, DeployStepError } from '../deploy-failure'
 import type { ServerConfig } from '../servers'
 import { type BridgeVerdict, type NginxUpstreamVerdict, buildPullEnabled, composeFileArgs, parseBridgeVerdict, parseNginxUpstreamVerdict, projectChangedMarkerFor, resolveInfraServices, testGateMemOverride } from './fragments'
@@ -18,7 +20,7 @@ import {
 	swapPrevPath,
 	swapStampPath,
 } from '../deploy-supersede'
-import { appLockShell } from './fragments'
+import { appLockShell, drainAbortClearShell, drainRuleId } from './fragments'
 import { shq } from '../shell'
 import type { PushDecision } from '../deploy-push-policy'
 import { withRegistryCreds } from '../docker-env'
@@ -114,6 +116,8 @@ export async function restoreSharedTagAfterAbort(
 	const lock = appLockPath(p.workingDir, p.service)
 	const inner =
 		appLockShell(lock) +
+		// the script's EXIT trap never ran: delete this app's powder-drain rules first
+		drainAbortClearShell(drainRuleId(p.workingDir, p.service), p.containerName) +
 		`F=${shq(prev)}; [ -f "$F" ] || exit 0; ` +
 		`PREV=$(sed -n 1p "$F"); REF=$(sed -n 2p "$F"); ` +
 		`RUN=$(docker inspect -f '{{.Image}}' ${shq(p.containerName)} 2>/dev/null || true); ` +
@@ -278,6 +282,13 @@ export function parseDeployedImage(stdout: string): string | null {
 	return all.at(-1)?.[1] ?? null
 }
 
+/** The test gate's outcome (deploys.test_gate): this run's nonced test-gate-result mark,
+ *  else, for a prebuilt deploy (the target skips its own gate), the builder's result.
+ *  A plain `[test-gate] passed` line in the output counts for nothing. Pure. */
+export function testGateOutcome(stdout: string, nonce: string, builderResult: TestGate | null): TestGate | null {
+	return parseStabilityMarkers(stdout, nonce).testGateResult ?? builderResult
+}
+
 export async function rebuildDeploy(
 	server: ServerConfig,
 	workingDir: string,
@@ -371,6 +382,8 @@ export async function rebuildDeploy(
 	nginxUpstreamVerdict?: NginxUpstreamVerdict | null
 	/** the deploy-setup checks' nonce-tagged markers (deploy/stability.ts); each part null when unknown. */
 	stability?: StabilityMarkers | null
+	/** the test gate's outcome from the nonced marks (stored as deploys.test_gate); null = not recorded */
+	testGate?: TestGate | null
 }> {
 	// A spent budget never starts a build: fail before touching anything, as a
 	// known pre-swap step (the old container keeps serving).
@@ -479,6 +492,8 @@ export async function rebuildDeploy(
 	// and the synced src/ (migrations, git_sha) MUST describe the same commit.
 	let shaIsStrict = false
 	let stageImage: string | null = null
+	// the builder's test gate outcome (its nonced mark): a prebuilt deploy takes it
+	let builderTestGate: TestGate | null = null
 	if (opts?.builder && declaredMode !== 'registry') {
 		const collect = (s: string) => {
 			builderLog += s
@@ -503,6 +518,7 @@ export async function rebuildDeploy(
 			)
 			prebuilt = true
 			stageImage = built.stageImage
+			builderTestGate = built.testGate
 			if (built.sha) {
 				wantSha = built.sha
 				shaIsStrict = true
@@ -512,7 +528,12 @@ export async function rebuildDeploy(
 			// target was touched yet (its checkout syncs in the deploy script), so this is a clean pre-swap stop.
 			if (err instanceof BuilderTestGateFailedError) {
 				collect(`[builder] ${err.message} - not falling back to a local build (the same tests would fail there)\n`)
-				throw new DeployStepError(`${builderLog}__POWDER_FAIL__ step=test gate code=1`)
+				throw new DeployStepError(`${builderLog}__POWDER_FAIL__ step=test gate code=1`).withTestGate('failed').withBuiltSha(err.builtSha)
+			}
+			// The commit's own build failure (builder-failure.ts) fails the same way anywhere: same clean stop.
+			if (err instanceof BuilderAppBuildFailedError) {
+				collect(`[builder] ${err.message} - not falling back to a local build (the same build would fail there)\n`)
+				throw new DeployStepError(`${builderLog}__POWDER_FAIL__ step=build code=1`).withBuiltSha(err.builtSha)
 			}
 			collect(
 				`[builder] phase failed - ${err instanceof Error ? err.message : String(err)}\n` +
@@ -529,6 +550,7 @@ export async function rebuildDeploy(
 	const infra = await resolveInfraServices(server, cf, service)
 	const scriptBudgetSec = remainingBudgetSec(opts?.deadlineAt)
 	const shaNonce = randomBytes(12).toString('hex')
+	const gateResult = (out: string): TestGate | null => testGateOutcome(out, shaNonce, prebuilt ? builderTestGate : null)
 	// the script's markers carry the nonce, so build output cannot fake them.
 	const changedMarker = composeChangedMarkerFor(shaNonce)
 	const scriptFor = (composeHash: string, budgetSec = scriptBudgetSec, recheck = !guard.enforce, hashEnforce = false) => buildDeployScript({
@@ -644,7 +666,14 @@ export async function rebuildDeploy(
 			stderr = [stderr, await refusedReset()].filter(Boolean).join('\n')
 		// Combine streams so the parser sees both the __POWDER_FAIL__ marker
 		// (stdout, via the EXIT trap) and any raw stderr a step emitted.
+		// a deploy that passed the gate and failed later (db migrate, swap) keeps 'passed'
 		throw new DeployStepError(strip([builderLog, stdout, stderr].filter(Boolean).join('\n')) || 'deploy failed')
+			.withTestGate(gateResult(stdout))
+			// the commit the script synced to (nonced marker), when it got that far; before that
+			// (app lock, preflight, git sync) a prebuilt deploy's commit is the builder's: wantSha
+			// holds it exactly when shaIsStrict (set only from the builder's nonced built sha, and
+			// the commit the target is pinned to), and the gate result then is the builder's too
+			.withBuiltSha(parseSyncedSha(stdout, shaNonce).sha ?? (prebuilt && shaIsStrict ? wantSha : null))
 	}
 
 	// Both sync paths (src/ and the workdir layout) print the same marker after the
@@ -674,6 +703,7 @@ export async function rebuildDeploy(
 		nginxUpstreamVerdict: parseNginxUpstreamVerdict(stdout, shaNonce),
 		// never throws (a bad marker is "unknown"): warnings must not fail a deploy.
 		stability: parseStabilityMarkers(stdout, shaNonce),
+		testGate: gateResult(stdout),
 	}
 }
 

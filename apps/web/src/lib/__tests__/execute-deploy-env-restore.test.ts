@@ -33,7 +33,7 @@ vi.mock('../deploys', () => ({
 	lastSuccessfulComposeHash: async () => null,
 	lastSuccessfulComposeView: async () => null,
 }))
-vi.mock('../github-deployments', () => ({ notifyDeploymentFinished: async () => {} }))
+vi.mock('../github-deployments', () => ({ notifyCommitPending: () => {}, notifyPreviewCommit: async () => {}, notifyDeploymentFinished: async () => {} }))
 vi.mock('../hq', () => ({ extractBuilderFallback: () => null, portsLeftPublicLines: () => [], reportDeployToHq: async () => {}, reportDeployWarningsToHq: async () => {} }))
 vi.mock('../notifications', () => ({ notifyDeployFailed: async () => {}, notifyDeploySucceeded: async () => {} }))
 vi.mock('../servers', () => ({ getServer: async () => ({ id: 's', host: 'h' }) }))

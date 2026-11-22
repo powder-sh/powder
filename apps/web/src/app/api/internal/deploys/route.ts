@@ -13,6 +13,8 @@ import { redactNullable, redactSecrets, safeSlice } from '@/lib/secret-text'
 import { hiddenSelfNames, requireUser } from '@/lib/access'
 import { and, asc, db, deploys, inArray, notInArray, sql } from '@/lib/db'
 import { heldSql } from '@/lib/deploy-settle'
+import { maskedFailedStep } from '@/lib/deploy-failure'
+import { safeFailedStep } from '@/lib/notify-text'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -42,6 +44,8 @@ export async function GET(req: Request) {
 			sha: deploys.gitSha,
 			branch: deploys.gitBranch,
 			errorSummary: deploys.errorSummary,
+			failedStep: deploys.failedStep,
+			exitCode: deploys.exitCode,
 			error: deploys.error,
 		})
 		.from(deploys)
@@ -104,6 +108,10 @@ export async function GET(req: Request) {
 			// errorSummary is the structured one-liner; fall back to the raw error
 			// (truncated) for rows that predate structured failures.
 			errorSummary: redactNullable(d.errorSummary) ?? (d.error ? safeSlice(redactSecrets(d.error), 0, 300) : null),
+			// the step and exit code as the deploy event carries them (deploy-failure.ts
+			// opsEventFailureFields), so a backfilled event reads like a live one
+			failedStep: d.failedStep ? safeFailedStep(maskedFailedStep(d.failedStep)) : null,
+			exitCode: d.exitCode ?? null,
 		})),
 		stuck: stuckRows.map((s) => ({
 			id: s.id,

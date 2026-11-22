@@ -6,7 +6,8 @@
 // /api/projects/[id]/backups/[backupId] and .../backups/restores/[restoreId].
 
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
-import { Check, Copy, Download, Trash2 } from 'lucide-react'
+import { CopyButton } from '@/components/ui/copy-button'
+import { Download, Trash2 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { timeAgo } from '../_lib/project-context'
 import { formatTime } from '@/lib/format'
@@ -75,28 +76,6 @@ export function RowAction({
 	)
 }
 
-function CopyButton({ text }: { text: string }) {
-	const [copied, setCopied] = useState(false)
-	return (
-		<button
-			type="button"
-			onClick={() =>
-				navigator.clipboard.writeText(text).then(
-					() => {
-						setCopied(true)
-						setTimeout(() => setCopied(false), 1500)
-					},
-					() => {},
-				)
-			}
-			className="inline-flex h-7 shrink-0 items-center gap-1 rounded-md border border-border px-2 text-xs hover:bg-accent/30"
-		>
-			{copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
-			{copied ? 'copied' : 'copy'}
-		</button>
-	)
-}
-
 export function DownloadPanel({ info, onClose }: { info: DownloadInfo; onClose: () => void }) {
 	return (
 		<div className="space-y-3 rounded-md border border-border bg-card p-4 text-sm">
@@ -104,8 +83,8 @@ export function DownloadPanel({ info, onClose }: { info: DownloadInfo; onClose: 
 				<div className="flex-1">
 					<div className="font-medium">download link</div>
 					<div className="text-xs text-muted-foreground">
-						expires {formatTime(info.expiresAt)}. the file is encrypted: you need
-						POWDER_BACKUP_KEY to open it. this download is in the activity log.
+						expires {formatTime(info.expiresAt)}. the file is encrypted: you need POWDER_BACKUP_KEY
+						to open it. this download is in the activity log.
 					</div>
 				</div>
 				<a
@@ -128,9 +107,19 @@ export function DownloadPanel({ info, onClose }: { info: DownloadInfo; onClose: 
 					open it on any machine with curl, openssl and psql. it is a plain SQL dump, so psql, not
 					pg_restore.
 				</div>
-				<CopyButton text={info.commands} />
+				<CopyButton
+					value={info.commands}
+					label="copy the commands"
+					text="copy"
+					targetId="backup-download-commands"
+					size="sm"
+					variant="outline"
+				/>
 			</div>
-			<pre className="ph-no-capture max-h-[50vh] overflow-auto rounded-md bg-background p-3 font-mono text-xs leading-relaxed">
+			<pre
+				id="backup-download-commands"
+				className="ph-no-capture max-h-[50vh] overflow-auto rounded-md bg-background p-3 font-mono text-xs leading-relaxed"
+			>
 				{info.commands}
 			</pre>
 		</div>
@@ -276,7 +265,7 @@ function RestoreRowView({
 
 	return (
 		<>
-			<tr className="border-b border-border last:border-0">
+			<tr className="group border-b border-border last:border-0">
 				<td className="px-4 py-2 text-muted-foreground">
 					{onToggle ? (
 						<button
@@ -309,6 +298,10 @@ function RestoreRowView({
 					<div className="flex items-center gap-1.5">
 						<span className={`inline-block h-1.5 w-1.5 rounded-full ${dotCls}`} aria-hidden />
 						<span className="font-mono text-xs">{row.status}</span>
+						{/* beside the short status: a wide error would push it out of a phone-width table */}
+						{row.error && (
+							<CopyButton value={row.error} label="copy the error" reveal className="-my-1" />
+						)}
 						{row.status === 'success' && row.tableCount != null && (
 							<span className="text-xs text-muted-foreground">
 								· {row.tableCount} tables
@@ -317,7 +310,10 @@ function RestoreRowView({
 						)}
 					</div>
 					{row.error && (
-						<div className="mt-0.5 max-w-md truncate text-xs text-destructive/80" title={row.error}>
+						<div
+							className="ph-no-capture mt-0.5 max-w-md truncate text-xs text-destructive/80"
+							title={row.error}
+						>
 							{row.error}
 						</div>
 					)}
@@ -334,12 +330,23 @@ function RestoreRowView({
 								server unreachable, showing the last known state
 							</div>
 						)}
-						<pre
-							ref={logRef}
-							className="ph-no-capture max-h-[50vh] overflow-auto rounded-md bg-background p-3 font-mono text-xs leading-relaxed"
-						>
-							{log || (running ? 'waiting for output…' : '(no output)')}
-						</pre>
+						<div className="relative">
+							<pre
+								ref={logRef}
+								id={`restore-log-${row.id}`}
+								className="ph-no-capture max-h-[50vh] overflow-auto rounded-md bg-background p-3 pr-10 font-mono text-xs leading-relaxed"
+							>
+								{log || (running ? 'waiting for output…' : '(no output)')}
+							</pre>
+							{log && (
+								<CopyButton
+									value={() => log}
+									label="copy the output"
+									targetId={`restore-log-${row.id}`}
+									className="absolute right-1.5 top-1.5"
+								/>
+							)}
+						</div>
 						{row.kind === 'restore' &&
 							row.status === 'success' &&
 							!row.droppedAt &&
@@ -354,7 +361,13 @@ function RestoreRowView({
 											<pre className="ph-no-capture flex-1 overflow-auto rounded-md bg-muted/40 px-2 py-1.5 font-mono text-2xs">
 												{urlLine}
 											</pre>
-											<CopyButton text={urlLine} />
+											<CopyButton
+												value={urlLine}
+												label="copy the DATABASE_URL line"
+												text="copy"
+												size="sm"
+												variant="outline"
+											/>
 										</div>
 									)}
 									<ul className="list-disc space-y-0.5 pl-5 text-muted-foreground">

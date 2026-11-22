@@ -19,11 +19,15 @@ import { getGithubIntegration } from '@/lib/integrations'
 import { generateDeployKey } from '@/lib/keygen'
 import { checkComposeSafe, validateAppInputs } from '@/lib/compose-guard'
 import { renderComposeYaml } from '@/lib/compose-render'
+import { createNetworkCommand } from '@/lib/server-bootstrap'
+import { resolveRoutingNetwork } from '@/lib/traefik-network-run'
 import { reservedAppNameError } from '@/lib/app-names'
 import { envVarInputError, serializeEnv } from '@/lib/env-parse'
 import { writeRuntimeFilesShell } from '@/lib/app-runtime-files'
 import { randomTempPath } from '@/lib/temp-path'
-import { ServerGoneError, createRepo, projectNameProblem, setRepoGithubIds } from '@/lib/repos'
+import { cloneMarkerMatchShell } from '@/lib/clone-marker'
+import { CloneError } from '@/lib/ssh/git'
+import { ServerGoneError, createRepo, previewNameProblem, projectNameProblem, setRepoGithubIds } from '@/lib/repos'
 import {
 	gitCloneRepo,
 	listContainers,
@@ -93,7 +97,7 @@ export async function POST(req: NextRequest) {
 	if (serverCheck instanceof Response) return serverCheck
 	const server = serverCheck
 	// no compose project name another app on the server (or powder) has.
-	const clash = await projectNameProblem(body.serverId, body.name)
+	const clash = (await projectNameProblem(body.serverId, body.name)) ?? (await previewNameProblem(body.name))
 	if (clash) return Response.json({ error: clash }, { status: 400 })
 	if (server.kind !== 'compose') {
 		return Response.json({ error: 'only compose servers supported in v1' }, { status: 400 })
@@ -177,6 +181,9 @@ export async function POST(req: NextRequest) {
 	// user attaches a custom domain (response carries a note).
 	const publicHost = onTraefik ? defaultHostFor(server, name) : null
 	const publicUrl = publicHost ? `https://${publicHost}` : null
+	// The network the app joins for Traefik: on a Traefik server the one its Traefik is
+	// declared to route over (flag or config, traefik-network.ts), else `web`.
+	const traefikNetwork = onTraefik ? await resolveRoutingNetwork(server) : 'web'
 
 	// Render + parse-check BEFORE any side effect (deploy key, clone).
 	const unsafe = checkComposeSafe(
@@ -192,10 +199,30 @@ export async function POST(req: NextRequest) {
 			postgres: dbPassword ? { password: dbPassword, dataDir: `${workingDir}/pgdata` } : null,
 			kv: addKv ? { dataDir: `${workingDir}/kvdata` } : null,
 			sharedInternal,
+			traefikNetwork,
 		}),
 		name,
+		// the template's own Traefik network counts as shared on this server only
+		traefikNetwork !== 'web' ? { traefikNetwork } : {},
 	)
 	if (unsafe) return Response.json({ error: `unsafe compose: ${unsafe}` }, { status: 400 })
+
+	// The compose joins the Traefik network (`web` unless the server's Traefik routes
+	// over another) and `internal` on opt-in as external networks, and compose refuses
+	// to start without them. Create a missing one now, before any other side effect,
+	// with the server bootstrap's own command (createNetworkCommand), so a server that
+	// only had adopted apps needs no setup step for its first new app.
+	for (const net of [...new Set([traefikNetwork, ...(sharedInternal ? ['internal'] : [])])]) {
+		const made = await runCommand(server, createNetworkCommand(net), 20_000)
+		if (made.code !== 0) {
+			return Response.json(
+				{
+					error: `could not create the docker network ${net} on the server: ${(made.stderr || made.stdout).trim().slice(0, 300) || `exit ${made.code}`}`,
+				},
+				{ status: 500 },
+			)
+		}
+	}
 
 	const { pub, priv } = await generateDeployKey()
 	let ghKeyId: number | null = null
@@ -277,9 +304,17 @@ export async function POST(req: NextRequest) {
 
 	try {
 		const repoUrl = `git@github.com:${owner}/${repoName}.git`
-		await gitCloneRepo(server, workingDir, repoUrl, branch, tmpKey)
+		await gitCloneRepo(server, workingDir, repoUrl, branch, tmpKey, `app:${name}`)
 	} catch (err) {
-		await runCommand(server, `rm -f ${shq(tmpKey)}`, 5_000).catch(() => {})
+		// this request's clone was placed and then refused (the status line says so):
+		// remove exactly that clone (its marker names app:<name>), so the name can be
+		// retried; anything else at the path is not this request's and stays
+		const placed = err instanceof CloneError && err.placed
+		await runCommand(
+			server,
+			`rm -f ${shq(tmpKey)}${placed ? `; if ${cloneMarkerMatchShell(workingDir, `app:${name}`)}; then rm -rf -- ${shq(workingDir)}; fi` : ''}`,
+			10_000,
+		).catch(() => {})
 		return Response.json(
 			{ error: `clone failed: ${clientErrorMessage(err, String(err), 'apps')}` },
 			{ status: 500 },
@@ -304,6 +339,7 @@ export async function POST(req: NextRequest) {
 		postgres: dbPassword ? { password: dbPassword, dataDir: `${workingDir}/pgdata` } : null,
 		kv: addKv ? { dataDir: `${workingDir}/kvdata` } : null,
 		sharedInternal,
+		traefikNetwork,
 	})
 	// the compose carries POSTGRES_PASSWORD: ship it over SFTP (0600), not argv.
 	const composeTmp = `${randomTempPath('/tmp/powder-compose')}.yml`
@@ -317,7 +353,7 @@ export async function POST(req: NextRequest) {
 		20_000,
 	)
 	if (installed.code !== 0) {
-		await runCommand(server, `rm -rf ${shq(workingDir)}; rm -f ${shq(tmpKey)} ${shq(composeTmp)} ${shq(envFilePath)}`, 20_000).catch(() => {})
+		await runCommand(server, `if ${cloneMarkerMatchShell(workingDir, `app:${name}`)}; then rm -rf -- ${shq(workingDir)}; fi; rm -f ${shq(tmpKey)} ${shq(composeTmp)} ${shq(envFilePath)}`, 20_000).catch(() => {})
 		return Response.json(
 			{ error: `refused to set up the app directory: ${(installed.stderr || installed.stdout).trim().slice(0, 300)}` },
 			{ status: 400 },

@@ -1,4 +1,5 @@
 import { buttonVariants } from '@/components/ui/button-variants'
+import { CopyButton } from '@/components/ui/copy-button'
 import { EmptyState } from '@/components/ui/empty-state'
 import { PageHeader } from '@/components/ui/page-header'
 import { StatusLabel, type StatusTone } from '@/components/ui/status'
@@ -182,13 +183,22 @@ export default async function ActivityPage({
 										{e.by && <span className="truncate">· {e.by}</span>}
 									</div>
 									{e.detail && (
-										<div
-											className={cn(
-												'ph-no-capture mt-1 line-clamp-2 break-words font-mono text-xs',
-												e.status === 'failed' ? 'text-destructive' : 'text-muted-foreground',
+										<div className="mt-1 flex items-start gap-1">
+											<div
+												className={cn(
+													'ph-no-capture line-clamp-2 min-w-0 flex-1 break-words font-mono text-xs',
+													e.status === 'failed' ? 'text-destructive' : 'text-muted-foreground',
+												)}
+											>
+												{e.detail}
+											</div>
+											{e.status === 'failed' && (
+												<CopyButton
+													value={`${e.app}: ${e.what}\n${e.detail}`}
+													label="copy the error"
+													className="relative z-10 -my-2"
+												/>
 											)}
-										>
-											{e.detail}
 										</div>
 									)}
 								</li>
@@ -218,7 +228,7 @@ export default async function ActivityPage({
 								{events.map((e) => {
 									const st = eventStatus(e)
 									return (
-										<Tr key={e.id}>
+										<Tr key={e.id} className="group">
 											<Td className="truncate align-top">
 												<Link
 													href={e.href}
@@ -231,14 +241,24 @@ export default async function ActivityPage({
 											<Td className="align-top">
 												<div className="truncate text-muted-foreground">{e.what}</div>
 												{e.detail && (
-													<div
-														className={cn(
-															'ph-no-capture mt-0.5 truncate font-mono text-xs',
-															e.status === 'failed' ? 'text-destructive' : 'text-muted-foreground',
+													<div className="mt-0.5 flex items-center gap-1">
+														<div
+															className={cn(
+																'ph-no-capture min-w-0 truncate font-mono text-xs',
+																e.status === 'failed' ? 'text-destructive' : 'text-muted-foreground',
+															)}
+															title={e.detail}
+														>
+															{e.detail}
+														</div>
+														{e.status === 'failed' && (
+															<CopyButton
+																value={`${e.app}: ${e.what}\n${e.detail}`}
+																label="copy the error"
+																reveal
+																className="-my-1"
+															/>
 														)}
-														title={e.detail}
-													>
-														{e.detail}
 													</div>
 												)}
 											</Td>

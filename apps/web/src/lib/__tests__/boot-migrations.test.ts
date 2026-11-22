@@ -177,7 +177,7 @@ describe('powder image: migrations on boot', () => {
 		expect(r2.stderr).not.toMatch(/not idempotent/)
 		expect(r2.stdout).toMatch(/applied: 0050_c.sql/)
 		expect(r2.stdout).toContain('SERVED')
-	}, 15_000)
+	})
 	it('the entrypoint sources lib-migrations.sh and holds no rules of its own', () => {
 		const s = readFileSync(ENTRY, 'utf8')
 		expect(s).toContain('. "$LIB"')

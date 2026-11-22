@@ -7,7 +7,10 @@
 
 import { and, db, deploys, eq, or, sql } from './db'
 import { HARD_CAP_MIN, HEARTBEAT_STALE_MIN, STUCK_AFTER_MIN } from './deploy-budget'
-import { reportSwapCheckLeftoverToHq } from './hq'
+import { deployCommit } from './deploy-commit'
+import { QUEUED_REAP_NOTE, QUEUED_STUCK_AFTER_MIN, RUNNING_REAP_NOTE, SILENT_AFTER_MIN, watchdogReapReason } from './deploy-watchdog-reason'
+import { reportDeployToHq, reportSwapCheckLeftoverToHq } from './hq'
+import { opsEventFailureFields } from './deploy-failure'
 import { listAllServers } from './servers'
 import { runCommand } from './ssh'
 
@@ -64,14 +67,14 @@ export async function checkLeftoverCandidates(): Promise<void> {
 // means the SSH session wedged before doing anything — reap fast so the lock
 // frees in minutes, not a quarter hour. `output` stays NULL until the runner's
 // first debounce-flush, so NULL/'' is a reliable "produced nothing yet" signal.
-const SILENT_AFTER_MIN = 5
+// (SILENT_AFTER_MIN and QUEUED_STUCK_AFTER_MIN live in deploy-watchdog-reason.ts, which
+// words each reaped row from the same limits.)
 // 'queued' rows the worker never claims (worker down/wedged, or a server
 // permanently excluded from the claim set) hold the queued slot FOREVER —
 // every later push folds into a row that never runs. Generous threshold: a
 // queued row legitimately waits behind the app's own running deploy plus a
 // couple of serialized builds on the server (each capped at ~57m), and an HQ receiver's
 // reconciliation sweep may already warn; this reap is the release valve.
-const QUEUED_STUCK_AFTER_MIN = 180
 
 /** WHERE clause of the running-row reap. Exported for tests. The no-output rule
  *  ignores a row whose executor heartbeat is fresh: in in-web mode a
@@ -95,10 +98,10 @@ export async function reapStuckDeploys(): Promise<void> {
 		.set({
 			status: 'failed',
 			finishedAt: new Date(),
-			error: `[watchdog] deploy stuck in running (executor heartbeat >${HEARTBEAT_STALE_MIN}m stale, >${HARD_CAP_MIN}m elapsed, >${STUCK_AFTER_MIN}m without a heartbeat, or >${SILENT_AFTER_MIN}m with no output) — executor died or SSH wedged; lock released`,
+			error: RUNNING_REAP_NOTE,
 		})
 		.where(runningReapCondition())
-		.returning({ id: deploys.id, containerName: deploys.containerName })
+		.returning(reapedColumns())
 
 	if (result.length > 0) {
 		console.warn(
@@ -112,7 +115,7 @@ export async function reapStuckDeploys(): Promise<void> {
 		.set({
 			status: 'failed',
 			finishedAt: new Date(),
-			error: `[watchdog] deploy stuck in queued (>${QUEUED_STUCK_AFTER_MIN}m, worker never claimed it) — lock released`,
+			error: QUEUED_REAP_NOTE,
 		})
 		.where(
 			and(
@@ -120,12 +123,171 @@ export async function reapStuckDeploys(): Promise<void> {
 				sql`${deploys.startedAt} < now() - (${QUEUED_STUCK_AFTER_MIN} * interval '1 minute')`,
 			),
 		)
-		.returning({ id: deploys.id, containerName: deploys.containerName })
+		.returning(reapedColumns())
 
 	if (queuedReaped.length > 0) {
 		console.warn(
 			`[deploy-watchdog] reaped ${queuedReaped.length} never-claimed queued deploys:`,
 			queuedReaped.map((r) => `${r.containerName}/${r.id}`).join(', '),
 		)
+	}
+
+	const reaped: Reaped[] = [
+		...result.map((r) => withReason({ ...r, claimed: true })),
+		...queuedReaped.map((r) => withReason({ ...r, claimed: false })),
+	]
+	if (reaped.length === 0) return
+	// After both reaps (the lock is already released): say what happened on each row, and
+	// send the failure event a normal failure sends, once per reaped row (a reap flips a row
+	// only once). A late failure from an executor that was alive after all does not send a
+	// second one (deploy-runner failDeploy).
+	await recordReapReasons(reaped)
+	for (const r of reaped) reportReapToHq(r)
+	// GitHub only after both reaps are written: a slow or hung GitHub never delays a reap.
+	// A queued row was never claimed: no commit status was pending, only its Deployment is closed.
+	await closeOnGithub(reaped)
+}
+
+function withReason(r: Omit<Reaped, 'failedStep' | 'summary'>): Reaped {
+	const reason = watchdogReapReason({
+		queued: !r.claimed,
+		heartbeatAt: r.heartbeatAt,
+		startedAt: r.startedAt,
+		queuedAt: r.queuedAt,
+		hadOutput: r.hadOutput,
+	})
+	return { ...r, ...reason }
+}
+
+/** failed_step and error_summary of each reaped row (the deploy page's failure banner
+ *  needs the summary). Guarded: a row a late success already flipped back is left alone.
+ *  Best effort, never throws. */
+async function recordReapReasons(rows: Reaped[]): Promise<void> {
+	const { redactSecrets } = await import('./secret-text')
+	await Promise.allSettled(
+		rows.map(async (r) => {
+			try {
+				await db
+					.update(deploys)
+					.set({ failedStep: r.failedStep, errorSummary: redactSecrets(r.summary) })
+					.where(and(eq(deploys.id, r.id), eq(deploys.status, 'failed'), sql`${deploys.errorSummary} IS NULL`))
+			} catch (err) {
+				console.error(`[deploy-watchdog] reason for ${r.id} not recorded:`, err instanceof Error ? err.message : err)
+			}
+		}),
+	)
+}
+
+/** The failure event of a reaped row, the same shape the deploy runner sends. Never throws. */
+function reportReapToHq(r: Reaped): void {
+	const commit = deployCommit(r)
+	// what the reap recorded on the row (watchdogReapReason): the event's step and summary
+	const failedStep = r.failedStep
+	const summary = r.summary
+	void import('./secret-text')
+		.then(({ redactSecrets }) => {
+			const errorText = redactSecrets(summary)
+			return reportDeployToHq({
+				app: r.containerName,
+				server: r.serverId,
+				status: 'failure',
+				sha: commit?.sha ?? null,
+				shaSource: commit ? (commit.requested ? 'requested' : 'built') : null,
+				branch: r.gitBranch,
+				// `failed during: watchdog · <why>` (or `queue`), plus failedStep: the same
+				// event shape as the runner's (deploy-failure.ts opsEventFailureFields)
+				...opsEventFailureFields(failedStep, null, errorText),
+				deployId: r.id,
+				deployKind: r.kind,
+			})
+		})
+		.catch((err) => console.error(`[deploy-watchdog] failure event (${failedStep}) not sent:`, err instanceof Error ? err.message : err))
+}
+
+/** The columns a reap returns (exported for tests). */
+export function reapedColumns() {
+	return {
+		id: deploys.id,
+		serverId: deploys.serverId,
+		containerName: deploys.containerName,
+		kind: deploys.kind,
+		gitSha: deploys.gitSha,
+		// no built_sha (0070): the reap must not depend on a newer column, or a deferred
+		// migration would fail it and leave rows running with their locks held. At reap time
+		// it is NULL or equal to git_sha anyway.
+		gitBranch: deploys.gitBranch,
+		requestedSha: deploys.requestedSha,
+		heartbeatAt: deploys.heartbeatAt,
+		startedAt: deploys.startedAt,
+		queuedAt: deploys.queuedAt,
+		hadOutput: sql<boolean>`(${deploys.output} IS NOT NULL AND ${deploys.output} <> '')`,
+	}
+}
+
+type Reaped = {
+	id: string
+	serverId: string
+	containerName: string
+	kind: string
+	gitSha: string | null
+	gitBranch?: string | null
+	requestedSha: string | null
+	heartbeatAt?: Date | string | null
+	startedAt?: Date | string | null
+	queuedAt?: Date | string | null
+	hadOutput?: boolean
+	claimed: boolean
+	/** what happened, from watchdogReapReason (deploy-watchdog-reason.ts) */
+	failedStep: string
+	summary: string
+}
+
+/** Overall time the watchdog waits for the GitHub closes of one tick. Each call has its
+ *  own limit too (github.ts); what is still running after this goes on in the background. */
+export const WATCHDOG_GITHUB_CLOSE_MS = 10_000
+
+/** A reaped row never reaches the runner's own exit, so its GitHub Deployment
+ *  (and, for a claimed git deploy, its commit status) would stay in progress
+ *  forever: close them as failed, all rows in parallel, waiting at most
+ *  `limitMs`. Best effort, never throws. */
+export async function closeOnGithub(
+	rows: (Omit<Reaped, 'failedStep' | 'summary'> & Partial<Pick<Reaped, 'summary'>>)[],
+	limitMs = WATCHDOG_GITHUB_CLOSE_MS,
+): Promise<void> {
+	let timer: ReturnType<typeof setTimeout> | undefined
+	const all = (async () => {
+		const [{ notifyDeploymentFinished }, { getRepoFor }, { redactSecrets }] = await Promise.all([
+			import('./github-deployments'),
+			import('./repos'),
+			import('./secret-text'),
+		])
+		await Promise.allSettled(
+			rows.map(async (r) => {
+				const repo = await getRepoFor(r.serverId, r.containerName).catch(() => null)
+				if (!repo) return
+				// the row's own summary (a never-claimed queued row says so); failedStep stays
+				// null here: "failed at watchdog: stopped by the watchdog" would say it twice
+				const summary = redactSecrets(r.summary ?? withReason(r).summary)
+				await notifyDeploymentFinished(
+					repo,
+					r.id,
+					'failure',
+					summary,
+					r.claimed ? { kind: r.kind, requestedSha: r.requestedSha, sha: r.gitSha, failedStep: null, errorSummary: summary, testGate: null } : undefined,
+				)
+			}),
+		)
+	})().catch((err) => console.error('[deploy-watchdog] GitHub status close failed:', err instanceof Error ? err.message : err))
+	const limit = new Promise<void>((resolve) => {
+		timer = setTimeout(() => {
+			console.warn(`[deploy-watchdog] GitHub status closes still running after ${limitMs} ms; not waiting for them`)
+			resolve()
+		}, limitMs)
+		timer.unref?.()
+	})
+	try {
+		await Promise.race([all, limit])
+	} finally {
+		if (timer) clearTimeout(timer)
 	}
 }

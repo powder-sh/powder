@@ -272,8 +272,8 @@ describe('build cache id snippet', () => {
 	it('bin/self-deploy.sh and the dashboard self-deploy use the same snippet', () => {
 		const sh = readFileSync(join(REPO, 'bin/self-deploy.sh'), 'utf8')
 		expect(sh).toContain(`BUILD_CACHE_ID_SH='${BUILD_CACHE_ID_SH}'`)
-		expect(sh).toContain('POWDER_BUILD_CACHE_ID=$BCID $DC build powder')
-		expect(sh).toContain('POWDER_BUILD_CACHE_ID=$BCID $DC build worker')
+		expect(sh).toContain('POWDER_BUILD_CACHE_ID=$BCID OS_PATCH_WEEK=$OS_PATCH_WEEK $DC build powder')
+		expect(sh).toContain('POWDER_BUILD_CACHE_ID=$BCID OS_PATCH_WEEK=$OS_PATCH_WEEK $DC build worker')
 	})
 	it('creates a 32-hex id once and reads the same value back', () => {
 		const dir = join(root, 'opt')

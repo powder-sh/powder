@@ -397,6 +397,40 @@ export async function createDeploymentStatus(
 	})
 }
 
+// Commit statuses (POST /repos/{owner}/{repo}/statuses/{sha}): the check a
+// commit and its pull request show. Decided in github-commit-status.ts.
+// Needs commit statuses: read and write (fine-grained) or repo:status (classic).
+export type GhCommitState = 'pending' | 'success' | 'failure' | 'error'
+
+const COMMIT_SHA_RE = /^[0-9a-f]{40}$/
+
+export async function createCommitStatus(
+	token: string,
+	owner: string,
+	repo: string,
+	sha: string,
+	opts: {
+		state: GhCommitState
+		context: string
+		/** Permanent and public on public repos: SafeText only (lib/secret-text.ts). */
+		description: SafeText
+		targetUrl?: string
+		timeoutMs?: number
+	},
+): Promise<void> {
+	if (!COMMIT_SHA_RE.test(sha)) throw new Error('invalid commit sha')
+	await ghFetch(token, `${repoPath(owner, repo)}/statuses/${sha}`, {
+		method: 'POST',
+		timeoutMs: opts.timeoutMs,
+		body: JSON.stringify({
+			state: opts.state,
+			context: opts.context,
+			description: opts.description.slice(0, 140),
+			...(opts.targetUrl ? { target_url: opts.targetUrl } : {}),
+		}),
+	})
+}
+
 // Pull-request lookup + comment APIs. Used by the preview-deploy flow to
 // post a sticky comment on the PR with the preview URL, so reviewers don't
 // have to dig through the powder dashboard to find it.

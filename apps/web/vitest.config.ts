@@ -10,9 +10,13 @@ export default defineConfig({
 	test: {
 		include: ['src/**/*.test.ts'],
 		environment: 'node',
-		// Many tests run bash scripts with stubs; under load (the self-deploy test
-		// gate on a busy server) the 5 s default flakes.
-		testTimeout: 30_000,
+		// Many tests run generated shell scripts with stubs, and on a loaded machine (the
+		// self-deploy test gate on a busy server) fork and exec slow them down several-fold.
+		// This bounds an async hang. It does NOT bound a synchronous spawn: vitest cannot
+		// interrupt a blocked event loop, so a spawnSync/execFileSync call needs its own
+		// `timeout` option, and the gate's outer limit is the backstop.
+		testTimeout: 120_000,
+		hookTimeout: 120_000,
 		// Yields to the event loop after every test (see the file for why).
 		setupFiles: ['./vitest.setup.ts'],
 		// the parent dir of the per-file hermetic roots, removed when the run ends

@@ -30,8 +30,8 @@ export async function DELETE(
 	if (!preview) return Response.json({ error: 'not found' }, { status: 404 })
 
 	try {
-		await tearDownPreview(previewId)
-		return Response.json({ ok: true })
+		const { note } = await tearDownPreview(previewId)
+		return Response.json({ ok: true, note })
 	} catch (err) {
 		return Response.json(
 			{ error: clientErrorMessage(err, 'teardown failed', 'servers/:id/containers/:name/previews/:previewId') },

@@ -22,7 +22,7 @@ vi.mock('@/lib/deploys', () => ({
 }))
 vi.mock('@/lib/paths-match', () => ({ pathsMatch: () => true }))
 vi.mock('@/lib/pending-redeploy', () => ({ schedulePendingRedeploy: vi.fn() }))
-vi.mock('@/lib/github-deployments', () => ({ commentPreviewOnPR: vi.fn(), notifyDeploymentStarted: vi.fn() }))
+vi.mock('@/lib/github-deployments', () => ({ notifyCommitPending: () => {}, notifyPreviewCommit: async () => {}, commentPreviewOnPR: vi.fn(), notifyDeploymentStarted: vi.fn() }))
 const spin = vi.fn(async () => ({ url: 'https://p.example' }))
 vi.mock('@/lib/preview-deploys', () => ({ previewBuildInputs: async (r: { dockerfilePath?: string; containerPort?: number }) => ({ dockerfilePath: r.dockerfilePath ?? './Dockerfile', containerPort: r.containerPort ?? 3000 }), previewSkipReason: async () => null, previewLastSha: async () => state.preview, spinOrRedeployPreview: (...a: unknown[]) => spin(...(a as [])) }))
 vi.mock('@/lib/rate-limit', () => ({ checkRateLimit: () => ({ ok: true }) }))

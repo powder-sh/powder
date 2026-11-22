@@ -1,3 +1,4 @@
+import { TEST_GATE_VALUES, type TestGate } from '@powder/db/schema'
 import {
 	and,
 	appDomains,
@@ -11,20 +12,14 @@ import {
 	isNotNull,
 	isNull,
 	notInArray,
-	powderMeta,
 	prefixes,
 	sql,
 } from './db'
 import type { Deploy } from './db'
-import {
-	DEPLOY_SETTLE_META_KEY,
-	SETTLE_WAITING_PREFIX,
-	effectiveSettleSeconds,
-	heldSql,
-	isSettleTrigger,
-	settleNote,
-	settleNoteFor,
-} from './deploy-settle'
+import { SETTLE_WAITING_PREFIX, heldSql, settleNote } from './deploy-settle'
+import { recordAfterSwap } from './deploy-bookkeeping'
+import { isReapNote } from './deploy-watchdog-reason'
+import { deployListOrder } from './deploy-order-db'
 import { isPgError } from './pg-error'
 import { redactNullable, redactSecrets } from './secret-text'
 import type { ServerConfig } from './servers'
@@ -152,12 +147,11 @@ export async function startDeploy(opts: {
 		if (waiting && !(PASS_HELD_KINDS.includes(opts.kind) && waiting.held === true))
 			throw new DeployInFlightError(opts.serverId, opts.containerName)
 	}
-	// Settle window: a webhook push that is not urgent waits until not_before, so pushes
-	// right after it fold into this one row (deploy-settle.ts). Off (null) by default.
-	const notBefore =
-		status === 'queued' && opts.kind === 'git_deploy' && !opts.urgent && isSettleTrigger(opts.triggeredBy)
-			? await settleNotBefore(opts.serverId, opts.containerName)
-			: null
+	// No push waits on a clock: a push with no deploy of the app queued or
+	// running is claimable at once; one that lands while a deploy runs becomes THE queued
+	// row, and every later push folds into it, so the next build takes the newest commit
+	// the moment the running one ends. not_before is never set here any more: rows held
+	// by an older powder still follow heldSql until they are claimed (deploy-settle.ts).
 	// The lock is two partial unique indexes (0035): at most one running and
 	// one queued row per app. ON CONFLICT DO NOTHING (untargeted, so it covers
 	// both partial indexes) turns a second one into "no row back" instead of a
@@ -180,8 +174,6 @@ export async function startDeploy(opts: {
 				queuedAt: new Date(),
 				triggeredBy: opts.triggeredBy ?? null,
 				requestedSha: opts.requestedSha && /^[0-9a-f]{40}$/.test(opts.requestedSha) ? opts.requestedSha : null,
-				// only when held: the row's log line says why it waits and how to skip it
-				...(notBefore ? { notBefore, output: `[settle] ${settleNoteFor(notBefore)}\n` } : {}),
 			})
 			.onConflictDoNothing()
 			.returning()
@@ -234,33 +226,6 @@ export async function startDeploy(opts: {
 
 /** Kinds of inline work that may run while a push is held on its settle window. */
 const PASS_HELD_KINDS: Kind[] = ['rollback', 'restart', 'manual_apply', 'env_change', 'stop', 'delete']
-
-/** The not_before for a new webhook push of this app, or null when the window is off.
- *  Read at insert time: app_repos.deploy_settle_seconds, else powder_meta, else off.
- *  A settings read that fails means no hold (deploy at once, as before the window). */
-async function settleNotBefore(serverId: string, containerName: string): Promise<Date | null> {
-	try {
-		const [app] = await db
-			.select({ s: appRepos.deploySettleSeconds })
-			.from(appRepos)
-			.where(and(eq(appRepos.serverId, serverId), eq(appRepos.containerName, containerName)))
-			.limit(1)
-		let global: string | null = null
-		if (app?.s === null || app?.s === undefined) {
-			const [meta] = await db
-				.select({ v: powderMeta.value })
-				.from(powderMeta)
-				.where(eq(powderMeta.key, DEPLOY_SETTLE_META_KEY))
-				.limit(1)
-			global = meta?.v ?? null
-		}
-		const seconds = effectiveSettleSeconds(global, app?.s)
-		return seconds > 0 ? new Date(Date.now() + seconds * 1000) : null
-	} catch (err) {
-		console.error('[settle] could not read the settle window, deploying without one:', err instanceof Error ? err.message : err)
-		return null
-	}
-}
 
 /** A rollback or a stop must not be undone by a held push deploying (the broken code, or
  *  a started app) on top of it without a human: every queued row of the app still waiting
@@ -406,8 +371,23 @@ export async function finishDeploy(
 		composeConfigHash?: string | null
 		/** the view of that structure (compose-diff.ts); stored with the hash only (0062). */
 		composeConfigView?: unknown
+		/** the built commit, re-stated so a lost earlier write (powder's DB slow) is caught up. */
+		gitSha?: string | null
+		gitBranch?: string | null
+		/** the commit the run synced or built (0070), on success and failure; unset or null leaves it NULL. */
+		builtSha?: string | null
+		/** the proven-good image tag, re-stated like gitSha (auto-rollback picks targets by it). */
+		imageTag?: string | null
+		/** when the deploy actually finished; a late retry of this write keeps the real time. */
+		finishedAt?: Date
+		/** the test gate's outcome (0066): stored on success and failure; unset or null leaves it NULL. */
+		testGate?: TestGate | null
 	},
-): Promise<void> {
+): Promise<FinishOutcome> {
+	// The row was already terminal when this result arrived (recordLateResult decides which,
+	// from the row it reads anyway): 'reaped' = the watchdog failed it (and sent its failure
+	// event), 'already-recorded' = it holds a result that is not the watchdog's, i.e. this
+	// run's own earlier write landed (its reply was lost) or a duplicate finish.
 	// Only transition NON-terminal rows. Once the watchdog has reaped a row as
 	// failed (and thereby released the in-flight lock), a late finishDeploy from
 	// the original executor must not flip it back - that reap/resurrect race
@@ -423,7 +403,11 @@ export async function finishDeploy(
 			failedStep: redactNullable(result.failedStep),
 			exitCode: result.exitCode ?? null,
 			errorSummary: redactNullable(result.errorSummary),
-			finishedAt: new Date(),
+			finishedAt: result.finishedAt ?? new Date(),
+			...(result.testGate && (TEST_GATE_VALUES as readonly string[]).includes(result.testGate) ? { testGate: result.testGate } : {}),
+			...(result.gitSha ? { gitSha: result.gitSha } : {}),
+			...(result.status === 'success' && result.imageTag ? { imageTag: result.imageTag } : {}),
+			...(result.gitBranch ? { gitBranch: result.gitBranch } : {}),
 			...(result.status === 'success' && result.composeConfigHash && /^[0-9a-f]{64}$/.test(result.composeConfigHash)
 				? {
 						composeConfigHash: result.composeConfigHash,
@@ -433,7 +417,59 @@ export async function finishDeploy(
 		})
 		.where(and(eq(deploys.id, id), notInArray(deploys.status, ['success', 'failed'])))
 		.returning({ id: deploys.id })
-	if (updated.length === 0) await recordLateResult(id, result.status)
+	if (updated.length > 0) {
+		// not awaited: the terminal publish, the event and the GitHub status do not wait on it
+		if (result.builtSha) trackBuiltShaWrite(recordBuiltSha(id, result.builtSha))
+		return 'written'
+	}
+	return recordLateResult(
+		id,
+		result.status,
+		{ testGate: result.testGate ?? null, gitSha: result.gitSha ?? null, gitBranch: result.gitBranch ?? null },
+		// what this call asked to write, masked as the UPDATE stores it
+		redactNullable(result.error) ?? null,
+	)
+}
+
+/** What finishDeploy did with a result: written now, or the row was already terminal. */
+export type FinishOutcome = 'written' | 'already-recorded' | 'reaped'
+
+/** Whether a terminal row was failed by the watchdog, from recorded facts only. First: the
+ *  row holds exactly the result this run sent (same status, same masked error), so its own
+ *  write landed and only the reply was lost. Only otherwise the reap's note, matched as one
+ *  of the exact texts the reap writes (deploy-watchdog-reason.ts isReapNote), never a prefix:
+ *  a step failure stores the end of the app's own log in `error`, which can print anything.
+ *  Not by failed_step either: a deploy script's fail marker can name any step. Pure. */
+export function reapedByWatchdog(
+	row: { status: string; error: string | null },
+	sent?: { status: string; error: string | null },
+): boolean {
+	if (sent && row.status === sent.status && (row.error ?? null) === (sent.error ?? null)) return false
+	return row.status === 'failed' && isReapNote(row.error)
+}
+
+// built_sha writes in flight. Production never waits for them; tests can (settleBuiltShaWrites).
+const builtShaWrites = new Set<Promise<void>>()
+function trackBuiltShaWrite(p: Promise<void>): void {
+	// recordBuiltSha never rejects; the catch makes an unhandled rejection impossible anyway
+	const tracked = p.catch(() => {}).finally(() => builtShaWrites.delete(tracked))
+	builtShaWrites.add(tracked)
+}
+
+/** Waits for the built_sha writes started so far (tests; production never calls it). */
+export async function settleBuiltShaWrites(): Promise<void> {
+	await Promise.all([...builtShaWrites])
+}
+
+/** deploys.built_sha (0070), written on its own after the result is committed: the
+ *  commit a deploy built is a display fact, and a failure here (the column missing, a slow
+ *  database) must never cost the deploy its recorded result. Logged, never thrown. */
+export async function recordBuiltSha(id: string, builtSha: string): Promise<void> {
+	try {
+		await db.update(deploys).set({ builtSha }).where(eq(deploys.id, id))
+	} catch (err) {
+		console.error(`[finishDeploy] ${id}: built commit not recorded (the result is):`, err instanceof Error ? err.message : err)
+	}
 }
 
 // A result arriving after the row went terminal. Usually the watchdog reaped a
@@ -441,15 +477,24 @@ export async function finishDeploy(
 // the row saying "failed" - the dashboard lied about what is live. Record the
 // truth: always annotate, and flip a reaped row to success when nothing newer
 // has started for the app since (a newer deploy owns "what is live" then).
-async function recordLateResult(id: string, status: 'success' | 'failed'): Promise<void> {
+async function recordLateResult(
+	id: string,
+	status: 'success' | 'failed',
+	/** what the finished run knows: written with a flip to success, so the row matches what was posted */
+	facts: { testGate: TestGate | null; gitSha: string | null; gitBranch: string | null } = { testGate: null, gitSha: null, gitBranch: null },
+	/** the masked error this result carries (null for none) */
+	sentError: string | null = null,
+): Promise<Exclude<FinishOutcome, 'written'>> {
 	const [row] = await db.select().from(deploys).where(eq(deploys.id, id)).limit(1)
-	if (!row) return
-	const reaped = row.status === 'failed' && (row.error ?? '').startsWith('[watchdog]')
-	if (!reaped) {
+	if (!row) return 'already-recorded'
+	const reaped = reapedByWatchdog(row, { status, error: sentError })
+	const notePrefix = `[late result] the executor finished with '${status}'`
+	// a retried late write (its first try committed but timed out client-side) annotates once
+	if (!reaped || (row.error ?? '').includes(notePrefix)) {
 		console.warn(`[finishDeploy] ${id}: row already terminal (duplicate finish) - late '${status}' result ignored`)
-		return
+		return reaped ? 'reaped' : 'already-recorded'
 	}
-	const note = `\n[late result] the executor finished with '${status}' at ${new Date().toISOString()}, after the watchdog reap above.`
+	const note = `\n${notePrefix} at ${new Date().toISOString()}, after the watchdog reap above.`
 	let flip = false
 	if (status === 'success') {
 		const [newer] = await db
@@ -469,11 +514,21 @@ async function recordLateResult(id: string, status: 'success' | 'failed'): Promi
 		.update(deploys)
 		.set(
 			flip
-				? { status: 'success', error: null, errorSummary: null, failedStep: null, output: `${row.output ?? ''}${note}` }
+				? {
+						status: 'success',
+						error: null,
+						errorSummary: null,
+						failedStep: null,
+						output: `${row.output ?? ''}${note}`,
+						...(facts.testGate && (TEST_GATE_VALUES as readonly string[]).includes(facts.testGate) ? { testGate: facts.testGate } : {}),
+						...(facts.gitSha ? { gitSha: facts.gitSha } : {}),
+						...(facts.gitBranch ? { gitBranch: facts.gitBranch } : {}),
+					}
 				: { error: `${row.error ?? ''}${note}` },
 		)
 		.where(and(eq(deploys.id, id), eq(deploys.status, 'failed')))
 	console.warn(`[finishDeploy] ${id}: late '${status}' after watchdog reap - ${flip ? 'row corrected to success' : 'annotated'}`)
+	return 'reaped'
 }
 
 // Resolves what the pre-swap health gate should actually probe, from
@@ -564,6 +619,7 @@ export async function verifyDeployHealth(opts: {
 	currentDeployId: string
 	maxWaitMs?: number
 	onChunk?: (chunk: string) => void
+	preSwapProbe?: { path: string; host?: string } | null
 }): Promise<{
 	healthy: true | false | 'skipped'
 	output: string
@@ -595,16 +651,39 @@ export async function runHealthGate(opts: {
 	containerName: string
 	maxWaitMs?: number
 	onChunk?: (chunk: string) => void
+	currentDeployId?: string
+	/** the probe this deploy already read before the swap (swap-check); used when the
+	 *  re-read below fails because powder's own DB is slow. undefined = none read. */
+	preSwapProbe?: { path: string; host?: string } | null
 }): Promise<{ healthy: true | false | 'skipped'; output: string }> {
 	// Read fresh on every deploy - never memoised - so flipping health_url in the
 	// UI takes effect on the very next deploy rather than after a powder restart.
-	const probe = await resolveHealthProbe(opts.serverId, opts.containerName)
+	// The gate runs after the swap: a slow powder DB must not fail a live deploy, and must
+	// not silently weaken the gate either. Bounded retry; then the probe read before the
+	// swap (same deploy, same row); only with none of those the default probe, with a
+	// warning line saying the gate could not read the app's health_url.
+	const read = await recordAfterSwap(opts.currentDeployId ?? opts.containerName, 'health_url read', () =>
+		resolveHealthProbe(opts.serverId, opts.containerName),
+		{ delaysMs: [2_000, 10_000], kind: 'read' },
+	)
+	let probe: { path: string; host?: string } | null
+	let probeNote = ''
+	if (read.ok) probe = read.value
+	else if (opts.preSwapProbe !== undefined) {
+		probe = opts.preSwapProbe
+		probeNote = `[health] warning: could not re-read health_url (powder's own database was slow); using the one read before the swap (${probe ? probe.path : 'none set'})\n`
+	} else {
+		probe = null
+		probeNote = "[health] warning: could not read health_url (powder's own database was slow); judged with the default probe (any 1xx-4xx on /), weaker than a configured health_url\n"
+	}
+	if (probeNote) opts.onChunk?.(probeNote)
 	const health = await healthCheckContainer(opts.server, opts.containerName, {
 		maxWaitMs: opts.maxWaitMs,
 		healthPath: probe?.path,
 		hostHeader: probe?.host,
 		onChunk: opts.onChunk,
 	})
+	health.output = probeNote + health.output
 	if (health.healthy) return { healthy: true, output: health.output }
 	// Non-HTTP workload (queue worker, cron - no published/exposed port). The
 	// HTTP probe can't judge it, so fall back to a docker-inspect liveness check:
@@ -634,26 +713,37 @@ export async function autoRollback(opts: {
 	currentDeployId: string
 	reason: string
 	onChunk?: (chunk: string) => void
+	/** the probe read before the swap; the post-rollback gate falls back to it like the first gate. */
+	preSwapProbe?: { path: string; host?: string } | null
 }): Promise<{ output: string; rolledBackTo: string | null; rollbackError: string | null; rollbackHealthy: boolean | null }> {
 	const say = (line: string) => {
 		opts.onChunk?.(line)
 		return line
 	}
 	let output = ''
-	const [prev] = await db
-		.select()
-		.from(deploys)
-		.where(
-			and(
-				eq(deploys.serverId, opts.serverId),
-				eq(deploys.containerName, opts.containerName),
-				eq(deploys.status, 'success'),
-				sql`${deploys.imageTag} IS NOT NULL`,
-				sql`${deploys.id} <> ${opts.currentDeployId}`,
-			),
-		)
-		.orderBy(desc(deploys.startedAt))
-		.limit(1)
+	// bounded retry: a slow powder DB must not stop a rollback that a down app needs.
+	const history = await recordAfterSwap(opts.currentDeployId, 'rollback target read', () =>
+		db
+			.select()
+			.from(deploys)
+			.where(
+				and(
+					eq(deploys.serverId, opts.serverId),
+					eq(deploys.containerName, opts.containerName),
+					eq(deploys.status, 'success'),
+					sql`${deploys.imageTag} IS NOT NULL`,
+					sql`${deploys.id} <> ${opts.currentDeployId}`,
+				),
+			)
+			.orderBy(desc(deploys.startedAt))
+			.limit(1),
+		{ delaysMs: [2_000, 10_000], kind: 'read' },
+	)
+	if (!history.ok) {
+		output += say("\n[rollback] could not read the deploy history (powder's own database was slow) - leaving the current state in place\n")
+		return { output, rolledBackTo: null, rollbackError: "could not read the deploy history (powder's own database was slow)", rollbackHealthy: null }
+	}
+	const [prev] = history.value
 	if (!prev || !prev.imageTag) {
 		output += say('\n[rollback] no previous tagged deploy available - leaving the current state in place for a manual fix\n')
 		return { output, rolledBackTo: null, rollbackError: null, rollbackHealthy: null }
@@ -716,6 +806,8 @@ export async function autoRollback(opts: {
 		serverId: opts.serverId,
 		containerName: opts.containerName,
 		onChunk: opts.onChunk,
+		currentDeployId: opts.currentDeployId,
+		preSwapProbe: opts.preSwapProbe,
 	})
 	output += after.output
 	const rollbackHealthy = after.healthy !== false
@@ -997,7 +1089,8 @@ export async function listDeploysFor(
 		.select(deployListColumns())
 		.from(deploys)
 		.where(and(eq(deploys.serverId, serverId), eq(deploys.containerName, containerName)))
-		.orderBy(desc(deploys.startedAt))
+		// newest push first, like every deploy list (lib/deploy-order.ts)
+		.orderBy(...deployListOrder())
 		.limit(limit)
 	// Deploy text is masked at write (finishDeploy); masked again here so rows
 	// written before that (or by any older path) never leave unmasked.

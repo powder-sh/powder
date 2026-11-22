@@ -98,3 +98,19 @@ export function adoptContainerProblem(
 		return `the container "${name}" belongs to powder's own compose project "${composeProject}"`
 	return null
 }
+
+/** The adopt flows (repo connect, repo import) refuse a container whose compose
+ *  working dir is in powder's preview namespace (`/opt/apps/pv-...`, also anything
+ *  below it): names starting with `pv-` are reserved for previews (/new refuses them
+ *  too), and an app there would block the preview of that name, whose clone is
+ *  refused because the directory is not its own. The container name alone does not
+ *  show where it runs from. Null when the working dir may be adopted. */
+export function adoptWorkingDirProblem(workingDir: string | null | undefined): string | null {
+	if (!workingDir) return null
+	const segs = workingDir.split('/').filter((x) => x && x !== '.')
+	if (segs.includes('..'))
+		return `the container's compose directory ${workingDir} is not a plain path (it holds ..); start the app from a plain directory, then connect it`
+	if (segs[0] === 'opt' && segs[1] === 'apps' && /^pv-/i.test(segs[2] ?? ''))
+		return `the container's compose directory ${workingDir} is in powder's preview namespace: names under /opt/apps/pv-* are reserved for previews, and a preview of that name would be refused because the directory is not its own. Move the app to a directory with another name, start it from there, then connect it again`
+	return null
+}

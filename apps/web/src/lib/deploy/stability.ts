@@ -6,12 +6,18 @@
 // marker (unknown: no card is raised or resolved).
 //
 // Marker lines, one per check, `<marker> <kind> <value>`:
-//   compose-drift drift|ok
+//   compose-drift drift|standing|ok         (deploy/compose-drift-inventory.ts)
 //   migrate-path  ok | <case>[,<case>...]   (MIGRATE_PATH_CASES)
 //   test-gate     present|absent           (.powder/test.sh in the build context)
+//   test-gate-result passed|failed|none    (the gate's outcome: printed by the script
+//                                           itself after the run, so the tests' and the
+//                                           build's output cannot set it; stored as
+//                                           deploys.test_gate)
+//   stop-drain    ok|no-route-away|sigterm-ignored|killed (fragments.ts drainShellFunctions)
 
+import type { TestGate } from '@powder/db/schema'
 import { shq } from '../shell'
-import { RELEASE_SCHEMA_PUSH_ERE, SCHEMA_TOOL_ERE } from './fragments'
+import { DRAIN_VERDICTS, type DrainVerdict, RELEASE_SCHEMA_PUSH_ERE, SCHEMA_TOOL_ERE } from './fragments'
 
 /** Marker prefix of this run, '' without a nonce (then no marker is printed). */
 export function stabilityMarkerFor(nonce: string): string {
@@ -28,7 +34,9 @@ export function stabilityMarkShell(nonce: string, kind: string, value: string): 
 }
 
 /** Ways an app's schema changes bypass powder-migrate (migrate-path marker):
- *  - stray-sql: migration-looking *.sql files, none in a folder powder-migrate reads
+ *  - stray-sql: migration-looking *.sql files, none in a folder powder-migrate reads,
+ *    and the image's powder.release.cmd label runs no ledgered migrator (a label
+ *    matching SCHEMA_TOOL_ERE but not RELEASE_SCHEMA_PUSH_ERE owns the app's SQL)
  *  - boot-cmd: the image Cmd/Entrypoint runs a schema tool (SCHEMA_TOOL_ERE)
  *  - release-cmd: the image label powder.release.cmd runs a schema push
  *    (RELEASE_SCHEMA_PUSH_ERE). A ledgered migrator there (knex migrate, prisma
@@ -38,15 +46,21 @@ export const MIGRATE_PATH_CASES = ['stray-sql', 'boot-cmd', 'release-cmd', 'star
 export type MigratePathCase = (typeof MIGRATE_PATH_CASES)[number]
 
 export type StabilityMarkers = {
-	/** the repo's docker-compose.yml differs from the runtime compose */
-	composeDrift: 'drift' | 'ok' | null
+	/** the repo's docker-compose.yml differs from the runtime compose: `drift` = changed
+	 *  in this deploy's commit range, `standing` = unchanged since the last deploy */
+	composeDrift: 'drift' | 'standing' | 'ok' | null
 	/** [] = none found, every part of the scan finished */
 	migratePath: MigratePathCase[] | null
 	/** the build context has .powder/test.sh (the opt-in test gate) */
 	testGate: 'present' | 'absent' | null
+	/** the test gate's outcome (test-gate-result marker); null = no marker (died before
+	 *  or inside the gate, or a prebuilt deploy whose gate ran on the builder) */
+	testGateResult: TestGate | null
+	/** how the old container stopped in a bridged swap (DRAIN_VERDICTS) */
+	stopDrain: DrainVerdict | null
 }
 
-export const NO_STABILITY_MARKERS: StabilityMarkers = Object.freeze({ composeDrift: null, migratePath: null, testGate: null })
+export const NO_STABILITY_MARKERS: StabilityMarkers = Object.freeze({ composeDrift: null, migratePath: null, testGate: null, testGateResult: null, stopDrain: null })
 
 /** The last valid marker line per kind. Never throws: anything malformed is
  *  ignored, and an unexpected error gives "unknown" for every kind. */
@@ -60,8 +74,10 @@ export function parseStabilityMarkers(out: string, nonce: string): StabilityMark
 			const parts = l.slice(marker.length + 1).trim().split(/\s+/)
 			if (parts.length !== 2) continue
 			const [kind, value] = parts as [string, string]
-			if (kind === 'compose-drift' && (value === 'drift' || value === 'ok')) v.composeDrift = value
+			if (kind === 'compose-drift' && (value === 'drift' || value === 'standing' || value === 'ok')) v.composeDrift = value
 			else if (kind === 'test-gate' && (value === 'present' || value === 'absent')) v.testGate = value
+			else if (kind === 'test-gate-result' && (value === 'passed' || value === 'failed' || value === 'none')) v.testGateResult = value
+			else if (kind === 'stop-drain' && (DRAIN_VERDICTS as readonly string[]).includes(value)) v.stopDrain = value as DrainVerdict
 			else if (kind === 'migrate-path') {
 				if (value === 'ok') v.migratePath = []
 				else {
@@ -77,14 +93,36 @@ export function parseStabilityMarkers(out: string, nonce: string): StabilityMark
 	}
 }
 
-/** `out` without this run's marker lines: they are read by parseStabilityMarkers
- *  and carry nothing for the stored deploy log. Other lines are kept as they are. */
+/** The synced-commit marker of a run (deploy/script.ts prints `<marker> <sha> <branch>`
+ *  after the git sync; deploy/run.ts parseSyncedSha reads it), '' without a nonce. */
+export function syncedShaMarkerFor(nonce: string): string {
+	const n = nonce.replace(/[^A-Za-z0-9]/g, '')
+	return n ? `__POWDER_SHA_${n}__` : ''
+}
+
+/** The builder's built-sha marker of a run (builder.ts prints `<marker> <sha>`,
+ *  parseBuiltSha reads it), '' without a nonce. */
+export function builtShaMarkerFor(nonce: string): string {
+	const n = nonce.replace(/[^A-Za-z0-9]/g, '')
+	return n ? `__POWDER_BUILT_SHA_${n}__` : ''
+}
+
+/** The line starts of every marker one run prints (each followed by a space): the
+ *  stability marks, the synced sha and the builder's built sha. [] without a nonce. */
+function runMarkerPrefixes(nonce: string): string[] {
+	return [stabilityMarkerFor(nonce), syncedShaMarkerFor(nonce), builtShaMarkerFor(nonce)].filter(Boolean).map((m) => `${m} `)
+}
+
+/** `out` without this run's marker lines (runMarkerPrefixes): they are read by their
+ *  parsers first and carry nothing for the stored deploy log or the stored error. The
+ *  one stripping rule for both: the live filter below applies the same prefixes.
+ *  Other lines are kept as they are. */
 export function stripStabilityMarkers(out: string, nonce: string): string {
-	const marker = stabilityMarkerFor(nonce)
-	if (!marker) return out
+	const prefixes = runMarkerPrefixes(nonce)
+	if (prefixes.length === 0) return out
 	return out
 		.split('\n')
-		.filter((l) => !l.startsWith(`${marker} `))
+		.filter((l) => !prefixes.some((p) => l.startsWith(p)))
 		.join('\n')
 }
 
@@ -101,9 +139,10 @@ export function stabilityMarkerFilter(
 	nonce: string,
 	sink: ((chunk: string) => void) | undefined,
 ): { push: (chunk: string, stream?: string) => void; flush: () => void } {
-	const marker = stabilityMarkerFor(nonce)
-	if (!marker || !sink) return { push: (c) => sink?.(c), flush: () => {} }
-	const prefix = `${marker} `
+	const prefixes = runMarkerPrefixes(nonce)
+	if (prefixes.length === 0 || !sink) return { push: (c) => sink?.(c), flush: () => {} }
+	const isMarker = (line: string) => prefixes.some((p) => line.startsWith(p))
+	const mayBecomeMarker = (line: string) => prefixes.some((p) => p.startsWith(line))
 	const streams = new Map<string, { atLineStart: boolean; held: string }>()
 	return {
 		push(chunk, stream = '') {
@@ -131,14 +170,14 @@ export function stabilityMarkerFilter(
 				}
 				const line = nl < 0 ? text : text.slice(0, nl)
 				if (nl < 0) {
-					if (prefix.startsWith(line) || line.startsWith(prefix)) held = line
+					if (mayBecomeMarker(line) || isMarker(line)) held = line
 					else {
 						out += line
 						atLineStart = false
 					}
 					text = ''
 				} else {
-					if (!line.startsWith(prefix)) out += `${line}\n`
+					if (!isMarker(line)) out += `${line}\n`
 					text = text.slice(nl + 1)
 				}
 			}
@@ -147,7 +186,7 @@ export function stabilityMarkerFilter(
 			if (out) sink(out)
 		},
 		flush() {
-			for (const st of streams.values()) if (st.held && !st.held.startsWith(prefix)) sink(st.held)
+			for (const st of streams.values()) if (st.held && !isMarker(st.held)) sink(st.held)
 			streams.clear()
 		},
 	}
@@ -195,12 +234,17 @@ export function migratePathScanShell(nonce: string, workingDir: string): string 
 		'else U=1; MD=skip; S=""; fi; ' +
 		// any non-zero find exit (timeout, permission denied, I/O error) = not finished:
 		// unknown. A hit find printed before a non-timeout error still counts.
-		`if [ "$MD" = n ]; then L=$($__t find "$S" -maxdepth 6 \\( ${prune} \\) -prune -o -type f -name '*.sql' -print 2>/dev/null); R=$?; if [ "$R" != 0 ]; then U=1; fi; ` +
+		// The image's powder.release.cmd label, read once. A ledgered migrator there (a
+		// schema tool, not a push) owns the app's *.sql files: the stray-sql part is
+		// skipped. A push, no label or a failed read keeps it.
+		'I="${IMGREF:-}"; [ -n "$I" ] || I="${LB_IMG:-}"; RC=""; RK=n; RM=n; ' +
+		`if [ -n "$I" ]; then RC=$($__ti docker image inspect -f '{{index .Config.Labels "powder.release.cmd"}}' "$I" 2>/dev/null); if [ $? = 0 ]; then RK=y; fi; fi; ` +
+		`if [ "$RK" = y ] && printf '%s' "$RC" | grep -qE ${shq(SCHEMA_TOOL_ERE)} && ! printf '%s' "$RC" | grep -qE ${shq(RELEASE_SCHEMA_PUSH_ERE)}; then RM=y; fi; ` +
+		`if [ "$MD" = n ] && [ "$RM" = n ]; then L=$($__t find "$S" -maxdepth 6 \\( ${prune} \\) -prune -o -type f -name '*.sql' -print 2>/dev/null); R=$?; if [ "$R" != 0 ]; then U=1; fi; ` +
 		`if [ "$R" -ge 124 ]; then L=""; else H=$(printf '%s\\n' "$L" | grep -iE ${shq(MIGRATION_SQL_ERE)} | head -n 1); L=""; ` +
 		`if [ -n "$H" ]; then F="$F,stray-sql"; H="\${H#"$S"/}"; H=$(printf '%s' "$H" | tr -cd 'A-Za-z0-9._/-' | cut -c1-200); echo "[migrate-path] WARNING: *.sql migration files (e.g. $H) sit outside the folders powder-migrate reads, so this deploy applies none of them (${fix})"; fi; fi; fi; ` +
-		'I="${IMGREF:-}"; [ -n "$I" ] || I="${LB_IMG:-}"; ' +
 		`if [ -n "$I" ]; then C=$($__ti docker image inspect -f '{{json .Config.Cmd}} {{json .Config.Entrypoint}}' "$I" 2>/dev/null); if [ $? = 0 ]; then if printf '%s' "$C" | grep -qE ${shq(SCHEMA_TOOL_ERE)}; then F="$F,boot-cmd"; echo "[migrate-path] WARNING: the image command/entrypoint runs a schema tool at container start, outside powder-migrate"; fi; else U=1; fi; ` +
-		`C=$($__ti docker image inspect -f '{{index .Config.Labels "powder.release.cmd"}}' "$I" 2>/dev/null); if [ $? = 0 ]; then if printf '%s' "$C" | grep -qE ${shq(RELEASE_SCHEMA_PUSH_ERE)}; then F="$F,release-cmd"; echo "[migrate-path] WARNING: the powder.release.cmd label runs a schema push (drizzle-kit push, prisma db push), which diffs the live schema with no ledger"; fi; else U=1; fi; else U=1; fi; C=""; ` +
+		`if [ "$RK" = y ]; then if printf '%s' "$RC" | grep -qE ${shq(RELEASE_SCHEMA_PUSH_ERE)}; then F="$F,release-cmd"; echo "[migrate-path] WARNING: the powder.release.cmd label runs a schema push (drizzle-kit push, prisma db push), which diffs the live schema with no ledger"; fi; else U=1; fi; else U=1; fi; C=""; ` +
 		'P=""; if [ -n "${PF_CTX:-}" ]; then P="$PF_CTX/package.json"; elif [ -n "$S" ]; then P="$S/package.json"; else U=1; fi; ' +
 		`if [ -z "$P" ]; then :; elif [ -L "$P" ]; then U=1; elif [ -f "$P" ]; then C=$(head -c 262144 "$P" 2>/dev/null | grep -m1 -E '"start"[[:space:]]*:'); if printf '%s' "$C" | grep -qE ${shq(SCHEMA_TOOL_ERE)}; then F="$F,start-script"; echo "[migrate-path] WARNING: package.json start runs a schema tool at container start, outside powder-migrate"; fi; fi; ` +
 		'F="${F#,}"; ' +
@@ -217,4 +261,9 @@ export function testGatePresenceShell(nonce: string): string {
 	const absent = stabilityMarkShell(nonce, 'test-gate', 'absent')
 	if (!present || !absent) return ''
 	return `{ ( if [ -f "\${PF_CTX:-$(pwd)/src}/.powder/test.sh" ]; then ${present}else ${absent}fi ) </dev/null 2>/dev/null || true; } && `
+}
+
+/** The `resultMark` of testGateShell for this run's nonce. */
+export function testGateResultMark(nonce: string): (result: 'passed' | 'failed') => string {
+	return (result) => stabilityMarkShell(nonce, 'test-gate-result', result)
 }

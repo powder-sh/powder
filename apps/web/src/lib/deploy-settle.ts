@@ -1,7 +1,16 @@
-// Settle window for push deploys: a webhook push does not deploy at once, it waits up to
-// N seconds (deploys.not_before) so further pushes of the same app fold into the one
-// queued row and ship as ONE deploy of the newest commit. The window is fixed from the
-// first push: a later push that folds in never moves not_before later.
+// Settle window for push deploys, RETIRED for new pushes: no push waits on a
+// clock any more. startDeploy (deploys.ts) never sets not_before: a push with no deploy of
+// the app queued or running is claimable at once, and pushes that land while one runs fold
+// into the single queued row, which the next build ships as the newest commit. Most
+// pushes have nothing to fold, so a window only delays them.
+// What stays, for rows an older powder already held: heldSql and its readers below, the
+// settings that switch a hold off (0 releases them), `[urgent]` / "redeploy now" releasing
+// one, and rollback / stop cancelling one.
+//
+// The rest of this comment describes the window as it worked for those held rows:
+// a webhook push waited up to N seconds (deploys.not_before) so further pushes of the same
+// app folded into the one queued row and shipped as ONE deploy of the newest commit. The
+// window was fixed from the first push: a later push that folds in never moves not_before.
 //
 // Off by default: no powder_meta row (DEPLOY_SETTLE_META_KEY) and no per-app value = 0.
 // The row is the install default; POWDER_DEPLOY_SETTLE_SECONDS writes it at boot

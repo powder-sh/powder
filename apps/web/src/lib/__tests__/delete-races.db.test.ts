@@ -110,7 +110,7 @@ describe.skipIf(!hasPg)('delete races on a real postgres', () => {
 		await deleting
 		await expect(creating).rejects.toBeInstanceOf(ServerGoneError)
 		expect(appCount('srv_a')).toBe('0')
-	}, 30_000)
+	})
 
 	it('an app create in flight: the server delete waits, then sees the app and refuses', async () => {
 		const { db, appRepos, createId, prefixes } = await import('../db')
@@ -154,7 +154,7 @@ describe.skipIf(!hasPg)('delete races on a real postgres', () => {
 		await creating
 		expect(await deleting).toEqual({ ok: false, reason: 'apps', apps: ['quuxapi'] })
 		expect(psql(['-tAc', "SELECT count(*) FROM servers WHERE id = 'srv_b'"]).trim()).toBe('1')
-	}, 30_000)
+	})
 
 	it('an app create in flight does not hold up a status update of its server', async () => {
 		const { db } = await import('../db')
@@ -186,7 +186,7 @@ describe.skipIf(!hasPg)('delete races on a real postgres', () => {
 			await creating
 		}
 		expect(psql(['-tAc', "SELECT status FROM servers WHERE id = 'srv_d'"]).trim()).toBe('connected')
-	}, 30_000)
+	})
 
 	it('without a server row the create refuses at once', async () => {
 		const { createRepo, ServerGoneError } = await import('../repos')
@@ -218,5 +218,5 @@ describe.skipIf(!hasPg)('delete races on a real postgres', () => {
 		expect(psql(['-tAc', "SELECT output, heartbeat_at IS NOT NULL FROM deploys WHERE id = 'dep_live'"]).trim()).toBe(
 			'deleting zorbweb: inspecting the container|t',
 		)
-	}, 30_000)
+	})
 })

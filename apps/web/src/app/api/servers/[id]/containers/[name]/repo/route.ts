@@ -1,6 +1,6 @@
 import type { NextRequest } from 'next/server'
 import { requireContainerAccess } from '@/lib/access'
-import { adoptContainerProblem } from '@/lib/app-names'
+import { adoptContainerProblem, adoptWorkingDirProblem } from '@/lib/app-names'
 import { branchProblem, repoUrlProblem } from '@/lib/git-input'
 import { generateDeployKey } from '@/lib/keygen'
 import {
@@ -11,8 +11,9 @@ import {
 	getRepoFor,
 	projectNameProblem,
 } from '@/lib/repos'
-import { shq } from '@/lib/shell'
-import { deleteRemoteFile, inspectContainer, runCommand, writeFileSecret } from '@/lib/ssh'
+import { type AppCheckout, checkoutNote, cloneRefusal } from '@/lib/app-checkout'
+import { deleteRemoteFile, inspectContainer, writeFileSecret } from '@/lib/ssh'
+import { deployKeyMissingForRepo, probeAppCheckout } from '@/lib/ssh/git'
 import { removeGithubObjects } from '@/lib/github-disconnect'
 import { archiveAppEnvFiles } from '@/lib/deleted-env'
 import { webhookConfigError, webhookUrl as buildWebhookUrl } from '@/lib/hosts'
@@ -35,21 +36,24 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string;
 	const row = await getRepoFor(id, name)
 	if (!row) return Response.json({ connected: false })
 
-	// check if the working dir is actually a git checkout — if not, surface so UI can show clone CTA
-	let isCheckout = false
+	// where the app's checkout is (src/ first: lib/app-checkout.ts). The UI offers the
+	// clone action only when cloneRefusal allows it; checkoutNote says what is true.
+	let checkout: AppCheckout = { kind: 'unknown' }
+	let workingDir: string | null = null
 	try {
 		const detail = await inspectContainer(server, name)
-		if (detail.compose.workingDir) {
-			const { code } = await runCommand(
-				server,
-				`test -d ${shq(`${detail.compose.workingDir}/.git`)}`,
-				5_000,
-			)
-			isCheckout = code === 0
-		}
+		workingDir = detail.compose.workingDir ?? null
+		if (workingDir) checkout = await probeAppCheckout(server, workingDir)
 	} catch {
-		// ignore; isCheckout stays false
+		// ignore; checkout stays unknown
 	}
+	const isCheckout = checkout.kind === 'src' || checkout.kind === 'workdir'
+	// a clone whose deploy key could not be written afterwards: the clone action then
+	// writes only the key (repo/clone route)
+	const keyMissing =
+		checkout.kind === 'src' && !!workingDir
+			? await deployKeyMissingForRepo(server, workingDir.replace(/\/+$/, ''), row.repoUrl).catch(() => false)
+			: false
 
 	return Response.json({
 		connected: true,
@@ -59,6 +63,11 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string;
 		webhookUrl: publicWebhookUrl(req, row.webhookToken),
 		webhookSecret: null,
 		isCheckout,
+		checkout,
+		checkoutNote: checkoutNote(workingDir, checkout),
+		// the clone action (into <working dir>/src) is offered only when the layout allows it
+		cloneAllowed: !!workingDir && cloneRefusal(workingDir, checkout) === null,
+		keyMissing,
 		createdAt: row.createdAt,
 	})
 }
@@ -95,7 +104,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
 		)
 	}
 	// never a reserved name, powder's own container or powder's compose project
-	const adopt = adoptContainerProblem(name, detail.compose.project)
+	const adopt = adoptContainerProblem(name, detail.compose.project) ?? adoptWorkingDirProblem(detail.compose.workingDir)
 	if (adopt) return Response.json({ error: adopt }, { status: 400 })
 
 	// no compose project name another app on the server (or powder) has.

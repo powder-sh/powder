@@ -823,8 +823,14 @@ export async function pollPendingBackups(): Promise<void> {
 //   - the tick races a TICK_TIMEOUT_MS deadline; on timeout it reports to HQ
 //     and releases the guard. A generation counter stops a hung tick that
 //     later wakes up from firing backups next to its successor.
-//   - the staleness check runs on its own guard + deadline, started before
-//     the main tick, so a stuck tick can't silence it.
+//   - the staleness check runs on its own guard + deadline. It runs AFTER the
+//     fire step (in the tick's finally, so also after a deadline or a throw),
+//     never before it: a check started before the fire step reads app_backups
+//     before this tick's first-ever backup row exists, and alerts "NO successful
+//     backup on record" for an app whose first backup starts the same second.
+//     When a previous tick still holds the guard, this tick runs the check at
+//     once, so a stuck tick can't silence it. backup-stale-order.db.test.ts fails if the check moves back
+//     in front of the fire step.
 const TICK_TIMEOUT_MS = 30 * 60 * 1000
 const STALE_CHECK_TIMEOUT_MS = 5 * 60 * 1000
 let tickRunning = false
@@ -841,10 +847,11 @@ function withDeadline<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
 
 export async function backupTick(): Promise<void> {
 	if (!isBackupConfigured()) return
-	void runStaleCheck()
 
 	if (tickRunning) {
 		console.log('[backup] tick already running, skipping')
+		// The running tick may be stuck: check staleness now, not after it.
+		await runStaleCheck()
 		return
 	}
 	tickRunning = true
@@ -862,6 +869,8 @@ export async function backupTick(): Promise<void> {
 		})
 	} finally {
 		tickRunning = false
+		// After the fire step, so this tick's new rows are visible to the check.
+		await runStaleCheck()
 	}
 }
 

@@ -17,6 +17,15 @@ import { runCommand } from './ssh'
 import type { ServerConfig } from './servers'
 import { shq } from './shell'
 import { traefikFileRouterTls } from './traefik-tls'
+import {
+	type InspectJson,
+	flagValue,
+	hostPathOf,
+	traefikArgv,
+	traefikConfigHostPath,
+} from './traefik-network'
+
+export { redirectRowInUse } from './traefik-network'
 
 export interface CustomRedirect {
 	from: string // path
@@ -437,54 +446,16 @@ export type FileProviderCheck =
 	| { state: 'need-config'; configHostPath: string }
 	| { state: 'fail' }
 
-interface InspectMount {
-	Source?: string
-	Destination?: string
-}
-interface InspectJson {
-	Args?: string[]
-	Config?: { Cmd?: string[] | null; Entrypoint?: string[] | null }
-	Mounts?: InspectMount[]
-}
-
-// Host path behind a container path, via the mounts (null if not mounted).
-function hostPathOf(mounts: InspectMount[], containerPath: string): string | null {
-	let best: InspectMount | null = null
-	for (const m of mounts) {
-		const d = (m.Destination ?? '').replace(/\/+$/, '')
-		if (!d || !m.Source) continue
-		if (containerPath === d || containerPath.startsWith(`${d}/`)) {
-			if (!best || d.length > (best.Destination ?? '').length) best = m
-		}
-	}
-	if (!best) return null
-	const d = (best.Destination ?? '').replace(/\/+$/, '')
-	return `${(best.Source ?? '').replace(/\/+$/, '')}${containerPath.slice(d.length)}`
-}
-
-function flagValue(argv: string[], name: string): string | null | undefined {
-	// undefined = flag absent; null = flag present without a value
-	for (let i = 0; i < argv.length; i++) {
-		const a = argv[i] ?? ''
-		const bare = a.replace(/^--?/, '')
-		if (bare === name) {
-			const next = argv[i + 1]
-			return next !== undefined && !next.startsWith('-') ? next : null
-		}
-		if (bare.startsWith(`${name}=`)) return bare.slice(name.length + 1)
-	}
-	return undefined
-}
-
 // Pure: does `docker inspect traefik` show a watched file provider on a
 // directory mounted from `dynamicDir`? 'need-config' means the settings live in
-// a traefik.yml; the caller reads that host file and uses fileProviderFromYml.
+// a config file (traefikConfigHostPath); the caller reads that host file and uses
+// fileProviderFromYml.
 export function checkFileProviderFromInspect(
 	inspect: InspectJson,
 	dynamicDir: string = TRAEFIK_DYNAMIC_DIR,
 ): FileProviderCheck {
 	const mounts = inspect.Mounts ?? []
-	const argv = [...(inspect.Config?.Entrypoint ?? []), ...(inspect.Config?.Cmd ?? []), ...(inspect.Args ?? [])]
+	const argv = traefikArgv(inspect)
 	const dir = flagValue(argv, 'providers.file.directory')
 	if (typeof dir === 'string') {
 		const watch = flagValue(argv, 'providers.file.watch')
@@ -492,9 +463,7 @@ export function checkFileProviderFromInspect(
 		const host = hostPathOf(mounts, dir.replace(/\/+$/, ''))
 		return watchOn && host === dynamicDir ? { state: 'ok' } : { state: 'fail' }
 	}
-	const cfgFlag = flagValue(argv, 'configFile') ?? flagValue(argv, 'configfile')
-	const cfgPath = typeof cfgFlag === 'string' ? cfgFlag : '/etc/traefik/traefik.yml'
-	const cfgHost = hostPathOf(mounts, cfgPath)
+	const cfgHost = traefikConfigHostPath(inspect)
 	if (cfgHost) return { state: 'need-config', configHostPath: cfgHost }
 	return { state: 'fail' }
 }

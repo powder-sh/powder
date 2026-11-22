@@ -4,13 +4,15 @@
 // running deploys. The hash anchor (#dep_xxx) on entry expands that row so
 // linking from elsewhere "jumps" to a specific deploy.
 
+import { CopyButton } from '@/components/ui/copy-button'
 import { EmptyState } from '@/components/ui/empty-state'
 import { StatusLabel } from '@/components/ui/status'
 import { cn } from '@/lib/cn'
 import { ChevronRight, Rocket } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { deployKindLabel, deployStatus } from '@/lib/deploy-status'
-import { stripFailMarkers } from '@/lib/deploy-log'
+import { failedDeployCopyFromRow } from '@/lib/deploy-copy'
+import Link from 'next/link'
 import {
 	REVOKED_MESSAGE,
 	STREAM_EXPIRED,
@@ -22,10 +24,13 @@ import {
 	streamOffset,
 } from '@/lib/stream-events'
 import { type Deploy, timeAgo, useProject } from '../_lib/project-context'
-import { formatDateTime } from '@/lib/format'
+import { formatDateTime, waitedLabel } from '@/lib/format'
+import { deployCommitLabel } from '@/lib/deploy-commit'
+import { deployListAt } from '@/lib/deploy-order'
+import { summaryBeyondStep } from '@/lib/notify-text'
 
 export default function DeploymentsPage() {
-	const { deploys, reload } = useProject()
+	const { deploys, reload, project } = useProject()
 	const [expandedDeploy, setExpandedDeploy] = useState<string | null>(null)
 
 	// Auto-expand from #dep_xxx URL hash on first render.
@@ -68,20 +73,22 @@ export default function DeploymentsPage() {
 							>
 								{deployStatus(d.status).label}
 							</StatusLabel>
-							<span className="font-mono text-xs">{d.gitSha ? d.gitSha.slice(0, 7) : '-'}</span>
+							<span className="font-mono text-xs">{deployCommitLabel(d) ?? '-'}</span>
 							{d.gitBranch && (
 								<span className="hidden truncate text-xs text-muted-foreground sm:inline">
 									{d.gitBranch}
 								</span>
 							)}
 							<span className="ml-auto shrink-0 text-right text-xs text-muted-foreground">
-								{timeAgo(d.startedAt)}
+								{timeAgo(String(deployListAt(d)))}
 							</span>
 							<span className="hidden w-24 shrink-0 text-right text-xs text-muted-foreground md:inline">
 								{deployKindLabel(d.kind)}
 							</span>
 						</button>
-						{expanded && <DeployBody deploy={d} reload={reload} />}
+						{expanded && (
+							<DeployBody deploy={d} reload={reload} app={project?.containerName ?? ''} />
+						)}
 					</li>
 				)
 			})}
@@ -89,7 +96,7 @@ export default function DeploymentsPage() {
 	)
 }
 
-function DeployBody({ deploy, reload }: { deploy: Deploy; reload: () => void }) {
+function DeployBody({ deploy, reload, app }: { deploy: Deploy; reload: () => void; app: string }) {
 	const [liveOutput, setLiveOutput] = useState('')
 	const [liveStatus, setLiveStatus] = useState<string | null>(null)
 	// an `expired` stream reconnects (streamKey) and resumes after the
@@ -141,32 +148,93 @@ function DeployBody({ deploy, reload }: { deploy: Deploy; reload: () => void }) 
 	const active = deploy.status === 'running' || deploy.status === 'queued'
 	// Keep live output on screen until the reload returns a finished deploy.
 	const isLive = active
+	// A failure shows its summary, step and exit code, then the END of its log, where the
+	// cause is (the API sends only that tail); the full log is on the deploy page.
+	const isFailure = !isLive && deploy.status === 'failed'
 	const showText = isLive
 		? liveOutput ||
 			(liveStatus ? 'finishing…' : deploy.status === 'queued' ? (deploy.waiting ?? 'queued…') : 'connecting…')
-		: deploy.error
-			? stripFailMarkers(deploy.error)
+		: isFailure
+			? deploy.logTail || 'no log recorded'
 			: (deploy.outputPreview ?? (liveOutput || 'no output recorded'))
-	const isError = !isLive && !!deploy.error
+	// Copy only real text: never a placeholder like "connecting…".
+	const copyable = isFailure || (isLive ? !!liveOutput : !!(deploy.outputPreview ?? liveOutput))
+	const textId = `deploy-text-${deploy.id}`
+	// the tail opens scrolled to its end: the cause is in the last lines
+	const preRef = useRef<HTMLPreElement | null>(null)
+	useEffect(() => {
+		if (isFailure && preRef.current) preRef.current.scrollTop = preRef.current.scrollHeight
+	}, [isFailure])
 
+	// a summary that already names the step ("failed during: <step>") is not followed by
+	// "failed at: <step>" as well
+	const stepShown =
+		deploy.failedStep && (!deploy.errorSummary || summaryBeyondStep(deploy.failedStep, deploy.errorSummary) === deploy.errorSummary.trim())
+			? deploy.failedStep
+			: null
 	return (
 		<div className="border-t border-border bg-muted/40 px-4 py-3 font-mono text-xs">
-			<div className="space-y-1">
-				<div className={`font-medium ${isError ? 'text-destructive' : 'text-muted-foreground'}`}>
-					{isLive
-						? liveStatus
-							? 'output'
-							: 'live output'
-						: isError
-							? 'error'
-							: 'output (preview)'}
+			{isFailure && (deploy.errorSummary || deploy.failedStep || deploy.exitCode != null) && (
+				<div className="mb-3 space-y-0.5 font-sans">
+					{deploy.errorSummary && (
+						<p className="ph-no-capture break-words text-sm font-medium text-destructive">{deploy.errorSummary}</p>
+					)}
+					{(stepShown || deploy.exitCode != null) && (
+						<p className="ph-no-capture font-mono text-2xs text-muted-foreground">
+							{stepShown && <>failed at: {stepShown}</>}
+							{stepShown && deploy.exitCode != null && ' · '}
+							{deploy.exitCode != null && <>exit code {deploy.exitCode}</>}
+						</p>
+					)}
 				</div>
-				<pre className="ph-no-capture max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-background p-3 leading-relaxed text-foreground/90">
+			)}
+			<div className="space-y-1">
+				<div className="flex min-h-6 items-center justify-between gap-2">
+					<span className={`font-medium ${isFailure ? 'text-destructive' : 'text-muted-foreground'}`}>
+						{isLive
+							? liveStatus
+								? 'output'
+								: 'live output'
+							: isFailure
+								? deploy.logCut
+									? 'end of the log'
+									: 'log'
+								: 'output (preview)'}
+					</span>
+					<span className="flex items-center gap-2">
+						{isFailure && (
+							<Link
+								href={`/deploys/${deploy.id}`}
+								className="font-sans text-2xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+							>
+								full log
+							</Link>
+						)}
+						{copyable && (
+							<CopyButton
+								value={() => (isFailure ? failedDeployCopyFromRow(app, deploy) : showText)}
+								label={isFailure ? 'copy error with app, deploy, commit and failed step' : 'copy output'}
+								text="copy"
+								targetId={textId}
+								size="xs"
+							/>
+						)}
+					</span>
+				</div>
+				<pre
+					id={textId}
+					ref={preRef}
+					className="ph-no-capture max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-background p-3 leading-relaxed text-foreground/90"
+				>
 					{showText}
 				</pre>
 			</div>
 			<div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-2xs text-muted-foreground">
-				<span>started {formatDateTime(deploy.startedAt)}</span>
+				{deploy.queuedAt && <span>queued {formatDateTime(deploy.queuedAt)}</span>}
+				{deploy.status !== 'queued' && <span>started {formatDateTime(deploy.startedAt)}</span>}
+				{deploy.status !== 'queued' && waitedLabel(deploy.queuedAt, deploy.startedAt) && (
+					<span>{waitedLabel(deploy.queuedAt, deploy.startedAt)}</span>
+				)}
 				{deploy.finishedAt && <span>finished {formatDateTime(deploy.finishedAt)}</span>}
 				{deploy.imageTag && <span className="truncate">image: {deploy.imageTag}</span>}
 			</div>

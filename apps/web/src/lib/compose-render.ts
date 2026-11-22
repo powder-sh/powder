@@ -9,9 +9,11 @@ const DEFAULT_APP_MEM_LIMIT = '512m'
 const DEFAULT_DB_MEM_LIMIT = '256m'
 const DEFAULT_KV_MEM_LIMIT = '128m'
 
-import { healthPathFor } from './app-hosts'
+import { healthPathFor, traefikRetryLabels } from './app-hosts'
+import { drainActiveFor } from './drain-mode'
 import { POSTGRES_IMAGE, REDIS_IMAGE } from './db-images'
 import { traefikRouterTlsLabel } from './traefik-tls'
+import { DEFAULT_TRAEFIK_NETWORK, assertDockerNetworkName } from './traefik-network'
 
 export function renderComposeYaml(opts: {
 	name: string
@@ -30,12 +32,22 @@ export function renderComposeYaml(opts: {
 	 *  DB containers shared by several apps). Default off: an app only joins `web` (Traefik) and
 	 *  its own db/kv networks. */
 	sharedInternal?: boolean
+	/** The network the server's Traefik routes over (traefik-network-run.ts
+	 *  resolveTraefikNetwork). Absent or `web`: the compose is exactly what it always
+	 *  was. Another network: the app joins that one instead of `web` and carries
+	 *  traefik.docker.network, so Traefik picks it among the app's networks (its db/kv
+	 *  networks too). Also on an app with no host yet: the labels a custom domain adds
+	 *  later (app-domains.ts, an override file) merge with these by key and keep it. */
+	traefikNetwork?: string
 }): string {
 	const dbNet = `${opts.name}-db`
 	const kvNet = `${opts.name}-kv`
+	const routeNet = assertDockerNetworkName(opts.traefikNetwork ?? DEFAULT_TRAEFIK_NETWORK)
+	const otherNet = routeNet !== DEFAULT_TRAEFIK_NETWORK
+	const internal = opts.sharedInternal && routeNet !== 'internal'
 	const appNetworks = [
-		'web',
-		...(opts.sharedInternal ? ['internal'] : []),
+		routeNet,
+		...(internal ? ['internal'] : []),
 		...(opts.postgres ? [dbNet] : []),
 		...(opts.kv ? [kvNet] : []),
 	]
@@ -54,7 +66,7 @@ export function renderComposeYaml(opts: {
 	const labelsBlock = opts.publicHost
 		? `    labels:
       - traefik.enable=true
-      - traefik.http.routers.${opts.name}.rule=Host(\`${opts.publicHost}\`)
+${otherNet ? `      - traefik.docker.network=${routeNet}\n` : ''}      - traefik.http.routers.${opts.name}.rule=Host(\`${opts.publicHost}\`)
       - traefik.http.routers.${opts.name}.entrypoints=websecure
       - ${traefikRouterTlsLabel(opts.name, opts.tlsMode)}
       - traefik.http.services.${opts.name}.loadbalancer.server.port=${opts.containerPort}
@@ -62,12 +74,12 @@ export function renderComposeYaml(opts: {
       - traefik.http.services.${opts.name}.loadbalancer.healthcheck.interval=10s
       - traefik.http.services.${opts.name}.loadbalancer.healthcheck.timeout=3s
       - traefik.http.middlewares.${opts.name}-diag.headers.customresponseheaders.X-Powder-App=${opts.name}
-      - traefik.http.routers.${opts.name}.middlewares=${opts.name}-diag
+${drainActiveFor(opts.name) ? traefikRetryLabels(opts.name).labels.map((l) => `      - ${l}\n`).join('') : ''}      - traefik.http.routers.${opts.name}.middlewares=${opts.name}-diag${drainActiveFor(opts.name) ? `,${traefikRetryLabels(opts.name).middleware}` : ''}
 `
 		: opts.traefik
 			? `    labels:
       - traefik.enable=false
-`
+${otherNet ? `      - traefik.docker.network=${routeNet}\n` : ''}`
 			: ''
 	const dbBlock = opts.postgres
 		? `
@@ -120,7 +132,7 @@ ${portsBlock}${labelsBlock}    networks:
 ${appNetworks.map((n) => `      - ${n}`).join('\n')}
 ${appExtras}${dbBlock}${kvBlock}
 networks:
-  web:
+  ${routeNet}:
     external: true
-${opts.sharedInternal ? '  internal:\n    external: true\n' : ''}${netDecls}`
+${internal ? '  internal:\n    external: true\n' : ''}${netDecls}`
 }

@@ -32,6 +32,8 @@ const h = vi.hoisted(() => ({
 }))
 // GitHub is stubbed: notifyDeploymentFinished records what it would have sent.
 vi.mock('../github-deployments', () => ({
+	notifyCommitPending: () => {},
+	notifyPreviewCommit: async () => {},
 	notifyDeploymentStarted: vi.fn(),
 	notifyDeploymentFinished: async (_repo: unknown, id: string, state: string, text: string) => {
 		h.ghFinished.push({ id, state, text })
@@ -102,6 +104,21 @@ describe.skipIf(!hasPg)('settle window on a real postgres', () => {
 			...over,
 		}).catch((e: unknown) => e)
 	}
+	/** A row held on the settle window the way an older powder wrote it (pushes
+	 *  no longer get one): queued, pinned, not_before = now + secs, the settle note. */
+	const hold = async (app: string, c: string, over: { triggeredBy?: string; secs?: number } = {}) => {
+		const { settleNoteFor } = await import('../deploy-settle')
+		const now = new Date()
+		const nb = new Date(now.getTime() + (over.secs ?? 600) * 1000)
+		const id = `dep_hold_${app}_${c}_${now.getTime()}`
+		psql([
+			'-c',
+			`INSERT INTO deploys(id, server_id, container_name, kind, status, queued_at, triggered_by, requested_sha, not_before, output)
+			 VALUES ('${id}', '${SRV}', '${app}', 'git_deploy', 'queued', '${now.toISOString()}', '${over.triggeredBy ?? 'webhook:me'}', '${sha(c)}', '${nb.toISOString()}', '[settle] ${settleNoteFor(nb)}
+')`,
+		])
+		return { id }
+	}
 	/** Claim everything claimable now; the claimed rows go back to success so the next test starts clean. */
 	const claimAll = async () => {
 		const { claimNextQueuedDeploy } = await import('../deploys')
@@ -147,49 +164,56 @@ describe.skipIf(!hasPg)('settle window on a real postgres', () => {
 		expect(await claimAll()).toEqual(['plain'])
 	})
 
-	it('a webhook push is held and claimed only once the window has passed', async () => {
-		addApp('held', null)
+	it('a lone webhook push is claimable at once even with a window set (no clock hold)', async () => {
+		addApp('held', 300)
 		setGlobal('600')
 		pin(0)
-		const d = (await push('held', 'a')) as { notBefore: Date; output: string }
-		expect(d.notBefore.toISOString()).toBe(at(600).toISOString())
-		expect(d.output).toContain('waiting until 10:10 UTC to bundle further pushes')
-		expect(d.output).toContain('redeploy now')
-		expect(d.output).toContain('[urgent]')
+		const d = await push('held', 'a')
+		expect(d).toMatchObject({ status: 'queued', notBefore: null, output: null })
+		expect(await claimAll()).toEqual(['held'])
+	})
+
+	it('a row held by an older powder is claimed once its window passed, without the settle note', async () => {
+		addApp('legacy', null)
+		setGlobal('600')
+		pin(0)
+		await hold('legacy', 'a')
 		pin(599)
 		expect(await claimAll()).toEqual([])
 		pin(600)
 		const { claimNextQueuedDeploy } = await import('../deploys')
 		const claimed = await claimNextQueuedDeploy()
-		expect(claimed?.containerName).toBe('held')
+		expect(claimed?.containerName).toBe('legacy')
 		// the settle note is dropped at claim, so the live log starts from the build
 		expect(claimed?.output).toBeNull()
 		await claimAll()
 	})
 
-	it('three pushes in the window: ONE deploy of the newest commit, held no longer than the window from the first', async () => {
+	it('pushes while a deploy runs fold into ONE queued row of the newest commit, claimable when it ends', async () => {
 		addApp('burst', null)
 		setGlobal('600')
 		pin(0)
 		await push('burst', 'a')
-		pin(200)
-		expect(await push('burst', 'b')).toMatchObject({ coalesced: true })
-		pin(590)
+		const { claimNextQueuedDeploy } = await import('../deploys')
+		expect((await claimNextQueuedDeploy())?.containerName).toBe('burst')
+		pin(20)
+		expect(await push('burst', 'b')).toMatchObject({ status: 'queued', notBefore: null })
+		pin(40)
 		expect(await push('burst', 'c')).toMatchObject({ coalesced: true })
-		// one row, unpinned (builds branch HEAD = the newest push), not_before still first + 600
-		expect(rows('burst')).toEqual(['queued|-|10:10:00|-'])
-		pin(599)
-		expect(await claimAll()).toEqual([])
-		pin(600)
+		// one queued row, unpinned (builds branch HEAD = the newest push), no clock
+		expect(rows('burst')).toEqual([`running|${sha('a')}|-|-`, 'queued|-|-|-'])
+		// still running: nothing to claim
+		expect(await claimNextQueuedDeploy()).toBeNull()
+		psql(['-c', `UPDATE deploys SET status = 'success', finished_at = now() WHERE container_name = 'burst' AND status = 'running'`])
 		expect(await claimAll()).toEqual(['burst'])
-		expect(rows('burst')).toHaveLength(1)
+		expect(rows('burst')).toHaveLength(2)
 	})
 
-	it('GitHub redelivering the same push creates no second row and does not extend the hold', async () => {
+	it('a push redelivered onto a held row creates no second row and does not extend the hold', async () => {
 		addApp('redeliver', null)
 		setGlobal('600')
 		pin(0)
-		await push('redeliver', 'a')
+		await hold('redeliver', 'a')
 		pin(300)
 		expect(await push('redeliver', 'a')).toMatchObject({ coalesced: true })
 		expect(rows('redeliver')).toEqual(['queued|-|10:10:00|-'])
@@ -213,7 +237,7 @@ describe.skipIf(!hasPg)('settle window on a real postgres', () => {
 		addApp('release', null)
 		setGlobal('600')
 		pin(0)
-		await push('release', 'a')
+		await hold('release', 'a')
 		pin(60)
 		const e = (await push('release', 'b', { urgent: true })) as { coalesced: boolean; released: boolean }
 		expect(e.coalesced).toBe(true)
@@ -226,7 +250,7 @@ describe.skipIf(!hasPg)('settle window on a real postgres', () => {
 		addApp('released-log', null)
 		setGlobal('600')
 		pin(0)
-		await push('released-log', 'a')
+		await hold('released-log', 'a')
 		pin(60)
 		await push('released-log', 'b', { urgent: true, triggeredBy: 'webhook:me' })
 		const { claimNextQueuedDeploy } = await import('../deploys')
@@ -240,7 +264,7 @@ describe.skipIf(!hasPg)('settle window on a real postgres', () => {
 		addApp('redeploy', null)
 		setGlobal('600')
 		pin(0)
-		const held = (await push('redeploy', 'a')) as { id: string }
+		const held = await hold('redeploy', 'a')
 		pin(30)
 		const { tryStartDeploy } = await import('../deploys')
 		const res = (await tryStartDeploy({
@@ -277,7 +301,7 @@ describe.skipIf(!hasPg)('settle window on a real postgres', () => {
 		addApp('rb', null)
 		setGlobal('600')
 		pin(0)
-		await push('rb', 'a')
+		await hold('rb', 'a')
 		pin(60)
 		const { startDeploy, cancelHeldDeploys, finishDeploy } = await import('../deploys')
 		const rb = await startDeploy({ serverId: SRV, containerName: 'rb', kind: 'rollback', inline: true })
@@ -297,7 +321,7 @@ describe.skipIf(!hasPg)('settle window on a real postgres', () => {
 		addApp('inl', null)
 		setGlobal('600')
 		pin(0)
-		await push('inl', 'a')
+		await hold('inl', 'a')
 		const { startDeploy, finishDeploy, DeployInFlightError } = await import('../deploys')
 		for (const kind of ['restart', 'manual_apply'] as const) {
 			const r = await startDeploy({ serverId: SRV, containerName: 'inl', kind, inline: true })
@@ -323,7 +347,7 @@ describe.skipIf(!hasPg)('settle window on a real postgres', () => {
 		psql(['-c', `UPDATE deploys SET git_sha = '${sha('b')}', image_tag = 'auto:b' WHERE container_name = 'auto' AND git_sha IS NULL`])
 		setGlobal('600')
 		pin(120)
-		await push('auto', 'c')
+		await hold('auto', 'c')
 		const { staticBlockers } = await import('../auto-rollback')
 		const { heldSql } = await import('../deploy-settle')
 		const { and, db, deploys, eq, desc, sql } = await import('../db')
@@ -357,42 +381,33 @@ describe.skipIf(!hasPg)('settle window on a real postgres', () => {
 		expect(await claimAll()).toEqual(['auto'])
 	})
 
-	it('per-app override: 0 = off, N = N seconds, both over the global; 1800 s cap on both', async () => {
+	it('no window setting (per app or global, any size) holds a new push', async () => {
 		addApp('off', 0)
 		addApp('short', 120)
 		addApp('huge', 99999)
 		addApp('global', null)
 		setGlobal('99999')
 		pin(0)
-		expect(await push('off', 'a')).toMatchObject({ notBefore: null })
-		expect(((await push('short', 'a')) as { notBefore: Date }).notBefore.toISOString()).toBe(at(120).toISOString())
-		expect(((await push('huge', 'a')) as { notBefore: Date }).notBefore.toISOString()).toBe(at(1800).toISOString())
-		expect(((await push('global', 'a')) as { notBefore: Date }).notBefore.toISOString()).toBe(at(1800).toISOString())
-		expect(await claimAll()).toEqual(['off'])
-		pin(120)
-		expect(await claimAll()).toEqual(['short'])
-		pin(1800)
-		expect(await claimAll()).toEqual(['global', 'huge'])
+		for (const n of ['off', 'short', 'huge', 'global']) expect(await push(n, 'a')).toMatchObject({ notBefore: null })
+		expect(await claimAll()).toEqual(['global', 'huge', 'off', 'short'])
 	})
 
-	it('monorepo fan-out: every sub-app row of a push is held; [urgent] (urgent) applies to all of them', async () => {
+	it('monorepo fan-out: no sub-app row of a push is held, urgent or not', async () => {
 		for (const n of ['mono-api', 'mono-web', 'mono2-api', 'mono2-web']) addApp(n, null)
 		setGlobal('600')
 		pin(0)
 		for (const n of ['mono-api', 'mono-web'])
-			expect(await push(n, 'a', { triggeredBy: 'webhook-group:me' })).toMatchObject({ notBefore: at(600) })
+			expect(await push(n, 'a', { triggeredBy: 'webhook-group:me' })).toMatchObject({ notBefore: null })
 		for (const n of ['mono2-api', 'mono2-web'])
 			expect(await push(n, 'a', { triggeredBy: 'webhook-group:me', urgent: true })).toMatchObject({ notBefore: null })
-		expect(await claimAll()).toEqual(['mono2-api', 'mono2-web'])
-		pin(600)
-		expect(await claimAll()).toEqual(['mono-api', 'mono-web'])
+		expect(await claimAll()).toEqual(['mono-api', 'mono-web', 'mono2-api', 'mono2-web'])
 	})
 
 	it('stop during a hold: not blocked, the held push is cancelled and the app stops', async () => {
 		addApp('stopme', null)
 		setGlobal('600')
 		pin(0)
-		const held = (await push('stopme', 'a')) as { id: string }
+		const held = await hold('stopme', 'a')
 		pin(30)
 		const { POST } = await import('../../app/api/servers/[id]/containers/[name]/stop/route')
 		const res = await POST(new Request('http://x', { method: 'POST' }), {
@@ -414,7 +429,7 @@ describe.skipIf(!hasPg)('settle window on a real postgres', () => {
 		addApp('delme', null)
 		setGlobal('600')
 		pin(0)
-		await push('delme', 'a')
+		await hold('delme', 'a')
 		const { startDeploy, finishDeploy } = await import('../deploys')
 		const del = await startDeploy({ serverId: SRV, containerName: 'delme', kind: 'delete', inline: true })
 		expect(del.status).toBe('running')
@@ -427,8 +442,8 @@ describe.skipIf(!hasPg)('settle window on a real postgres', () => {
 		addApp('offapp', null)
 		setGlobal('600')
 		pin(0)
-		await push('offglobal', 'a')
-		await push('offapp', 'a')
+		await hold('offglobal', 'a')
+		await hold('offapp', 'a')
 		pin(10)
 		expect(await claimAll()).toEqual([])
 		psql(['-c', `UPDATE app_repos SET deploy_settle_seconds = 0 WHERE container_name = 'offapp'`])
@@ -441,7 +456,7 @@ describe.skipIf(!hasPg)('settle window on a real postgres', () => {
 		expect(await claimAll()).toEqual(['offglobal'])
 	})
 
-	it('a settings read that fails means no hold (deploy at once)', async () => {
+	it('a push reads no settle setting (a broken settings column cannot hold it)', async () => {
 		addApp('readfail', null)
 		setGlobal('600')
 		pin(0)
@@ -449,7 +464,6 @@ describe.skipIf(!hasPg)('settle window on a real postgres', () => {
 		psql(['-c', 'ALTER TABLE app_repos RENAME COLUMN deploy_settle_seconds TO deploy_settle_seconds_x'])
 		try {
 			expect(await push('readfail', 'a')).toMatchObject({ status: 'queued', notBefore: null })
-			expect(err).toHaveBeenCalled()
 		} finally {
 			psql(['-c', 'ALTER TABLE app_repos RENAME COLUMN deploy_settle_seconds_x TO deploy_settle_seconds'])
 			err.mockRestore()
@@ -457,7 +471,7 @@ describe.skipIf(!hasPg)('settle window on a real postgres', () => {
 		expect(await claimAll()).toEqual(['readfail'])
 	})
 
-	it('end to end through the webhook route: a fan-out push holds both sub-apps; [urgent] in a non-head commit releases both', async () => {
+	it('end to end through the webhook route: a fan-out push is claimable at once for both sub-apps', async () => {
 		addApp('fan-api', null)
 		addApp('fan-web', null)
 		setGlobal('600')
@@ -484,15 +498,11 @@ describe.skipIf(!hasPg)('settle window on a real postgres', () => {
 			)
 		}
 		pin(0)
-		expect((await send(sha('a'), [{ message: 'one' }], 'one')).status).toBe(202)
-		expect(rows('fan-api')).toEqual([`queued|${sha('a')}|10:10:00|-`])
-		expect(rows('fan-web')).toEqual([`queued|${sha('a')}|10:10:00|-`])
-		pin(60)
-		expect(await claimAll()).toEqual([])
-		const res = await send(sha('b'), [{ message: 'hotfix [URGENT]' }, { message: 'tidy' }], 'tidy')
-		expect((await res.json()).triggered).toEqual(['fan-api (folded into queued)', 'fan-web (folded into queued)'])
-		expect(rows('fan-api')).toEqual(['queued|-|-|-'])
-		expect(rows('fan-web')).toEqual(['queued|-|-|-'])
+		const res = await send(sha('a'), [{ message: 'one' }], 'one')
+		expect(res.status).toBe(202)
+		expect((await res.json()).waiting).toBeUndefined()
+		expect(rows('fan-api')).toEqual([`queued|${sha('a')}|-|-`])
+		expect(rows('fan-web')).toEqual([`queued|${sha('a')}|-|-`])
 		expect(await claimAll()).toEqual(['fan-api', 'fan-web'])
 	})
 
@@ -501,7 +511,7 @@ describe.skipIf(!hasPg)('settle window on a real postgres', () => {
 		addApp('restart', null)
 		setGlobal('600')
 		pin(0)
-		await push('restart', 'a')
+		await hold('restart', 'a')
 		pin(300)
 		expect(await claimAll()).toEqual([])
 		// a fresh process: new module instances, new pool

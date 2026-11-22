@@ -11,7 +11,7 @@ commit.
 ## Prerequisites
 
 - Node.js 22 (`.nvmrc`)
-- pnpm 10.21.0 (`packageManager` in `package.json`; `corepack enable` picks it up)
+- pnpm 10.34.9 (`packageManager` in `package.json`; `corepack enable` picks it up)
 - Docker, for the development database
 - `psql` (the Postgres client), used by `pnpm db:init`
 
@@ -55,6 +55,9 @@ pnpm build
 ```
 
 Add or update a test for any behaviour you change. Keep a PR to one change.
+Use invented names (`demo`, `shop`, `example.com`) in code, tests, fixtures and docs,
+and keep dates and bug stories out of comments and test titles: the release export
+refuses them.
 
 There is no CI on purpose: nothing runs on GitHub, so run the four checks locally
 before you open a PR. `bin/self-deploy.sh` runs the unit tests too and stops before

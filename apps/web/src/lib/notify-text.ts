@@ -23,3 +23,19 @@ export function safeFailedStep(step: string | null | undefined): string {
 		.trim()
 	return SAFE_STEP_RE.test(n) ? n : 'unknown'
 }
+
+/** What a failure summary says beyond the step it failed at, for every place that shows
+ *  both (a "failed at <step>" line, the GitHub status, the ops event): '' when the
+ *  summary is only `failed during: <step>` (the step as it is, or as safeFailedStep
+ *  normalised it in older rows), the text after that when the summary starts with it
+ *  (`(exit 124: ...)`), else the whole summary. Pure; no imports beyond this file, so
+ *  client pages can use it. */
+export function summaryBeyondStep(step: string | null | undefined, summary: string | null | undefined): string {
+	const s = (summary ?? '').trim()
+	if (!step || !s) return s
+	for (const head of [`failed during: ${step}`, `failed during: ${safeFailedStep(step)}`]) {
+		if (s === head) return ''
+		if (s.startsWith(`${head} `)) return s.slice(head.length).trim()
+	}
+	return s
+}

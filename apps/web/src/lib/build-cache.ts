@@ -107,6 +107,38 @@ export function runNamespaceArgName(ns: string): string {
 	return `POWDER_NS_${createHash('sha256').update(`${ns}\npowder:run-layer-ns`).digest('hex').slice(0, 20)}`
 }
 
+// OS patch week. A Dockerfile whose base image is pinned (or simply unchanged)
+// keeps its `apt-get upgrade` / `apk upgrade` layer cached forever, so OS security
+// fixes never land. powder passes every build the build arg OS_PATCH_WEEK=<ISO week>
+// (2026-W47, UTC). A Dockerfile that declares `ARG OS_PATCH_WEEK` before its upgrade
+// RUN gets a new cache key for that layer once a week; one that does not declare it
+// is unaffected (BuildKit ignores an undeclared build arg, with a warning).
+
+/** The build arg powder sets on every app build and on its own build. */
+export const OS_PATCH_WEEK_ARG = 'OS_PATCH_WEEK'
+
+/** Shell: sets OS_PATCH_WEEK to the current ISO week in UTC, or to empty when
+ *  `date` cannot print it (GNU and BSD date both know %G and %V). Same text in
+ *  bin/self-deploy.sh and bin/install.sh (a test keeps them identical). */
+export const OS_PATCH_WEEK_SH =
+	'OS_PATCH_WEEK=$(date -u +%G-W%V 2>/dev/null || true); case "$OS_PATCH_WEEK" in [0-9][0-9][0-9][0-9]-W[0-9][0-9]) ;; *) OS_PATCH_WEEK= ;; esac'
+
+/** The ISO 8601 week of `d` in UTC, as `date -u +%G-W%V` prints it (2026-W47). */
+export function osPatchWeek(d: Date = new Date()): string {
+	const t = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()))
+	// the Thursday of this ISO week decides the ISO year
+	t.setUTCDate(t.getUTCDate() + 4 - (t.getUTCDay() || 7))
+	const year = t.getUTCFullYear()
+	const week = Math.floor((t.getTime() - Date.UTC(year, 0, 1)) / 86_400_000 / 7) + 1
+	return `${year}-W${String(week).padStart(2, '0')}`
+}
+
+/** A build's args with OS_PATCH_WEEK set to this week (powder's value wins over the
+ *  compose one). The builder path; the target path adds it in the compose override. */
+export function withOsPatchWeek(args: Record<string, string>, d: Date = new Date()): Record<string, string> {
+	return { ...args, [OS_PATCH_WEEK_ARG]: osPatchWeek(d) }
+}
+
 /** Read (or create, once) the per-(server, app) salt and return the namespace.
  *  Never throws: null when the DB is unavailable (the caller falls back to an
  *  ephemeral namespace). */
@@ -1234,12 +1266,16 @@ export const IMAGE_PULL_RECORD = '/var/lib/powder/image-pulls'
  *  the first deploy with this check pulls each base once per server. */
 export const DFR_PROV_FN =
 	[
+		// dfr_pull ARGS: `docker pull` under the 300s limit. In a builder script ($__PULL_LOCK set,
+		// builder-prune.ts builderPullGuardFunctions) it goes through the script's pull guard,
+		// which applies the limit itself, so a base image pull never overlaps the cap prune either.
+		'dfr_pull() { if [ -n "${__PULL_LOCK:-}" ]; then __PULL_TIMEOUT="$__pvt" docker pull "$@"; else $__pvt docker pull "$@"; fi; }; ',
 		`dfr_prov() { __pvwhy=""; __pvf="\${DFR_PROV_FILE:-${IMAGE_PULL_RECORD}}"; __pvt=""; if command -v timeout >/dev/null 2>&1; then __pvt="timeout 300"; fi; `,
-		'case "$1" in *@sha256:*) if [ "${2:-0}" = 1 ] || ! docker image inspect -- "$1" >/dev/null 2>&1 </dev/null; then $__pvt docker pull -q -- "$1" >/dev/null 2>&1 </dev/null || { __pvwhy="cannot pull $1 anonymously"; return 1; }; fi; return 0;; esac; ',
+		'case "$1" in *@sha256:*) if [ "${2:-0}" = 1 ] || ! docker image inspect -- "$1" >/dev/null 2>&1 </dev/null; then dfr_pull -q -- "$1" >/dev/null 2>&1 </dev/null || { __pvwhy="cannot pull $1 anonymously"; return 1; }; fi; return 0;; esac; ',
 		'__pvl() { docker image inspect --format \'{{json .Config}}\' -- "$1" 2>/dev/null </dev/null | grep -c \'[{,]"com\\.docker\\.compose\\.project":\' || true; }; ',
 		'__pvid=""; if [ "${2:-0}" != 1 ]; then __pvid=$(docker image inspect --format \'{{.Id}}\' -- "$1" 2>/dev/null </dev/null) || __pvid=""; fi; ',
 		'if [ -n "$__pvid" ] && [ "$(__pvl "$1")" = 0 ] && [ -f "$__pvf" ] && grep -qxF -- "$__pvid" "$__pvf" 2>/dev/null; then return 0; fi; ',
-		'__pvo=$($__pvt docker pull -- "$1" 2>/dev/null </dev/null) || { if [ -n "$__pvid" ]; then __pvwhy="a local build may shadow the image $1: its local copy is not one powder pulled from its registry, and the anonymous pull to replace it failed"; else __pvwhy="cannot pull $1 anonymously"; fi; return 1; }; ',
+		'__pvo=$(dfr_pull -- "$1" 2>/dev/null </dev/null) || { if [ -n "$__pvid" ]; then __pvwhy="a local build may shadow the image $1: its local copy is not one powder pulled from its registry, and the anonymous pull to replace it failed"; else __pvwhy="cannot pull $1 anonymously"; fi; return 1; }; ',
 		// the ID recorded is the one of the digest the pull reported (repo@digest),
 		// never the tag read back after the pull (another app can retag it in between). A
 		// pull output without a Digest line falls back to the tag (older docker output).
@@ -1363,5 +1399,5 @@ s && b && ib && /^        / { print substr($0, 9) > (INL "/" n ".inline"); next 
 s && b && ib && /^[ \t]*$/ { print "" > (INL "/" n ".inline"); next }
 END { flush() }
 `
-	return `DFR_CFG=$(docker compose ${cf} ${ALL_PROFILES} config 2>/dev/null) && DFR_LIST=$(printf '%s\n' "$DFR_CFG" | awk -v INL="$DFR_DIR" ${shq(listAwk)}) || { echo "preflight: cannot read the compose build sections for the Dockerfile check"; exit 1; }; printf '%s\\n' "$DFR_LIST" > "$DFR_DIR/list"; : > "$DFR_DIR/pins" || { echo "preflight: cannot write $DFR_DIR/pins"; exit 1; }; DFR_OWN="$DFR_OWN $(awk -F'|' -v p="\${CP_PROJ:-}" 'NF{ if ($4 != "-") print $4; if (p != "") print p "-" $1 }' "$DFR_DIR/list" | tr '\\n' ' ')"; printf 'services:\\n' > "$DFR_DIR/override.yml"; DFR_N=0; DFR_BAD=0; while IFS='|' read -r __s __c __d __i __in __x; do [ -n "$__s" ] || continue; DFR_N=$((DFR_N+1)); if [ -n "$__x" ]; then echo "[build-cache] refusing: a build path of service $__s contains a |"; DFR_BAD=1; continue; fi; case "$__s" in *[!A-Za-z0-9._-]*) echo "[build-cache] refusing: service name $__s"; DFR_BAD=1; continue;; esac; if [ "$__in" = 1 ]; then __src="$DFR_DIR/$DFR_N.inline"; else case "$__d" in /*) __src="$__d";; *) __src="$__c/$__d";; esac; fi; __dst="$DFR_DIR/$DFR_N.Dockerfile"; if [ "$__in" != 1 ]; then dfr_src "$__src" "$__c" || { DFR_BAD=1; continue; }; fi; if [ ! -f "$__src" ]; then echo "[build-cache] refusing: service $__s has no Dockerfile at $__src (missing or not a regular file), so powder cannot check what a build of it would read; add the Dockerfile or remove the build section of $__s"; DFR_BAD=1; continue; fi; __rd="$__src"; if [ "$__in" != 1 ]; then __rd="$DFR_DIR/$DFR_N.src"; dfr_copy "$__src" "$__c" "$__rd" || { DFR_BAD=1; continue; }; fi; dfr_one "$__rd" "$__dst" "$__src" "$DFR_DIR/$DFR_N.args" || { rm -f "$DFR_DIR/$DFR_N.args"; DFR_BAD=1; continue; }; rm -f "$DFR_DIR/$DFR_N.args"; if [ "$__in" != 1 ]; then rm -f "$__rd"; fi; if [ "$__in" != 1 ] && { [ -e "$__src.dockerignore" ] || [ -L "$__src.dockerignore" ]; }; then cp -R -P -- "$__src.dockerignore" "$__dst.dockerignore" || { DFR_BAD=1; continue; }; if [ -L "$__dst.dockerignore" ]; then echo "[build-cache] refusing: $__src.dockerignore is a symlink"; DFR_BAD=1; continue; fi; if [ ! -f "$__dst.dockerignore" ]; then echo "[build-cache] refusing: $__src.dockerignore is not a regular file"; DFR_BAD=1; continue; fi; ( ${protectIgnore('$__dst.dockerignore').replace(/'\$__dst\.dockerignore'/g, '"$__dst.dockerignore"')} ) || { DFR_BAD=1; continue; }; fi; dfr_pin "$__s" "$__c" "$DFR_DIR/$DFR_N.ac" "$DFR_DIR/$DFR_N.acy" || { DFR_BAD=1; continue; }; printf '  %s:\\n    build:\\n      dockerfile: %s\\n' "$__s" "\${DFR_FINAL:-$DFR_DIR}/$DFR_N.Dockerfile" >> "$DFR_DIR/override.yml"; if [ -n "$__pc" ]; then printf '      context: %s\\n' "$__pc" >> "$DFR_DIR/override.yml"; fi; if [ -s "$DFR_DIR/$DFR_N.acy" ]; then printf '      additional_contexts:\\n' >> "$DFR_DIR/override.yml"; cat "$DFR_DIR/$DFR_N.acy" >> "$DFR_DIR/override.yml"; fi; if [ "$__in" = 1 ]; then printf '      dockerfile_inline: !reset null\\n' >> "$DFR_DIR/override.yml"; fi; done < "$DFR_DIR/list"; rm -f "$DFR_DIR"/*.args "$DFR_DIR"/*.ac "$DFR_DIR"/*.acy; if [ "$DFR_BAD" = 0 ] && ! dfr_bases; then DFR_BAD=1; fi; rm -f "$DFR_DIR/bases"; if [ "$DFR_BAD" != 0 ]; then echo "preflight: build refused by the Dockerfile check (see [build-cache] lines above); the old container keeps serving"; exit 1; fi; printf 'services: {}\\n' > "$DFR_DIR/labels.yml" || { echo "preflight: cannot write $DFR_DIR/labels.yml"; exit 1; }; if [ -n "\${DFR_FINAL:-}" ]; then { rm -rf "$DFR_FINAL.old" && { [ ! -e "$DFR_FINAL" ] || mv "$DFR_FINAL" "$DFR_FINAL.old"; } && mv "$DFR_DIR" "$DFR_FINAL" && rm -rf "$DFR_FINAL.old"; } || { echo "preflight: cannot install the build override set at $DFR_FINAL"; exit 1; }; DFR_DIR="$DFR_FINAL"; fi; if [ "$DFR_N" -gt 0 ]; then DFR_F="-f $DFR_DIR/override.yml"; fi; `
+	return `DFR_CFG=$(docker compose ${cf} ${ALL_PROFILES} config 2>/dev/null) && DFR_LIST=$(printf '%s\n' "$DFR_CFG" | awk -v INL="$DFR_DIR" ${shq(listAwk)}) || { echo "preflight: cannot read the compose build sections for the Dockerfile check"; exit 1; }; printf '%s\\n' "$DFR_LIST" > "$DFR_DIR/list"; : > "$DFR_DIR/pins" || { echo "preflight: cannot write $DFR_DIR/pins"; exit 1; }; DFR_OWN="$DFR_OWN $(awk -F'|' -v p="\${CP_PROJ:-}" 'NF{ if ($4 != "-") print $4; if (p != "") print p "-" $1 }' "$DFR_DIR/list" | tr '\\n' ' ')"; ${OS_PATCH_WEEK_SH}; printf 'services:\\n' > "$DFR_DIR/override.yml"; DFR_N=0; DFR_BAD=0; while IFS='|' read -r __s __c __d __i __in __x; do [ -n "$__s" ] || continue; DFR_N=$((DFR_N+1)); if [ -n "$__x" ]; then echo "[build-cache] refusing: a build path of service $__s contains a |"; DFR_BAD=1; continue; fi; case "$__s" in *[!A-Za-z0-9._-]*) echo "[build-cache] refusing: service name $__s"; DFR_BAD=1; continue;; esac; if [ "$__in" = 1 ]; then __src="$DFR_DIR/$DFR_N.inline"; else case "$__d" in /*) __src="$__d";; *) __src="$__c/$__d";; esac; fi; __dst="$DFR_DIR/$DFR_N.Dockerfile"; if [ "$__in" != 1 ]; then dfr_src "$__src" "$__c" || { DFR_BAD=1; continue; }; fi; if [ ! -f "$__src" ]; then echo "[build-cache] refusing: service $__s has no Dockerfile at $__src (missing or not a regular file), so powder cannot check what a build of it would read; add the Dockerfile or remove the build section of $__s"; DFR_BAD=1; continue; fi; __rd="$__src"; if [ "$__in" != 1 ]; then __rd="$DFR_DIR/$DFR_N.src"; dfr_copy "$__src" "$__c" "$__rd" || { DFR_BAD=1; continue; }; fi; if [ -n "$OS_PATCH_WEEK" ]; then printf '%s=%s\\n' ${OS_PATCH_WEEK_ARG} "$OS_PATCH_WEEK" >> "$DFR_DIR/$DFR_N.args"; fi; dfr_one "$__rd" "$__dst" "$__src" "$DFR_DIR/$DFR_N.args" || { rm -f "$DFR_DIR/$DFR_N.args"; DFR_BAD=1; continue; }; rm -f "$DFR_DIR/$DFR_N.args"; if [ "$__in" != 1 ]; then rm -f "$__rd"; fi; if [ "$__in" != 1 ] && { [ -e "$__src.dockerignore" ] || [ -L "$__src.dockerignore" ]; }; then cp -R -P -- "$__src.dockerignore" "$__dst.dockerignore" || { DFR_BAD=1; continue; }; if [ -L "$__dst.dockerignore" ]; then echo "[build-cache] refusing: $__src.dockerignore is a symlink"; DFR_BAD=1; continue; fi; if [ ! -f "$__dst.dockerignore" ]; then echo "[build-cache] refusing: $__src.dockerignore is not a regular file"; DFR_BAD=1; continue; fi; ( ${protectIgnore('$__dst.dockerignore').replace(/'\$__dst\.dockerignore'/g, '"$__dst.dockerignore"')} ) || { DFR_BAD=1; continue; }; fi; dfr_pin "$__s" "$__c" "$DFR_DIR/$DFR_N.ac" "$DFR_DIR/$DFR_N.acy" || { DFR_BAD=1; continue; }; printf '  %s:\\n    build:\\n      dockerfile: %s\\n' "$__s" "\${DFR_FINAL:-$DFR_DIR}/$DFR_N.Dockerfile" >> "$DFR_DIR/override.yml"; if [ -n "$OS_PATCH_WEEK" ]; then printf '      args:\\n        %s: "%s"\\n' ${OS_PATCH_WEEK_ARG} "$OS_PATCH_WEEK" >> "$DFR_DIR/override.yml"; fi; if [ -n "$__pc" ]; then printf '      context: %s\\n' "$__pc" >> "$DFR_DIR/override.yml"; fi; if [ -s "$DFR_DIR/$DFR_N.acy" ]; then printf '      additional_contexts:\\n' >> "$DFR_DIR/override.yml"; cat "$DFR_DIR/$DFR_N.acy" >> "$DFR_DIR/override.yml"; fi; if [ "$__in" = 1 ]; then printf '      dockerfile_inline: !reset null\\n' >> "$DFR_DIR/override.yml"; fi; done < "$DFR_DIR/list"; rm -f "$DFR_DIR"/*.args "$DFR_DIR"/*.ac "$DFR_DIR"/*.acy; if [ "$DFR_BAD" = 0 ] && ! dfr_bases; then DFR_BAD=1; fi; rm -f "$DFR_DIR/bases"; if [ "$DFR_BAD" != 0 ]; then echo "preflight: build refused by the Dockerfile check (see [build-cache] lines above); the old container keeps serving"; exit 1; fi; printf 'services: {}\\n' > "$DFR_DIR/labels.yml" || { echo "preflight: cannot write $DFR_DIR/labels.yml"; exit 1; }; if [ -n "\${DFR_FINAL:-}" ]; then { rm -rf "$DFR_FINAL.old" && { [ ! -e "$DFR_FINAL" ] || mv "$DFR_FINAL" "$DFR_FINAL.old"; } && mv "$DFR_DIR" "$DFR_FINAL" && rm -rf "$DFR_FINAL.old"; } || { echo "preflight: cannot install the build override set at $DFR_FINAL"; exit 1; }; DFR_DIR="$DFR_FINAL"; fi; if [ "$DFR_N" -gt 0 ]; then DFR_F="-f $DFR_DIR/override.yml"; fi; `
 }

@@ -5,24 +5,35 @@
 // GitHub for the visible window - SHAs are immutable so the lookups cache
 // forever per process.
 //
-// Cursor pagination on started_at DESC. Filters: ?author=, ?repo=, ?branch=,
-// ?status= - all optional, combine.
+// Newest push first: ordered and paginated by queued_at (lib/deploy-order.ts; started_at
+// is reset when the worker claims a row), the id breaking ties. Filters: ?author=, ?repo=,
+// ?branch=, ?status= - all optional, combine.
 
 import { hiddenSelfNames, requireUser } from '@/lib/access'
 import { db, sql } from '@/lib/db'
 import { getCommitBySha, parseGitHubRepo } from '@/lib/github-ci'
 import { getGithubIntegration } from '@/lib/integrations'
-import { parseListCursor, parseListLimit } from '@/lib/list-params'
+import { parseListLimit } from '@/lib/list-params'
+import { encodeDeployCursor, parseDeployCursor } from '@/lib/deploy-order'
 import { redactNullable } from '@/lib/secret-text'
 import { settleNote } from '@/lib/deploy-settle'
+import { deployCommit } from '@/lib/deploy-commit'
+import { authorOptions, parseTrigger, triggersMatching } from '@/lib/deploy-status'
+
+// distinct triggered_by values read for the author dropdown and filter (one per person and
+// prefix, so far more than any install has)
+const MAX_TRIGGERS = 2000
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
 interface DeployRow {
 	id: string
+	/** the deploy's commit (lib/deploy-commit.ts): went live, else built, else requested */
 	sha: string | null
 	shortSha: string | null
+	/** true when `sha` is only the commit the push requested (nothing built is recorded) */
+	shaRequested: boolean
 	branch: string | null
 	status: string
 	queuedAt: string
@@ -45,32 +56,15 @@ interface DeployRow {
 	waiting: string | null
 }
 
-// `triggered_by` examples from the table:
-//   "webhook:<github-user>"    - push from this github user
-//   "webhook:github-actions"   - push by the GitHub Actions bot
-//   "reconcile"                - system fix-up
-//   null                       - manual, or no recorded trigger
-function parseAuthor(triggered_by: string | null): {
-	display: string | null
-	login: string | null
-} {
-	if (!triggered_by) return { display: null, login: null }
-	if (triggered_by.startsWith('webhook:')) {
-		const login = triggered_by.slice('webhook:'.length)
-		return { display: `push by ${login}`, login }
-	}
-	return { display: triggered_by, login: null }
-}
-
 export async function GET(req: Request) {
 	const u = await requireUser()
 	if (u instanceof Response) return u
 
 	const url = new URL(req.url)
 	const limit = parseListLimit(url.searchParams.get('limit'))
-	const cursor = parseListCursor(url.searchParams.get('cursor')) // rows older than this
+	const cursor = parseDeployCursor(url.searchParams.get('cursor')) // rows older than this
 	if (cursor === 'invalid')
-		return Response.json({ error: 'cursor must be an ISO timestamp' }, { status: 400 })
+		return Response.json({ error: 'cursor must be the nextCursor of a previous page' }, { status: 400 })
 	const filterAuthor = url.searchParams.get('author') || null
 	const filterRepo = url.searchParams.get('repo') || null
 	const filterBranch = url.searchParams.get('branch') || null
@@ -81,14 +75,31 @@ export async function GET(req: Request) {
 	const whereClauses: ReturnType<typeof sql>[] = []
 	// powder's own deploys only to an admin session (lib/access.ts visibleRepos), never to a token.
 	const hidden = hiddenSelfNames(u, 'admin-session')
-	if (hidden.length > 0) {
-		whereClauses.push(sql`d.container_name NOT IN (${sql.join(hidden.map((n) => sql`${n}`), sql`, `)})`)
-	}
-	if (cursor) {
-		whereClauses.push(sql`d.started_at < ${cursor}`)
+	const hiddenSql =
+		hidden.length > 0 ? sql`d.container_name NOT IN (${sql.join(hidden.map((n) => sql`${n}`), sql`, `)})` : null
+	if (hiddenSql) whereClauses.push(hiddenSql)
+	// Every stored trigger, read by the one parser (lib/deploy-status.ts parseTrigger): the
+	// author dropdown is built from it, and the author filter matches the stored values the
+	// parser maps to that person (every push-like prefix of a login, manual deploys by user).
+	const triggerRows = (await db.execute(sql`
+		SELECT DISTINCT d.triggered_by
+		FROM deploys d
+		WHERE d.triggered_by IS NOT NULL ${hiddenSql ? sql`AND ${hiddenSql}` : sql``}
+		LIMIT ${MAX_TRIGGERS}
+	`)) as unknown as Array<{ triggered_by: string | null }>
+	const triggers = triggerRows.map((r) => r.triggered_by)
+	if (cursor && 'micros' in cursor) {
+		whereClauses.push(
+			sql`(d.queued_at, d.id) < (timestamptz 'epoch' + ${cursor.micros}::bigint * interval '1 microsecond', ${cursor.id})`,
+		)
+	} else if (cursor) {
+		whereClauses.push(sql`d.queued_at < ${cursor.iso}`)
 	}
 	if (filterAuthor) {
-		whereClauses.push(sql`d.triggered_by = ${`webhook:${filterAuthor}`}`)
+		const values = triggersMatching(filterAuthor, triggers)
+		whereClauses.push(
+			values.length > 0 ? sql`d.triggered_by IN (${sql.join(values.map((v) => sql`${v}`), sql`, `)})` : sql`FALSE`,
+		)
 	}
 	if (filterRepo) {
 		whereClauses.push(sql`d.container_name = ${filterRepo}`)
@@ -106,10 +117,13 @@ export async function GET(req: Request) {
 		SELECT
 			d.id,
 			d.git_sha,
+			d.built_sha,
+			d.requested_sha,
 			d.git_branch,
 			d.status,
 			d.kind,
 			d.queued_at,
+			(extract(epoch from d.queued_at) * 1000000)::bigint::text AS queued_us,
 			d.started_at,
 			d.finished_at,
 			d.triggered_by,
@@ -124,15 +138,18 @@ export async function GET(req: Request) {
 		LEFT JOIN app_repos a
 			ON a.container_name = d.container_name AND a.server_id = d.server_id
 		${whereSql}
-		ORDER BY d.started_at DESC
+		ORDER BY d.queued_at DESC, d.id DESC
 		LIMIT ${limit + 1}
 	`)) as unknown as Array<{
 		id: string
 		git_sha: string | null
+		built_sha: string | null
+		requested_sha: string | null
 		git_branch: string | null
 		status: string
 		kind: string
 		queued_at: Date
+		queued_us: string
 		started_at: Date
 		finished_at: Date | null
 		triggered_by: string | null
@@ -148,7 +165,7 @@ export async function GET(req: Request) {
 	const hasMore = rawRows.length > limit
 	const rows = hasMore ? rawRows.slice(0, limit) : rawRows
 	const last = rows.at(-1)
-	const nextCursor = hasMore && last ? new Date(last.started_at).toISOString() : null
+	const nextCursor = hasMore && last ? encodeDeployCursor(last.queued_us, last.id) : null
 
 	// Build base rows, defer commit message lookups.
 	const out: DeployRow[] = rows.map((r) => {
@@ -163,11 +180,13 @@ export async function GET(req: Request) {
 		const startedMs = new Date(r.started_at).getTime()
 		const finishedMs = r.finished_at ? new Date(r.finished_at).getTime() : null
 		const durationMs = finishedMs ? finishedMs - startedMs : null
-		const auth = parseAuthor(r.triggered_by)
+		const trigger = parseTrigger(r.triggered_by)
+		const commit = deployCommit({ gitSha: r.git_sha, builtSha: r.built_sha, requestedSha: r.requested_sha })
 		return {
 			id: r.id,
-			sha: r.git_sha,
-			shortSha: r.git_sha ? r.git_sha.slice(0, 7) : null,
+			sha: commit?.sha ?? null,
+			shortSha: commit?.short ?? null,
+			shaRequested: commit?.requested ?? false,
 			branch: r.git_branch,
 			status: r.status,
 			queuedAt: new Date(r.queued_at).toISOString(),
@@ -182,8 +201,8 @@ export async function GET(req: Request) {
 			environment: env,
 			kind: r.kind,
 			triggeredBy: r.triggered_by,
-			author: auth.display,
-			authorAvatarLogin: auth.login,
+			author: trigger.who,
+			authorAvatarLogin: trigger.how === 'push' ? trigger.who : null,
 			commitMessage: null,
 			// deploy text read by raw SQL goes through the read-side redactor too.
 			errorSummary: redactNullable(r.error_summary),
@@ -209,5 +228,5 @@ export async function GET(req: Request) {
 		)
 	}
 
-	return Response.json({ deploys: out, nextCursor })
+	return Response.json({ deploys: out, nextCursor, authors: authorOptions(triggers) })
 }

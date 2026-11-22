@@ -81,7 +81,7 @@ describe('hardening is the default (opt-out docker-compose.unharden.yml)', () =>
 		const hash = createHash('sha256')
 			.update(JSON.stringify(parse(text)))
 			.digest('hex')
-		expect(hash).toBe('98fdd23a3c84e6c4572a6d14fa1f3a7e18bf6fb578b15b152788eb62bb2c80e4')
+		expect(hash).toBe('209fa16dc74c6c3554087c0d83ba8cd3dedf59c659e855119be998d9fde84cd0')
 	})
 	it('powder and worker drop every capability and forbid privilege gain by default; read_only stays opt-in', () => {
 		for (const svc of ['powder', 'worker']) {

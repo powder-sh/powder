@@ -8,11 +8,18 @@ A deploy that fails before the swap (preflight, build, migration, swap-check) le
 
 ## Failed deploys
 
+A failed deploy carries a one-line summary: on the deploy page, in the copied error block, in the GitHub commit status and in the event sent to an ops endpoint. powder reads it from the failed step's own part of the log, by what that step does: a build failure is explained only by the build's output (the Dockerfile `RUN` step that failed and its own lines, such as a TypeScript error), a test gate failure only by the test output (the runner's `N failed` line and the first failing file, or the gate script's last failure line), a failure after the swap only by the containers. A line from another step, or one a test prints on purpose (a simulated `ECONNREFUSED`), never names the cause. When powder itself stopped the step (a `preflight:` check, a guard's `refusing` line, `[build-cache] refusing`, `[migrate] ... cannot ...`, `swap-check: FAILED (...)`, the `[deadline]` line), the summary is that line. Only when the step's part of the log holds nothing readable does it say `failed during: <step>`.
+
 | Summary | Cause and fix |
 |---|---|
+| ... (the Dockerfile step RUN ...) | The build's `RUN` step exited non-zero; the text before the brackets is its own failure lines (a package manager's "command failed" trailer is skipped for the line above it). The cause comes first so a cut summary keeps it. Fix the code or the Dockerfile. |
+| test-failure: ... | The tests in `.powder/test.sh` (or a test `RUN` step) failed: the first failing file (or the first `FAIL` line or failing `not ok` test, and how many more) and the runner's count; or an unhandled error failed the run, with the file it came from. |
+| the test gate failed: ... | The test gate failed on something other than a test runner: a located type error, or the gate script's own last word just above the gate's `FAILED` line (its labelled failure line, or a shell error). Output from the middle of the test run never counts. |
+| container-oom: ... killed | The gate's process was killed (exit 137, or a bare `Killed` line from the shell just before the gate ended), usually by the memory limit or the kernel OOM killer. |
+| `heap-oom:` / `container-oom:` | The step ran out of memory; see the test gate in [Deploys](deploys.md). These two prefixes are stable. |
 | disk full on the server | `no space left on device`. Free space; make sure `powder-image-prune` and its hourly cron are installed ("check server", then "fix missing pieces"; [Per-server helpers](self-hosting.md#per-server-helpers)). |
 | build ran out of memory (OOM-killed) | The build or the app was killed. Add memory or swap, or build on a dedicated builder. |
-| git auth failed | The deploy key is missing or not authorized on the repository: check the repository's Settings, Deploy keys on GitHub. |
+| git auth failed | The deploy key is missing or not authorized on the repository (or the remote URL is wrong): check the repository's Settings, Deploy keys on GitHub. |
 | git pull blocked by uncommitted local changes | Someone edited the checkout on the server. The checkout is disposable: discard the changes. |
 | git is in detached HEAD on the server | Reattach the checkout to the deploy branch. |
 | docker daemon is down on the server | Start Docker (`systemctl start docker`). |

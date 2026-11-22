@@ -21,6 +21,7 @@ import {
 	healthPathFor,
 	isRoutedDomain,
 	isValidHostname,
+	traefikRetryLabels,
 } from './app-hosts'
 import { checkComposeSafe } from './compose-guard'
 import { labelLinesFromBlock, overridePathFor, parseOverrideLabels } from './compose-override'
@@ -46,6 +47,7 @@ import { getServer } from './servers'
 import type { ServerConfig } from './servers'
 import { shq } from './shell'
 import { inspectContainer, runCommand } from './ssh'
+import { drainActiveFor } from './drain-mode'
 import { isTraefikServer } from './traefik-servers'
 import { traefikRouterTlsLabel } from './traefik-tls'
 
@@ -515,7 +517,13 @@ export function renderLabelsBlock(opts: {
 		)
 	}
 
-	const allMiddlewares = [middlewareChain, diagMiddleware].filter(Boolean).join(',')
+	// Retry on a connection that never reached the app (traefikRetryLabels): last, so
+	// it wraps only the call to the service.
+	// only with the drain on for this app (drain-mode.ts): off, the labels are unchanged.
+	const retry = drainActiveFor(containerName) ? traefikRetryLabels(containerName) : null
+	for (const l of retry?.labels ?? []) lines.push(`      - ${l}`)
+
+	const allMiddlewares = [middlewareChain, diagMiddleware, retry?.middleware].filter(Boolean).join(',')
 	lines.push(`      - traefik.http.routers.${containerName}.middlewares=${allMiddlewares}`)
 
 	for (const l of middlewareLabels) {

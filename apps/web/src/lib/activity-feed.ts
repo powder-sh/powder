@@ -3,6 +3,8 @@
 // No DB here, so it is unit-tested (lib/__tests__/activity-feed.test.ts). The
 // queries live in lib/activity-feed-db.ts.
 
+import { deployCommitLabel } from './deploy-commit'
+import { deployListAt } from './deploy-order'
 import { deployKindLabel, triggeredByLabel } from './deploy-status'
 
 export const ACTIVITY_FILTERS = [
@@ -136,17 +138,22 @@ export interface DeployRowIn {
 	startedAt: Date
 	triggeredBy: string | null
 	gitSha: string | null
+	builtSha?: string | null
+	requestedSha?: string | null
 	errorSummary: string | null
 }
 
 export function deployEvent(r: DeployRowIn): ActivityEvent {
 	const kind = deployKindLabel(r.kind)
+	// the commit as every display names it (lib/deploy-commit.ts)
+	const commit = r.kind === 'git_deploy' ? deployCommitLabel(r) : null
 	return {
 		id: `deploy:${r.id}`,
 		source: 'deploy',
-		at: r.startedAt,
+		// dated like every deploy list: when it was asked for (lib/deploy-order.ts)
+		at: deployListAt(r) as Date,
 		app: r.containerName,
-		what: r.kind === 'git_deploy' && r.gitSha ? `${kind} ${r.gitSha.slice(0, 7)}` : kind,
+		what: commit ? `${kind} ${commit}` : kind,
 		status: r.status,
 		detail: r.status === 'failed' ? r.errorSummary : null,
 		by: triggeredByLabel(r.triggeredBy),

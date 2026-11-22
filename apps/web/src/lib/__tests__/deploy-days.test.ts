@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest'
 import {
 	DEPLOY_DAYS,
 	bucketDeployDays,
+	dayCounts,
 	dayLabel,
+	dayTitle,
 	dayTone,
 	emptyDays,
 	sumDeployDays,
@@ -64,7 +66,29 @@ describe('deploy days (strip data from the deploys table)', () => {
 		expect(dayTone({ ok: 2, failed: 0 })).toBe('ok')
 		expect(dayTone({ ok: 0, failed: 1 })).toBe('failed')
 		expect(dayTone({ ok: 1, failed: 1 })).toBe('mixed')
-		expect(dayLabel({ day: '2026-11-03', ok: 2, failed: 1 })).toBe('Nov 3: 2 ok, 1 failed')
-		expect(dayLabel({ day: '2026-11-03', ok: 0, failed: 0 })).toBe('Nov 3: no deploys')
+		expect(dayLabel({ day: '2026-11-03', ok: 2, failed: 1 })).toBe(
+			'Tue 3 Nov 2026 (UTC): 2 ok, 1 failed',
+		)
+		expect(dayLabel({ day: '2026-11-03', ok: 0, failed: 0 })).toBe('Tue 3 Nov 2026 (UTC): no deploys')
+	})
+
+	it('the tooltip title is the weekday and full UTC date, whatever the local zone', () => {
+		expect(dayTitle({ day: '2026-11-20' })).toBe('Fri 20 Nov 2026 (UTC)')
+		expect(dayTitle({ day: '2026-01-01' })).toBe('Thu 1 Jan 2026 (UTC)')
+		expect(dayTitle({ day: '2025-12-31' })).toBe('Wed 31 Dec 2025 (UTC)')
+		// A day bucketed from a Date keeps its UTC calendar day.
+		const [d] = bucketDeployDays(
+			[{ server_id: 's', container_name: 'a', day: new Date('2026-11-04T23:30:00Z'), ok: 1, failed: 0 }],
+			NOW,
+		).get('s|a')?.slice(-1) ?? []
+		expect(d && dayTitle(d)).toBe('Wed 4 Nov 2026 (UTC)')
+		expect(dayTitle({ day: 'garbage' })).toBe('garbage (UTC)')
+	})
+
+	it('the tooltip counts name ok and failed, or say no deploys', () => {
+		expect(dayCounts({ ok: 3, failed: 1 })).toBe('3 ok, 1 failed')
+		expect(dayCounts({ ok: 3, failed: 0 })).toBe('3 ok')
+		expect(dayCounts({ ok: 0, failed: 2 })).toBe('2 failed')
+		expect(dayCounts({ ok: 0, failed: 0 })).toBe('no deploys')
 	})
 })

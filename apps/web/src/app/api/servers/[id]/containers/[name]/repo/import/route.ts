@@ -2,7 +2,7 @@ import { POWDER_GIT_NOREPO, gitCmd, gitHardenShellFunctions } from '@/lib/git-ha
 import type { NextRequest } from 'next/server'
 import { branchProblem, repoUrlProblem } from '@/lib/git-input'
 import { requireContainerAccess } from '@/lib/access'
-import { adoptContainerProblem } from '@/lib/app-names'
+import { adoptContainerProblem, adoptWorkingDirProblem } from '@/lib/app-names'
 import { bulkImportFromText, envWriteCtx } from '@/lib/env-vars-db'
 import { createDeployKey, createWebhook, getRepoInfo } from '@/lib/github'
 import { getGithubIntegration } from '@/lib/integrations'
@@ -17,6 +17,7 @@ import {
 	writeFileSecret,
 } from '@/lib/ssh'
 import { shq } from '@/lib/shell'
+import { probeAppCheckout } from '@/lib/ssh/git'
 import { webhookConfigError, webhookUrl as buildWebhookUrl } from '@/lib/hosts'
 import { clientErrorMessage } from '@/lib/pg-error'
 
@@ -80,7 +81,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
 		return Response.json({ error: 'container has no compose working dir' }, { status: 400 })
 	}
 	// never a reserved name, powder's own container or powder's compose project
-	const adopt = adoptContainerProblem(name, detail.compose.project)
+	const adopt = adoptContainerProblem(name, detail.compose.project) ?? adoptWorkingDirProblem(detail.compose.workingDir)
 	if (adopt) return Response.json({ error: adopt }, { status: 400 })
 
 	// no compose project name another app on the server (or powder) has.
@@ -234,15 +235,20 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
 	// registered (powder's reattach only handles detached HEAD, not a misnamed
 	// branch), and a compose that builds on the server (can OOM a server with little memory).
 	try {
-		const onDisk = await runCommand(
-			server, `${gitHardenShellFunctions()}${gitCmd(shq(workingDir), shq(workingDir))} rev-parse --abbrev-ref HEAD 2>/dev/null || true`, 10_000,
-		)
+		// the checkout the deploy syncs (src/ first: lib/app-checkout.ts)
+		const co = await probeAppCheckout(server, workingDir)
+		const coDir = co.kind === 'src' || co.kind === 'workdir' ? co.dir : null
+		const onDisk = coDir
+			? await runCommand(
+					server, `${gitHardenShellFunctions()}${gitCmd(shq(coDir), shq(coDir))} rev-parse --abbrev-ref HEAD 2>/dev/null || true`, 10_000,
+				)
+			: { stdout: '' }
 		const cur = onDisk.stdout.trim()
-		if (cur && cur !== 'HEAD' && cur !== branch) {
+		if (coDir && cur && cur !== 'HEAD' && cur !== branch) {
 			steps.push({
 				step: 'on-disk branch',
 				ok: false,
-				detail: `checkout is on "${cur}" but registered branch is "${branch}" — run: git -C ${workingDir} checkout ${branch} (deploys pull the registered branch)`,
+				detail: `checkout is on "${cur}" but registered branch is "${branch}"; run: git -C ${coDir} checkout ${branch} (deploys pull the registered branch)`,
 			})
 		} else {
 			steps.push({ step: 'on-disk branch', ok: true, detail: cur ? `on ${cur}` : 'not a git checkout (registry-mode)' })

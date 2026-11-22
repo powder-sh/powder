@@ -12,6 +12,16 @@
 // (and publishing Traefik's ports) does add Docker's own iptables rules.
 import { shq } from './shell'
 import { SIDE_RUN_CAPS } from './side-run'
+import {
+	DEFAULT_TRAEFIK_NETWORK,
+	type DockerNetworkInfo,
+	type TraefikNetwork,
+	assertDockerNetworkName,
+	isDeclaredSource,
+	isDockerNetworkName,
+	parseDockerNetworks,
+	routingNetwork,
+} from './traefik-network'
 
 export type BootstrapProxy = 'traefik' | 'nginx' | 'nginx-container'
 
@@ -21,8 +31,75 @@ export type BootstrapProxy = 'traefik' | 'nginx' | 'nginx-container'
 export const TRAEFIK_IMAGE =
 	'traefik:v3.6@sha256:31267173a15b4944e797a76ffd9c419707c8d8b32fe5b610f80cd0cfa05f372d'
 export const BOOTSTRAP_NETWORKS = ['web', 'internal'] as const
+// Why each piece is required (or not), in the check's own words. bin/server-bootstrap.sh
+// prints the same text (server-bootstrap.test.ts holds both to it).
+// The Traefik network: on Traefik servers the network Traefik routes over
+// (traefik-network.ts: its flag, its config file, else the network it is attached to;
+// `web`, what powder's own Traefik runs on, when none). Every app, preview, snapshot
+// and rollback bridge powder starts there joins it: it must exist and Traefik must
+// be attached to it. A missing `web` is then only an info line when Traefik routes
+// over another network. On nginx and nginx-container servers only apps created at
+// /new join `web`, and the new-app flow creates it first (app/api/apps/route.ts,
+// createNetworkCommand): an info line when absent.
+export const NETWORK_WEB_MISSING = 'missing: Traefik and the apps, previews and snapshots it routes run on it'
+export const NETWORK_WEB_ABSENT = 'not created: powder creates it when the first app is created here at /new'
+/** `web` on a Traefik server whose Traefik routes over another network. */
+export function networkWebNotUsed(net: string, present: boolean): string {
+	return present
+		? `exists; not used for routing here: Traefik routes over ${net}`
+		: `not needed: Traefik here routes over ${net}, and the apps, previews and snapshots powder starts here join ${net}`
+}
+/** The Traefik network (not `web`) is missing. */
+export function traefikNetworkMissing(net: string): string {
+	return `missing: Traefik routes over ${net}, and the apps, previews and snapshots powder starts here join it`
+}
+/** Traefik is attached to a network no flag or config declares: powder keeps `web`. */
+export function traefikNetworkUndeclared(net: string): string {
+	return `traefik is attached to ${net}; set providers.docker.network to let powder route apps over it (until then powder uses web)`
+}
+/** The traefik container is not attached to its routing network. */
+export function traefikNotAttached(net: string): string {
+	return `missing: the traefik container is not attached to ${net}, so it cannot reach what powder starts there (connect it by hand: docker network connect ${net} traefik; powder never changes an existing Traefik)`
+}
+// `internal`: only an app created with the opt-in "join the shared internal network"
+// joins it, and the new-app flow creates it then. Optional: an info line when absent.
+export const NETWORK_INTERNAL_ABSENT = 'not created: optional, only apps created with "join the shared internal network" use it, and powder creates it for the first one'
+// The Traefik file provider and its folder: only domain redirects use them (powder
+// writes their Traefik rules there, domain-redirects.ts applyToTraefik). Required on
+// a Traefik server only while a redirect is set up there (redirectRowInUse: a www
+// mode other than none, or custom redirects); otherwise an info line, since getting
+// one can mean recreating the Traefik that fronts everything, for a feature not in
+// use. bin/server-bootstrap.sh learns the fact from --redirects yes|no (default yes).
+export const DYNAMIC_DIR_MISSING =
+	'missing: domain redirects are set up on this server, and powder writes their Traefik rules here'
+export const DYNAMIC_DIR_UNUSED =
+	'not created: only domain redirects use it, and none is set up on this server; they stay unavailable here until Traefik has a file provider on it'
+export function fileProviderMissing(dir: string): string {
+	return `missing: domain redirects are set up on this server, and Traefik needs a watched file provider on ${dir} to serve them (add providers.file.directory + watch and mount it)`
+}
+export function fileProviderUnused(dir: string): string {
+	return `not configured: domain redirects are unavailable on this server until Traefik has a watched file provider on ${dir} (add providers.file.directory + watch and mount it); nothing here uses it now`
+}
 const APPS_DIR = '/opt/apps'
 const TRAEFIK_ACME_DIR = '/opt/infra/traefik/acme'
+// Only files the daemons really load count as "handled elsewhere".
+// cron: /etc/crontab always; in /etc/cron.d only names of letters, digits, `_` and `-`
+// (Debian's cron(8): cron.d files "must conform to the same naming convention as used
+// by run-parts(8) ... upper- and lower-case letters, digits, underscores, and hyphens.
+// This means that they cannot contain any dots"), so a `name.bak` copy is not a cron
+// file. logrotate: its default taboo extensions (logrotate(8), tabooext: files in an
+// included directory with these endings are skipped). `.bak` is not on that list:
+// logrotate does load a `.bak` file, so one counts, and so does a hidden file
+// (logrotate skips only `.` and `..` there), so the scan includes dotfiles. A
+// commented-out line never counts.
+export const LOGROTATE_TABOO_EXTENSIONS = [
+	',v', '.cfsaved', '.disabled', '.dpkg-bak', '.dpkg-del', '.dpkg-dist', '.dpkg-new', '.dpkg-old',
+	'.dpkg-tmp', '.rhn-cfg-tmp-*', '.rpmnew', '.rpmorig', '.rpmsave', '.swp', '.ucf-dist', '.ucf-new',
+	'.ucf-old', '~',
+] as const
+const LOGROTATE_TABOO_CASE = LOGROTATE_TABOO_EXTENSIONS.map((e) => `*${e}`).join(' | ')
+// Written out as a literal in the grep programs below (data never becomes program
+// text: shell-program-data.test.ts); server-bootstrap.test.ts holds them to this.
 const TRAEFIK_LOG_DIR = '/var/log/traefik'
 // Container path the file provider reads; the host dir is mounted there.
 const TRAEFIK_DYNAMIC_MOUNT = '/etc/traefik/dynamic'
@@ -61,6 +138,23 @@ export const PRUNE_CRON_FILE = '/etc/cron.d/powder-image-prune'
 export const PRUNE_CRON_LINE =
 	'17 * * * * root /usr/local/bin/powder-image-prune >> /var/log/powder-image-prune.log 2>&1'
 
+/** Another logrotate file already rotates the Traefik logs: handled, left alone. */
+export function logrotateElsewhere(other: string): string {
+	return `/etc/logrotate.d/${other} already rotates ${TRAEFIK_LOG_DIR}; handled there, left alone (powder adds no second file)`
+}
+/** powder's file and another one both rotate the Traefik logs. */
+export function logrotateTwice(other: string): string {
+	return `${TRAEFIK_LOGROTATE_FILE} and /etc/logrotate.d/${other} both rotate ${TRAEFIK_LOG_DIR}: logrotate reports a duplicate entry and exits non-zero; remove one of them by hand`
+}
+/** Another cron file already runs powder-image-prune: handled, left alone. */
+export function pruneCronElsewhere(other: string): string {
+	return `/etc/${other} already runs powder-image-prune; handled there, left alone (powder adds no second line)`
+}
+/** powder's cron file and another one both run powder-image-prune. */
+export function pruneCronTwice(other: string): string {
+	return `${PRUNE_CRON_FILE} and /etc/${other} both run powder-image-prune; remove one of them by hand`
+}
+
 /** `printf` that writes TRAEFIK_LOGROTATE_LINES, one per line. */
 function logrotatePrintf(): string {
 	return `printf '%s\\n' ${TRAEFIK_LOGROTATE_LINES.map((l) => shq(l)).join(' ')}`
@@ -89,6 +183,11 @@ export function renderCheckScript(dynWord: string): string {
 		'if docker compose version >/dev/null 2>&1; then echo compose=present; else echo compose=absent; fi',
 		'for n in web internal; do if docker network inspect "$n" >/dev/null 2>&1; then echo "net_$n=present"; else echo "net_$n=absent"; fi; done',
 		`case "$(docker inspect --type container -f '{{.State.Running}}' traefik 2>/dev/null)" in true) echo traefik=running ;; false) echo traefik=stopped ;; *) echo traefik=absent ;; esac`,
+		// Every network with its internal flag, and the networks traefik is attached to:
+		// what the Traefik network rule (traefik-network.ts) needs besides the inspect JSON.
+		`echo "docker_networks=$(docker network ls --format '{{.Name}}:{{.Internal}}:{{.Label "com.docker.compose.project"}}' 2>/dev/null | tr '\\n' ' ')"`,
+		`echo "traefik_project=$(docker inspect --type container -f '{{index .Config.Labels "com.docker.compose.project"}}' traefik 2>/dev/null)"`,
+		`echo "traefik_networks=$(docker inspect --type container -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' traefik 2>/dev/null)"`,
 		`if [ -d ${shq(APPS_DIR)} ]; then echo apps_dir=present; else echo apps_dir=absent; fi`,
 		`if [ -d ${dynWord} ]; then echo dynamic_dir=present; else echo dynamic_dir=absent; fi`,
 		'if have ufw; then case "$(ufw status 2>/dev/null | head -n1)" in *inactive*) echo ufw=inactive ;; *active*) echo ufw=active ;; *) echo ufw=unknown ;; esac; else echo ufw=absent; fi',
@@ -109,9 +208,14 @@ export function renderCheckScript(dynWord: string): string {
 		// Deploys clone and pull with git and take the per-app lock with flock.
 		'for c in git flock; do if have "$c"; then echo "cmd_$c=present"; else echo "cmd_$c=absent"; fi; done',
 		// The prune's cron file: absent, powder's exact line, or something else (left alone).
+		// Another cron file that already runs powder-image-prune (not a comment line).
+		`o=; for f in /etc/crontab /etc/cron.d/*; do [ "$f" = ${shq(PRUNE_CRON_FILE)} ] && continue; case "$f" in /etc/cron.d/*) case "\${f##*/}" in *[!A-Za-z0-9_-]*) continue ;; esac ;; esac; if [ -f "$f" ] && grep -Eqs '^[^#]*powder-image-prune' "$f"; then o=\${f#/etc/}; break; fi; done; echo "prune_cron_other=$o"`,
 		`if [ ! -d /etc/cron.d ]; then echo prune_cron=no-crond; elif [ ! -e ${shq(PRUNE_CRON_FILE)} ] && [ ! -L ${shq(PRUNE_CRON_FILE)} ]; then echo prune_cron=absent; elif [ "$(cat ${shq(PRUNE_CRON_FILE)} 2>/dev/null)" = ${shq(PRUNE_CRON_LINE)} ]; then echo prune_cron=current; else echo prune_cron=different; fi`,
 		// Traefik's access log rotation: absent, powder's exact file, or something else (left alone).
 		`if [ ! -d /etc/logrotate.d ]; then echo traefik_logrotate=no-logrotate; elif [ ! -e ${shq(TRAEFIK_LOGROTATE_FILE)} ] && [ ! -L ${shq(TRAEFIK_LOGROTATE_FILE)} ]; then echo traefik_logrotate=absent; elif [ "$(cat ${shq(TRAEFIK_LOGROTATE_FILE)} 2>/dev/null)" = "$(${logrotatePrintf()})" ]; then echo traefik_logrotate=current; else echo traefik_logrotate=different; fi`,
+		// Another file under /etc/logrotate.d that already rotates the Traefik logs (by
+		// the path it names, not by its file name; not a comment line).
+		`o=; if [ -d /etc/logrotate.d ]; then for f in /etc/logrotate.d/* /etc/logrotate.d/.[!.]* /etc/logrotate.d/..?*; do [ "$f" = ${shq(TRAEFIK_LOGROTATE_FILE)} ] && continue; case "\${f##*/}" in ${LOGROTATE_TABOO_CASE}) continue ;; esac; if [ -f "$f" ] && grep -Eqs '^[^#]*/var/log/traefik' "$f"; then o=\${f##*/}; break; fi; done; fi; echo "traefik_logrotate_other=$o"`,
 		`echo ${shq(INSPECT_MARKER)}`,
 		'docker inspect --type container traefik 2>/dev/null || true',
 	].join('\n')
@@ -129,6 +233,15 @@ export interface BootstrapFacts {
 	traefik: 'running' | 'stopped' | 'absent'
 	// Filled by the caller from the inspect JSON (checkFileProviderFromInspect).
 	traefikFileProvider: 'ok' | 'missing' | 'n/a'
+	// Filled by the caller (traefikNetworkFrom): the network Traefik routes over.
+	// Absent = `web`, attachment unknown.
+	traefikNetwork?: TraefikNetwork
+	// Every docker network with its internal flag (null = not reported).
+	dockerNetworks?: DockerNetworkInfo[] | null
+	// Networks the traefik container is attached to (null = no container or not reported).
+	traefikAttached?: string[] | null
+	// The traefik container's compose project label (null = none or not reported).
+	traefikProject?: string | null
 	appsDir: Presence
 	dynamicDir: Presence
 	ufw: 'active' | 'inactive' | 'absent' | 'unknown'
@@ -157,6 +270,10 @@ export interface BootstrapFacts {
 	// TRAEFIK_LOGROTATE_FILE: absent, powder's content exactly, other content, or
 	// no /etc/logrotate.d on the server.
 	traefikLogrotate?: 'current' | 'different' | 'absent' | 'no-logrotate'
+	// Another /etc/logrotate.d file that rotates /var/log/traefik (its name), or null.
+	traefikLogrotateOther?: string | null
+	// Another cron file (/etc/crontab, /etc/cron.d/x) that runs powder-image-prune, or null.
+	pruneCronOther?: string | null
 }
 
 export type HelperKey = 'migrate' | 'imagePrune' | 'resourceGuard'
@@ -189,7 +306,7 @@ export function helperState(f: BootstrapFacts, key: HelperKey, shipped: ShippedH
 
 /** Splits the check output into the key=value map and the inspect JSON text. */
 export function parseCheckOutput(stdout: string): {
-	facts: Omit<BootstrapFacts, 'traefikFileProvider'>
+	facts: Omit<BootstrapFacts, 'traefikFileProvider' | 'traefikNetwork'>
 	inspectJson: string
 } {
 	const idx = stdout.indexOf(INSPECT_MARKER)
@@ -210,6 +327,12 @@ export function parseCheckOutput(stdout: string): {
 		const v = kv.get(key) ?? ''
 		return SHA256.test(v) ? v : null
 	}
+	// A file name reported by the server: shown in the check, so a plain name only.
+	const fileName = (key: string): string | null => {
+		const v = kv.get(key) ?? ''
+		// a leading dot too: logrotate loads hidden files
+		return /^[A-Za-z0-9.][A-Za-z0-9._@+/-]{0,127}$/.test(v) && !v.includes('..') ? v : null
+	}
 	const kb = (key: string): number | null => {
 		const n = Number(kv.get(key))
 		return kv.get(key) && Number.isFinite(n) && n >= 0 ? n * 1024 : null
@@ -223,6 +346,13 @@ export function parseCheckOutput(stdout: string): {
 			compose: presence('compose'),
 			networks: { web: presence('net_web'), internal: presence('net_internal') },
 			traefik: pick('traefik', ['running', 'stopped', 'absent'], 'absent'),
+			...(kv.has('docker_networks') ? { dockerNetworks: parseDockerNetworks(kv.get('docker_networks') ?? '') } : {}),
+			...(kv.has('traefik_project')
+				? { traefikProject: /^[a-z0-9][a-z0-9_-]{0,127}$/.test(kv.get('traefik_project') ?? '') ? (kv.get('traefik_project') ?? null) : null }
+				: {}),
+			...(kv.has('traefik_networks')
+				? { traefikAttached: (kv.get('traefik_networks') ?? '').split(/\s+/).filter(isDockerNetworkName) }
+				: {}),
 			appsDir: presence('apps_dir'),
 			dynamicDir: presence('dynamic_dir'),
 			ufw: pick('ufw', ['active', 'inactive', 'absent', 'unknown'], 'unknown'),
@@ -251,6 +381,8 @@ export function parseCheckOutput(stdout: string): {
 			...(kv.has('prune_cron')
 				? { pruneCron: pick('prune_cron', ['current', 'different', 'absent', 'no-crond'] as const, 'different') }
 				: {}),
+			...(kv.has('prune_cron_other') ? { pruneCronOther: fileName('prune_cron_other') } : {}),
+			...(kv.has('traefik_logrotate_other') ? { traefikLogrotateOther: fileName('traefik_logrotate_other') } : {}),
 			...(kv.has('traefik_logrotate')
 				? {
 						traefikLogrotate: pick(
@@ -278,19 +410,49 @@ function gb(n: number): string {
 	return `${(n / 1024 ** 3).toFixed(1)} GB`
 }
 
+/** The Traefik network the facts carry, else `web` (attachment unknown). */
+export function traefikNetworkOf(f: Pick<BootstrapFacts, 'traefikNetwork' | 'traefikAttached'>): TraefikNetwork {
+	return (
+		f.traefikNetwork ?? {
+			name: DEFAULT_TRAEFIK_NETWORK,
+			source: 'default',
+			attached: f.traefikAttached ?? null,
+			why: 'powder uses web',
+		}
+	)
+}
+
+/** Does the network exist on the server? `web` and `internal` from their own check
+ *  lines, any other from the network list. */
+export function networkPresent(f: Pick<BootstrapFacts, 'networks' | 'dockerNetworks'>, name: string): boolean {
+	if (name === 'web' || name === 'internal') return f.networks[name] === 'present'
+	return !!f.dockerNetworks?.some((n) => n.name === name)
+}
+
 /**
  * Human checklist. 'missing' items fail the check; 'warn'/'info' do not.
  * Traefik pieces are only required when the server's proxy is 'traefik'; on
- * nginx and nginx-container servers they are info.
+ * nginx and nginx-container servers they are info, and so is the `web` network
+ * (NETWORK_WEB_ABSENT). On Traefik servers the network Traefik routes over
+ * (traefikNetworkOf) must exist and Traefik must be attached to it; `web` is an info
+ * line when that is another network. The file provider and its folder are required
+ * only when `redirectsInUse` (a domain redirect is set up on this server; default
+ * true, the cautious side). The `internal` network is optional on every proxy.
  */
 export function checkItems(
 	f: BootstrapFacts,
 	dynamicDir: string,
 	proxy: BootstrapProxy,
 	shipped: ShippedHelperShas = {},
+	redirectsInUse = true,
 ): CheckItem[] {
 	const traefikServer = proxy === 'traefik'
 	const need = (ok: boolean): CheckState => (ok ? 'ok' : traefikServer ? 'missing' : 'info')
+	// the file provider pieces: required only while a redirect needs them
+	const needRedirects = (ok: boolean): CheckState => (ok ? 'ok' : traefikServer && redirectsInUse ? 'missing' : 'info')
+	const tnet = traefikNetworkOf(f)
+	// what powder routes over: the declared network (flag or config), else web
+	const route = routingNetwork(tnet)
 	const items: CheckItem[] = []
 	items.push({
 		id: 'docker',
@@ -309,14 +471,51 @@ export function checkItems(
 		state: f.compose === 'present' ? 'ok' : 'missing',
 		detail: f.compose === 'present' ? 'installed' : 'not installed',
 	})
-	for (const n of BOOTSTRAP_NETWORKS) {
+	if (traefikServer) {
+		const present = networkPresent(f, route)
 		items.push({
-			id: `network-${n}`,
-			label: `network ${n}`,
-			state: f.networks[n] === 'present' ? 'ok' : 'missing',
-			detail: f.networks[n] === 'present' ? 'exists' : 'missing',
+			id: 'traefik-network',
+			label: `network ${route}`,
+			state: present ? 'ok' : 'missing',
+			detail: present
+				? isDeclaredSource(tnet.source)
+					? `exists; Traefik routes over it (${tnet.why})`
+					: 'exists'
+				: route === DEFAULT_TRAEFIK_NETWORK
+					? NETWORK_WEB_MISSING
+					: traefikNetworkMissing(route),
+		})
+		if (route !== DEFAULT_TRAEFIK_NETWORK) {
+			items.push({
+				id: 'network-web',
+				label: 'network web',
+				state: 'info',
+				detail: networkWebNotUsed(route, f.networks.web === 'present'),
+			})
+		}
+		// attached to a network nobody declared: reported, never used
+		if (tnet.source === 'attached' && tnet.name !== DEFAULT_TRAEFIK_NETWORK) {
+			items.push({
+				id: 'traefik-network-undeclared',
+				label: 'traefik networks',
+				state: 'info',
+				detail: traefikNetworkUndeclared(tnet.name),
+			})
+		}
+	} else {
+		items.push({
+			id: 'network-web',
+			label: 'network web',
+			state: f.networks.web === 'present' ? 'ok' : 'info',
+			detail: f.networks.web === 'present' ? 'exists' : NETWORK_WEB_ABSENT,
 		})
 	}
+	items.push({
+		id: 'network-internal',
+		label: 'network internal',
+		state: f.networks.internal === 'present' ? 'ok' : 'info',
+		detail: f.networks.internal === 'present' ? 'exists' : NETWORK_INTERNAL_ABSENT,
+	})
 	items.push({
 		id: 'traefik',
 		label: 'traefik container',
@@ -330,15 +529,33 @@ export function checkItems(
 						? 'no container named traefik'
 						: `not used: this server routes with ${proxy}`,
 	})
+	if (f.traefik !== 'absent' && traefikServer) {
+		const attached = tnet.attached ?? f.traefikAttached ?? null
+		items.push({
+			id: 'traefik-attached',
+			label: `traefik on ${route}`,
+			state: attached === null ? 'info' : attached.includes(route) ? 'ok' : 'missing',
+			detail:
+				attached === null
+					? 'could not read the networks of the traefik container'
+					: attached.includes(route)
+						? 'attached'
+						: traefikNotAttached(route),
+		})
+	}
 	if (f.traefik !== 'absent') {
 		items.push({
 			id: 'traefik-file-provider',
 			label: 'traefik file provider',
-			state: need(f.traefikFileProvider === 'ok'),
+			state: needRedirects(f.traefikFileProvider === 'ok'),
 			detail:
 				f.traefikFileProvider === 'ok'
 					? `watches ${dynamicDir}`
-					: `no watched file provider on ${dynamicDir} (add providers.file.directory + watch and mount it)`,
+					: !traefikServer
+						? `no watched file provider on ${dynamicDir} (add providers.file.directory + watch and mount it)`
+						: redirectsInUse
+							? fileProviderMissing(dynamicDir)
+							: fileProviderUnused(dynamicDir),
 		})
 	}
 	items.push({
@@ -350,9 +567,15 @@ export function checkItems(
 	items.push({
 		id: 'dynamic-dir',
 		label: dynamicDir,
-		state: need(f.dynamicDir === 'present'),
+		state: needRedirects(f.dynamicDir === 'present'),
 		detail:
-			f.dynamicDir === 'present' ? 'exists' : traefikServer ? 'missing' : `not used with ${proxy}`,
+			f.dynamicDir === 'present'
+				? 'exists'
+				: !traefikServer
+					? `not used with ${proxy}`
+					: redirectsInUse
+						? DYNAMIC_DIR_MISSING
+						: DYNAMIC_DIR_UNUSED,
 	})
 	items.push({
 		id: 'ufw',
@@ -432,33 +655,59 @@ export function checkItems(
 		})
 	}
 	if (f.pruneCron) {
+		const other = f.pruneCronOther ?? null
+		const ownFile = f.pruneCron === 'current' || f.pruneCron === 'different'
 		items.push({
 			id: 'image-prune-cron',
 			label: 'image prune cron',
-			state: f.pruneCron === 'current' ? 'ok' : f.pruneCron === 'different' ? 'info' : 'warn',
+			state:
+				other && ownFile
+					? 'warn'
+					: other || f.pruneCron === 'current'
+						? 'ok'
+						: f.pruneCron === 'different'
+							? 'info'
+							: 'warn',
 			detail:
-				f.pruneCron === 'current'
-					? `${PRUNE_CRON_FILE}: hourly at :17`
-					: f.pruneCron === 'different'
-						? `${PRUNE_CRON_FILE} has other content; left as is. powder's line: ${PRUNE_CRON_LINE}`
-						: f.pruneCron === 'absent'
-							? `${PRUNE_CRON_FILE} missing: powder-image-prune never runs (fix missing pieces adds it)`
-							: `no /etc/cron.d on this server: add this line to /etc/crontab by hand: ${PRUNE_CRON_LINE}`,
+				other && ownFile
+					? pruneCronTwice(other)
+					: other
+						? pruneCronElsewhere(other)
+						: f.pruneCron === 'current'
+							? `${PRUNE_CRON_FILE}: hourly at :17`
+							: f.pruneCron === 'different'
+								? `${PRUNE_CRON_FILE} has other content; left as is. powder's line: ${PRUNE_CRON_LINE}`
+								: f.pruneCron === 'absent'
+									? `${PRUNE_CRON_FILE} missing: powder-image-prune never runs (fix missing pieces adds it)`
+									: `no /etc/cron.d on this server: add this line to /etc/crontab by hand: ${PRUNE_CRON_LINE}`,
 		})
 	}
 	if (f.traefikLogrotate && traefikServer) {
+		const other = f.traefikLogrotateOther ?? null
+		const ownFile = f.traefikLogrotate === 'current' || f.traefikLogrotate === 'different'
 		items.push({
 			id: 'traefik-logrotate',
 			label: 'traefik access log rotation',
-			state: f.traefikLogrotate === 'current' ? 'ok' : f.traefikLogrotate === 'different' ? 'info' : 'warn',
+			state:
+				other && ownFile
+					? 'warn'
+					: other || f.traefikLogrotate === 'current'
+						? 'ok'
+						: f.traefikLogrotate === 'different'
+							? 'info'
+							: 'warn',
 			detail:
-				f.traefikLogrotate === 'current'
-					? `${TRAEFIK_LOGROTATE_FILE}: daily, 7 kept, 100 MB cap`
-					: f.traefikLogrotate === 'different'
-						? `${TRAEFIK_LOGROTATE_FILE} has other content; left as is`
-						: f.traefikLogrotate === 'absent'
-							? `${TRAEFIK_LOGROTATE_FILE} missing: ${TRAEFIK_LOG_DIR}/access.log grows without bound (fix missing pieces adds it)`
-							: `no /etc/logrotate.d on this server: ${TRAEFIK_LOG_DIR}/access.log is not rotated (install logrotate)`,
+				other && ownFile
+					? logrotateTwice(other)
+					: other
+						? logrotateElsewhere(other)
+						: f.traefikLogrotate === 'current'
+							? `${TRAEFIK_LOGROTATE_FILE}: daily, 7 kept, 100 MB cap`
+							: f.traefikLogrotate === 'different'
+								? `${TRAEFIK_LOGROTATE_FILE} has other content; left as is`
+								: f.traefikLogrotate === 'absent'
+									? `${TRAEFIK_LOGROTATE_FILE} missing: ${TRAEFIK_LOG_DIR}/access.log grows without bound (fix missing pieces adds it)`
+									: `no /etc/logrotate.d on this server: ${TRAEFIK_LOG_DIR}/access.log is not rotated (install logrotate)`,
 		})
 	}
 	return items
@@ -468,10 +717,17 @@ export function isCheckGreen(items: CheckItem[]): boolean {
 	return items.every((i) => i.state !== 'missing')
 }
 
+/** The required pieces a check names as missing (its 'missing' items): what
+ *  servers.check_missing stores and the setup checklist names. */
+export function missingPieces(items: readonly CheckItem[]): Array<Pick<CheckItem, 'id' | 'label' | 'detail'>> {
+	return items.filter((i) => i.state === 'missing').map(({ id, label, detail }) => ({ id, label, detail }))
+}
+
 export type StepId =
 	| 'install-docker'
 	| 'network-web'
 	| 'network-internal'
+	| 'network-traefik'
 	| 'mkdir-apps'
 	| 'mkdir-dynamic'
 	| 'start-traefik'
@@ -551,13 +807,16 @@ export function installDockerScriptCommand(): string {
 }
 
 /** Writes TRAEFIK_LOGROTATE_FILE (root:root 0644) via a temp file in /etc (outside
- *  the dir logrotate reads) and mv. A file that exists is left alone. Pure;
+ *  the dir logrotate reads) and mv. A file that exists is left alone, and so is the
+ *  step when another /etc/logrotate.d file already names the log dir (two stanzas
+ *  for one log make logrotate fail). Pure;
  *  bin/server-bootstrap.sh runs the same lines. */
 export function installTraefikLogrotateCommand(): string {
 	const dest = shq(TRAEFIK_LOGROTATE_FILE)
 	return [
 		`if [ ! -d /etc/logrotate.d ]; then echo 'no /etc/logrotate.d on this server (install logrotate); ${TRAEFIK_LOG_DIR}/access.log is not rotated'; exit 1; fi`,
 		`if [ -e ${dest} ] || [ -L ${dest} ]; then echo '${TRAEFIK_LOGROTATE_FILE} exists, left as is'; exit 0; fi`,
+		`for f in /etc/logrotate.d/* /etc/logrotate.d/.[!.]* /etc/logrotate.d/..?*; do case "\${f##*/}" in ${LOGROTATE_TABOO_CASE}) continue ;; esac; if [ -f "$f" ] && grep -Eqs '^[^#]*/var/log/traefik' "$f"; then echo "$f already rotates ${TRAEFIK_LOG_DIR}, no second file written"; exit 0; fi; done`,
 		`C=$(mktemp /etc/.powder-traefik-logrotate.XXXXXX) || { echo 'could not create a temp file in /etc'; exit 1; }`,
 		`${logrotatePrintf()} > "$C" && chown root:root "$C" && chmod 0644 "$C" && mv -f "$C" ${dest} || { rm -f "$C"; echo 'install failed'; exit 1; }`,
 		`echo 'installed ${TRAEFIK_LOGROTATE_FILE}'`,
@@ -580,12 +839,14 @@ export function installHelperCommand(bin: string): string {
 
 /** Writes PRUNE_CRON_FILE with PRUNE_CRON_LINE, root:root 0644, via a temp file
  *  (a dot name cron ignores) and mv. Re-checks at run time: a file that appeared
- *  since the check is left alone. Pure; bin/server-bootstrap.sh runs the same lines. */
+ *  since the check is left alone, and no line is written when /etc/crontab or another
+ *  /etc/cron.d file already runs powder-image-prune. Pure; bin/server-bootstrap.sh runs the same lines. */
 export function installPruneCronCommand(): string {
 	const dest = shq(PRUNE_CRON_FILE)
 	return [
 		`if [ ! -d /etc/cron.d ]; then echo ${shq(`no /etc/cron.d on this server; add this line to /etc/crontab by hand: ${PRUNE_CRON_LINE}`)}; exit 1; fi`,
 		`if [ -e ${dest} ] || [ -L ${dest} ]; then echo '${PRUNE_CRON_FILE} exists, left as is'; exit 0; fi`,
+		`for f in /etc/crontab /etc/cron.d/*; do case "$f" in /etc/cron.d/*) case "\${f##*/}" in *[!A-Za-z0-9_-]*) continue ;; esac ;; esac; if [ -f "$f" ] && grep -Eqs '^[^#]*powder-image-prune' "$f"; then echo "$f already runs powder-image-prune, no second line written"; exit 0; fi; done`,
 		`if [ ! -x '${HELPER_BIN_DIR}/powder-image-prune' ]; then echo '${HELPER_BIN_DIR}/powder-image-prune is not installed, no cron written'; exit 1; fi`,
 		`C=$(mktemp /etc/cron.d/.powder-image-prune.XXXXXX) || { echo 'could not create a temp file in /etc/cron.d'; exit 1; }`,
 		`printf '%s\\n' ${shq(PRUNE_CRON_LINE)} > "$C" && chown root:root "$C" && chmod 0644 "$C" && mv -f "$C" ${dest} || { rm -f "$C"; echo 'install failed'; exit 1; }`,
@@ -593,8 +854,15 @@ export function installPruneCronCommand(): string {
 	].join('\n')
 }
 
-export function createNetworkCommand(name: (typeof BOOTSTRAP_NETWORKS)[number]): string {
-	return `docker network inspect ${name} >/dev/null 2>&1 || docker network create ${name}`
+/** Creates the network when it is missing. The name is validated
+ *  (assertDockerNetworkName), so it is a bare shell word. */
+export function createNetworkCommand(name: string): string {
+	return networkCommand(assertDockerNetworkName(name))
+}
+
+/** createNetworkCommand for a shell word (bin/server-bootstrap.sh passes "$TNET"). */
+export function networkCommand(word: string): string {
+	return `docker network inspect ${word} >/dev/null 2>&1 || docker network create ${word}`
 }
 
 export function mkdirCommand(dirWord: string): string {
@@ -613,6 +881,10 @@ export function startTraefikCommand(dynWord: string): string {
 		'--providers.docker=true',
 		'--providers.docker.exposedbydefault=false',
 		'--providers.docker.network=web',
+		// One backend connection per request: a container stopped in a deploy swap gets no
+		// request over a pooled keep-alive connection after powder refused its new
+		// connections (fragments.ts drainShellFunctions), so it drains and exits.
+		'--serverstransport.maxidleconnsperhost=-1',
 		`--providers.file.directory=${TRAEFIK_DYNAMIC_MOUNT}`,
 		'--providers.file.watch=true',
 		'--certificatesresolvers.le.acme.httpchallenge=true',
@@ -680,6 +952,7 @@ export function planApply(
 	dynWord: string,
 	proxy: BootstrapProxy,
 	shipped: ShippedHelperShas = {},
+	redirectsInUse = true,
 ): BootstrapPlan {
 	const steps: BootstrapStep[] = []
 	const skipped: BootstrapPlan['skipped'] = []
@@ -715,22 +988,39 @@ export function planApply(
 			command: mkdirCommand(shq(APPS_DIR)),
 		})
 	}
-	if (f.dynamicDir === 'absent' && proxy === 'traefik') {
+	// only domain redirects use the dynamic dir: created while one is set up here
+	if (f.dynamicDir === 'absent' && proxy === 'traefik' && redirectsInUse) {
 		steps.push({
 			id: 'mkdir-dynamic',
 			title: 'create the Traefik dynamic dir',
 			command: mkdirCommand(dynWord),
 		})
 	}
+	// The routing network: on Traefik servers the one Traefik routes over (`web`
+	// unless it routes over another), elsewhere `web`. Then `internal`.
+	const tnet = proxy === 'traefik' ? traefikNetworkOf(f) : null
 	if (dockerUsable) {
-		for (const n of BOOTSTRAP_NETWORKS) {
-			if (f.networks[n] === 'absent' || f.docker === 'absent') {
+		const routing = tnet ? routingNetwork(tnet) : DEFAULT_TRAEFIK_NETWORK
+		for (const n of [routing, ...BOOTSTRAP_NETWORKS.filter((b) => b !== 'web' && b !== routing)]) {
+			if (!networkPresent(f, n) || f.docker === 'absent') {
+				const own = n === 'web' || n === 'internal'
 				steps.push({
-					id: `network-${n}`,
-					title: `create docker network ${n}`,
+					id: own ? (`network-${n}` as StepId) : 'network-traefik',
+					title: own ? `create docker network ${n}` : `create docker network ${n} (Traefik routes over it)`,
 					command: createNetworkCommand(n),
 				})
 			}
+		}
+	}
+	// An existing Traefik is never changed: attaching it is the operator's step.
+	if (tnet && f.traefik !== 'absent') {
+		const attached = tnet.attached ?? f.traefikAttached ?? null
+		const routing = routingNetwork(tnet)
+		if (attached && !attached.includes(routing)) {
+			skipped.push({
+				id: 'traefik-network',
+				reason: `attach Traefik to ${routing} by hand (docker network connect ${routing} traefik); powder never changes an existing Traefik`,
+			})
 		}
 	}
 	const blocker = traefikBlocker(f, proxy)
@@ -770,8 +1060,11 @@ export function planApply(
 			})
 		}
 	}
-	// The prune's cron, once the helper is there or about to be installed.
-	if (f.pruneCron === 'absent') {
+	// The prune's cron, once the helper is there or about to be installed; never a
+	// second line when another cron file already runs it.
+	if (f.pruneCron === 'absent' && f.pruneCronOther) {
+		// handled elsewhere
+	} else if (f.pruneCron === 'absent') {
 	const prune =
 		f.helpers?.imagePrune === 'present' || steps.some((s) => s.id === 'install-powder-image-prune')
 	if (prune) {
@@ -783,11 +1076,12 @@ export function planApply(
 	} else {
 		skipped.push({ id: 'image-prune-cron', reason: 'powder-image-prune is not installed; install it first' })
 	}
-	} else if (f.pruneCron === 'no-crond') {
+	} else if (f.pruneCron === 'no-crond' && !f.pruneCronOther) {
 	skipped.push({ id: 'image-prune-cron', reason: `no /etc/cron.d on this server; add to /etc/crontab: ${PRUNE_CRON_LINE}` })
 	}
 	// Traefik's access log rotation, on traefik servers only; an existing file is never changed.
-	if (proxy === 'traefik' && f.traefikLogrotate === 'absent') {
+	// Another file under /etc/logrotate.d that rotates the same logs counts as handled.
+	if (proxy === 'traefik' && f.traefikLogrotate === 'absent' && !f.traefikLogrotateOther) {
 		steps.push({
 			id: 'install-traefik-logrotate',
 			title: `add ${TRAEFIK_LOGROTATE_FILE}: rotates ${TRAEFIK_LOG_DIR}/*.log daily, keeps 7 (root:root, 0644)`,

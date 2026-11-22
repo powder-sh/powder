@@ -5,6 +5,7 @@
 
 import { useState } from 'react'
 import { Button } from '@/components/ui/button'
+import { cn } from '@/lib/cn'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { FieldRow, Input } from '@/components/ui/input'
 import { DEPLOY_SETTLE_MAX_SECONDS } from '@/lib/deploy-settle'
@@ -98,6 +99,9 @@ export default function SettingsPage() {
 		}
 	}
 
+	// previews cannot work on this server (no Traefik or no base domain): the toggle is off
+	// limits, except to switch off previews that are already on
+	const previewsBlocked = !!meta?.previewBlockReason && !meta.previewsEnabled
 	const healthValue = healthDraft ?? meta?.healthUrl ?? ''
 	const healthDirty = healthDraft !== null && healthDraft.trim() !== (meta?.healthUrl ?? '')
 	const dockerfileValue = dockerfileDraft ?? meta?.dockerfilePath ?? './Dockerfile'
@@ -233,13 +237,20 @@ export default function SettingsPage() {
 					<CardTitle>preview deploys</CardTitle>
 				</CardHeader>
 				<CardContent>
-					<label className="flex cursor-pointer items-start gap-3 rounded-md border border-border px-3 py-3 hover:bg-accent/30">
+					<label
+						className={cn(
+							'flex items-start gap-3 rounded-md border border-border px-3 py-3',
+							previewsBlocked ? 'cursor-not-allowed opacity-70' : 'cursor-pointer hover:bg-accent/30',
+						)}
+					>
 						<input
 							type="checkbox"
 							checked={meta?.previewsEnabled ?? false}
-							disabled={!meta || saving !== null}
+							// blocked: can still be switched off, never on
+							disabled={!meta || saving !== null || previewsBlocked}
 							onChange={(e) => save('previews', { previewsEnabled: e.target.checked })}
 							className="mt-0.5"
+							aria-describedby={meta?.previewBlockReason ? 'preview-block-reason' : undefined}
 						/>
 						<div className="flex-1">
 							<div className="text-sm font-medium">deploy previews of other branches</div>
@@ -250,6 +261,11 @@ export default function SettingsPage() {
 							</div>
 						</div>
 					</label>
+					{meta?.previewBlockReason && (
+						<p id="preview-block-reason" className="mt-2 text-xs text-warning">
+							{meta.previewBlockReason}
+						</p>
+					)}
 					{errors.previews && <p className="mt-2 text-xs text-destructive">{errors.previews}</p>}
 					<form
 						className="mt-4"
@@ -354,7 +370,7 @@ export default function SettingsPage() {
 					>
 						<FieldRow
 							error={errors.settle}
-							hint={`a push deploy waits this long so further pushes ship with it as one deploy of the newest commit. 0: never wait. empty: the install default (off unless set). at most ${DEPLOY_SETTLE_MAX_SECONDS}. a commit with [urgent] or redeploy now skips the wait.`}
+							hint={`retired: new pushes never wait. a push deploys at once, and pushes that land while a deploy runs ship together in the next one. this value only affects a push an older powder version still holds (0 releases it). at most ${DEPLOY_SETTLE_MAX_SECONDS}.`}
 							action={
 								<Button type="submit" variant="outline" disabled={!settleDirty || saving !== null}>
 									{saving === 'settle' ? 'saving…' : 'save'}

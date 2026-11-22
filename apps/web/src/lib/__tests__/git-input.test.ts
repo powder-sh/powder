@@ -78,10 +78,10 @@ describe('gitCloneRepo refuses before running anything', () => {
 		const { gitCloneRepo } = await import('../ssh/git')
 		const srv = { id: 's', host: 'h' } as never
 		await expect(
-			gitCloneRepo(srv, '/opt/apps/a', 'git@github.com:a/b.git', '--upload-pack=x', '/k'),
+			gitCloneRepo(srv, '/opt/apps/a', 'git@github.com:a/b.git', '--upload-pack=x', '/k', 'app:a'),
 		).rejects.toThrow('unsafe branch name')
 		await expect(
-			gitCloneRepo(srv, '/opt/apps/a', 'https://u:tok@github.com/a/b.git', 'main', '/k'),
+			gitCloneRepo(srv, '/opt/apps/a', 'https://u:tok@github.com/a/b.git', 'main', '/k', 'app:a'),
 		).rejects.toThrow(REPO_URL_CREDENTIALS_ERROR)
 		expect(runCommand).not.toHaveBeenCalled()
 		vi.doUnmock('../ssh/connection')

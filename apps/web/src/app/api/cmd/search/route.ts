@@ -111,7 +111,7 @@ export async function GET(req: Request) {
 		actions.push(
 			{
 				id: 'redeploy',
-				label: `deploy ${p.containerName}`,
+				label: `redeploy ${p.containerName}`,
 				subtitle: 'POST /api/projects/[id]/redeploy',
 				href: `/projects/${p.id}#redeploy`,
 			},

@@ -70,7 +70,7 @@ const SYNTAX =
 export const NODE_IMAGE = 'node:22.23.3-alpine'
 export const BUN_IMAGE = 'oven/bun:1.2.14-alpine'
 /** Same pnpm version as this repo's packageManager field. */
-export const PNPM_VERSION = '10.21.0'
+export const PNPM_VERSION = '10.34.9'
 
 // Belt and braces next to the .dockerignore powder writes: delete powder's
 // runtime files from the build stage before a runtime stage copies it.

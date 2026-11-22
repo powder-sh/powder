@@ -143,8 +143,8 @@ export async function DELETE(req: Request, ctx: { params: Promise<{ id: string; 
 		await progress.step(removed.output || 'containers: none left')
 
 		for (const p of previews) {
-			await tearDownPreview(p.id)
-			await progress.step(`preview ${p.containerName}: torn down`)
+			const { note } = await tearDownPreview(p.id)
+			await progress.step(`preview ${p.containerName}: torn down${note ? ` (${note})` : ''}`)
 		}
 		const redirects = await db
 			.select({ hostname: domainRedirects.hostname, appliedAt: domainRedirects.appliedAt })

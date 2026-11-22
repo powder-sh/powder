@@ -1,5 +1,5 @@
 import { sql } from 'drizzle-orm'
-import { boolean, pgEnum, pgTable, text, timestamp, uniqueIndex } from 'drizzle-orm/pg-core'
+import { boolean, jsonb, pgEnum, pgTable, text, timestamp, uniqueIndex } from 'drizzle-orm/pg-core'
 
 export const serverKind = pgEnum('server_kind', ['compose', 'raw-docker'])
 export const serverStatus = pgEnum('server_status', ['pending', 'connected', 'unreachable'])
@@ -53,6 +53,14 @@ export const servers = pgTable(
 		checkGreen: boolean('check_green'),
 		checkProxy: text('check_proxy').$type<'nginx' | 'nginx-container' | 'traefik'>(),
 		checkedAt: timestamp('checked_at', { withTimezone: true }),
+		// The required pieces that check found missing (0068); NULL = saved before 0068.
+		checkMissing: jsonb('check_missing').$type<Array<{ id: string; label: string; detail: string }>>(),
+		// The Docker network the server's Traefik routes over, as last resolved from the
+		// running traefik container (0069). NULL = not resolved yet: powder uses `web`.
+		traefikNetwork: text('traefik_network'),
+		// Where it came from (0069): flag | config | attached | default. Only flag and
+		// config move powder's apps off `web`.
+		traefikNetworkSource: text('traefik_network_source').$type<'flag' | 'config' | 'attached' | 'default'>(),
 	},
 	(t) => ({
 		hostUnique: uniqueIndex('servers_host_unique').on(sql`lower(${t.host})`),

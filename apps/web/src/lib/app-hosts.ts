@@ -89,6 +89,33 @@ export function firstLiveHostByRepo(
 }
 
 /**
+ * Traefik retry middleware on every router powder renders (`<name>-retry`, last in the
+ * router's middleware chain so it wraps only the call to the service). Traefik re-sends
+ * a request only while it has not reached a backend: the middleware turns retries off
+ * as soon as the request headers are written to the backend connection (httptrace
+ * WroteHeaders / WroteRequest, traefik v3 pkg/middlewares/retry). So it retries a
+ * refused connection, no route to host and a dial timeout, and never re-sends a
+ * request, a POST included, that a backend may have received: a reset or a timeout
+ * after the request was written still answers 502. In a deploy swap that covers the
+ * old container's refused port and vanished IP while the docker provider still lists
+ * it: those failures all happen before the request is written.
+ * Each attempt goes through the load balancer again, so it lands on the bridge or the
+ * new container. Backoff starts at 100 ms and stays under 200 ms.
+ */
+export const TRAEFIK_RETRY_ATTEMPTS = 10
+
+export function traefikRetryLabels(name: string): { middleware: string; labels: string[] } {
+	const middleware = `${name}-retry`
+	return {
+		middleware,
+		labels: [
+			`traefik.http.middlewares.${middleware}.retry.attempts=${TRAEFIK_RETRY_ATTEMPTS}`,
+			`traefik.http.middlewares.${middleware}.retry.initialinterval=100ms`,
+		],
+	}
+}
+
+/**
  * Path Traefik's service health check should probe: the path of the app's
  * health_url (scheme, host and query dropped), else '/'. Must start with '/'.
  */

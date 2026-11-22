@@ -65,6 +65,9 @@ services:
         # Secret part of powder's own BuildKit cache ids (docker/web.Dockerfile);
         # the self-deploy paths export it from /opt/apps/.powder-build-cache-id.
         POWDER_BUILD_CACHE_ID: ${POWDER_BUILD_CACHE_ID:-}
+        # ISO week (2026-W47): refreshes the image's apt-get upgrade layers weekly.
+        # The self-deploy paths export it (OS_PATCH_WEEK_SH in apps/web/src/lib/build-cache.ts).
+        OS_PATCH_WEEK: ${OS_PATCH_WEEK:-}
     container_name: powder
     restart: unless-stopped
     env_file: ${POWDER_ENV_FILE:-/opt/apps/powder.env}
@@ -142,6 +145,9 @@ services:
         # Secret part of powder's own BuildKit cache ids (docker/web.Dockerfile);
         # the self-deploy paths export it from /opt/apps/.powder-build-cache-id.
         POWDER_BUILD_CACHE_ID: ${POWDER_BUILD_CACHE_ID:-}
+        # ISO week (2026-W47): refreshes the image's apt-get upgrade layers weekly.
+        # The self-deploy paths export it (OS_PATCH_WEEK_SH in apps/web/src/lib/build-cache.ts).
+        OS_PATCH_WEEK: ${OS_PATCH_WEEK:-}
     container_name: powder-worker
     restart: unless-stopped
     env_file: ${POWDER_ENV_FILE:-/opt/apps/powder.env}

@@ -33,19 +33,36 @@ vi.mock('@/lib/integrations', () => ({
 vi.mock('@/lib/github-ci', () => ({
 	parseGitHubRepo: () => ({ owner: 'zorbco', repo: 'zorbweb' }),
 	listRunsForRepo: async () => [],
+	listWorkflowsForRepo: async () => [],
+	getCommitBySha: async () => null,
 	getRunFailureTail: async () => '',
 }))
 vi.mock('@/lib/db', () => ({
 	domainRedirects: { serverId: 'domain_redirects.server_id', ownerUserId: 'domain_redirects.owner_user_id' },
 	inArray: (col: unknown, vals: unknown) => ({ inArray: [col, vals] }),
+	// the ci tab's deploy checks: query helpers and the deploys columns
+	sql: () => ({}),
+	and: (...a: unknown[]) => ({ and: a }),
+	eq: (col: unknown, v: unknown) => ({ eq: [col, v] }),
+	desc: (col: unknown) => ({ desc: col }),
+	gte: (col: unknown, v: unknown) => ({ gte: [col, v] }),
+	isNotNull: (col: unknown) => ({ isNotNull: col }),
+	deploys: { serverId: 'deploys.server_id', containerName: 'deploys.container_name', kind: 'deploys.kind', status: 'deploys.status', startedAt: 'deploys.started_at' },
 	db: {
 		select: () => ({
-			from: () => ({
-				where: async (w: unknown) => {
+			from: (table: { serverId?: unknown }) => ({
+				where: (w: unknown) => {
+					// deploys: no rows; the chain goes on with orderBy/limit/groupBy
+					if (table?.serverId === 'deploys.server_id') {
+						return Object.assign(Promise.resolve([]), {
+							orderBy: () => ({ limit: async () => [] }),
+							groupBy: async () => [],
+						})
+					}
 					h.redirectWhere.push(w)
-					return [
+					return Promise.resolve([
 						{ serverId: 'boxa', containerName: 'zorbweb', hostname: 'zorb.example', ownerUserId: 'gone_user', wwwMode: 'apex', customRedirectsJson: '[]', appliedAt: null, appliedError: null },
-					]
+					])
 				},
 			}),
 		}),

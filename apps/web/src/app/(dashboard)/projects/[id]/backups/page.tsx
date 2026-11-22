@@ -3,6 +3,7 @@
 import { SkeletonList } from '@/components/ui/skeleton'
 import { EmptyState } from '@/components/ui/empty-state'
 import { buttonVariants } from '@/components/ui/button-variants'
+import { CopyButton } from '@/components/ui/copy-button'
 import Link from 'next/link'
 // Backups tab: consumes /api/projects/[id]/backups GET (list) + POST (trigger).
 // The list shows when each backup ran, its size, and any errors. The trigger
@@ -285,7 +286,7 @@ export default function BackupsPage() {
 											? 'bg-destructive'
 											: 'bg-warning animate-pulse'
 								return (
-									<tr key={b.id} className="border-b border-border last:border-0">
+									<tr key={b.id} className="group border-b border-border last:border-0">
 										<td className="px-4 py-2 text-muted-foreground">{timeAgo(b.startedAt)}</td>
 										<td className="px-4 py-2">
 											<div className="flex items-center gap-1.5">
@@ -294,10 +295,19 @@ export default function BackupsPage() {
 													aria-hidden
 												/>
 												<span className="font-mono text-xs">{b.status}</span>
+												{/* beside the short status, not after the truncated error: a wide error would push it out of a phone-width table */}
+												{b.error && (
+													<CopyButton
+														value={b.error}
+														label="copy the error"
+														reveal
+														className="-my-1"
+													/>
+												)}
 											</div>
 											{b.error && (
 												<div
-													className="mt-0.5 truncate text-xs text-destructive/80 max-w-md"
+													className="ph-no-capture mt-0.5 max-w-md truncate text-xs text-destructive/80"
 													title={b.error}
 												>
 													{b.error}

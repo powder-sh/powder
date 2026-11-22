@@ -7,6 +7,7 @@
 // the command that authorizes powder's key on the server.
 
 import { Button } from '@/components/ui/button'
+import { CopyButton } from '@/components/ui/copy-button'
 import { authorizeCommand, fetchPowderPubkey } from '@/lib/authorize-command'
 import { cn } from '@/lib/cn'
 import { Check, KeyRound, RefreshCw, ServerOff } from 'lucide-react'
@@ -75,12 +76,15 @@ export function ServerUnreachable({
 							: `powder could not connect over SSH, so ${what} is unknown. the apps may still be serving.`}
 					</p>
 					{error && (
-						<p
-							className="ph-no-capture line-clamp-2 font-mono text-2xs text-muted-foreground [overflow-wrap:anywhere]"
-							title={error}
-						>
-							{error}
-						</p>
+						<div className="flex items-start gap-1">
+							<p
+								className="ph-no-capture line-clamp-2 min-w-0 flex-1 font-mono text-2xs text-muted-foreground [overflow-wrap:anywhere]"
+								title={error}
+							>
+								{error}
+							</p>
+							<CopyButton value={error} label="copy the error" className="-mt-0.5" />
+						</div>
 					)}
 				</div>
 			</div>

@@ -1,15 +1,14 @@
 'use client'
 
+import { remoteState } from '@/lib/git-remote-state'
 import { Alert } from '@/components/ui/alert'
 import { StatusDot } from '@/components/ui/status'
 import { ChevronLeft } from 'lucide-react'
 import { SkeletonList } from '@/components/ui/skeleton'
-import { use, useEffect, useRef, useState } from 'react'
+import { use, useEffect, useId, useRef, useState } from 'react'
 import Link from 'next/link'
 import { ServerUnreachable } from '@/components/server-unreachable'
 import {
-	Check,
-	Copy,
 	Eye,
 	EyeOff,
 	GitBranch,
@@ -22,6 +21,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import { CopyButton } from '@/components/ui/copy-button'
 import { Input, Textarea } from '@/components/ui/input'
 import { useToast } from '@/components/ui/toast'
 import { RepoCard } from '@/components/repo-card'
@@ -105,6 +105,10 @@ interface GitStatus {
 	currentSha?: string | null
 	upstreamSha?: string | null
 	dirty?: boolean
+	checkout?: 'src' | 'workdir' | 'none' | 'src-link' | 'unknown'
+	checkoutDir?: string | null
+	staleWorkdirGit?: boolean
+	upstreamError?: string | null
 }
 
 type Entry = { key: string; value: string; id: number }
@@ -637,6 +641,17 @@ export default function ContainerPage({
 									<Badge variant="destructive">failed</Badge>
 								)}
 							</div>
+							{(liveDeploy.error || liveDeploy.lines.length > 0) && (
+								<CopyButton
+									value={() =>
+										[liveDeploy.error, liveDeploy.lines.join('\n')].filter(Boolean).join('\n\n')
+									}
+									label="copy the deploy output"
+									text="copy"
+									size="sm"
+									className="ml-auto"
+								/>
+							)}
 							<Button
 								variant="ghost"
 								size="sm"
@@ -1165,22 +1180,49 @@ function GitInline({ status }: { status: GitStatus | null }) {
 				git deploy not available: {status.reason ?? 'no compose working dir'}.
 			</p>
 		)
-	if (!status.isRepo)
+	if (!status.isRepo) {
+		if (status.checkout === 'src-link')
+			return (
+				<p className="mt-2 text-xs text-muted-foreground">
+					<span className="font-mono">src</span> in{' '}
+					<span className="font-mono">{status.workingDir}</span> is a symlink · deploys refuse it
+				</p>
+			)
+		if (status.checkout === 'unknown' || (status.checkout !== 'none' && status.checkoutDir))
+			return (
+				<p className="mt-2 text-xs text-muted-foreground">
+					could not read the git checkout in{' '}
+					<span className="font-mono">{status.checkoutDir ?? status.workingDir}</span>
+				</p>
+			)
 		return (
 			<p className="mt-2 text-xs text-muted-foreground">
 				not git-tracked · deploys will rebuild from{' '}
 				<span className="font-mono">{status.workingDir}</span>
 			</p>
 		)
-	const ahead = status.upstreamSha && status.currentSha && status.upstreamSha !== status.currentSha
+	}
+	const remote = remoteState(status)
 	return (
 		<p className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
 			<GitBranch className="h-3 w-3" />
 			<span className="font-mono">{status.branch ?? '-'}</span>
 			<span>·</span>
 			<span className="font-mono">{(status.currentSha ?? '').slice(0, 7) || '-'}</span>
-			{ahead && <Badge variant="warning">remote has new commits</Badge>}
+			{remote.kind === 'ahead' && <Badge variant="warning">remote has new commits</Badge>}
+			{remote.kind === 'unchecked' && (
+				<Badge variant="outline" title={remote.reason}>
+					could not check the remote
+				</Badge>
+			)}
+			{remote.kind === 'unchecked' && <span className="break-all">{remote.reason}</span>}
 			{status.dirty && <Badge variant="outline">dirty working tree</Badge>}
+			{status.checkoutDir && <span className="font-mono">{status.checkoutDir}</span>}
+			{status.staleWorkdirGit && (
+				<span title="an older layout's .git in the working dir; deploys and this view use src/">
+					· old .git in the working dir ignored
+				</span>
+			)}
 		</p>
 	)
 }
@@ -1356,29 +1398,20 @@ function SnapshotButton({
 }
 
 function DeployOutputBlock({ error, output }: { error: string | null; output: string | null }) {
-	const [copied, setCopied] = useState(false)
 	const text = `${error ? `ERROR: ${error}\n\n` : ''}${output ?? ''}`
-	async function copy() {
-		try {
-			await navigator.clipboard.writeText(text)
-			setCopied(true)
-			setTimeout(() => setCopied(false), 1500)
-		} catch {
-			// clipboard blocked: ignore
-		}
-	}
+	const id = useId()
 	return (
 		<div className="relative mt-2">
-			<button
-				type="button"
-				onClick={copy}
-				className="absolute right-2 top-2 rounded-md border border-border bg-background/80 p-1 text-muted-foreground hover:text-foreground"
-				title={copied ? 'copied' : 'copy'}
-				aria-label={copied ? 'copied' : 'copy output'}
+			<CopyButton
+				value={text}
+				label="copy output"
+				targetId={id}
+				className="absolute right-1.5 top-1.5 bg-background/80"
+			/>
+			<pre
+				id={id}
+				className="ph-no-capture max-h-72 overflow-auto rounded-md bg-muted/40 p-3 pr-10 font-mono text-2xs leading-relaxed"
 			>
-				{copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
-			</button>
-			<pre className="ph-no-capture max-h-72 overflow-auto rounded-md bg-muted/40 p-3 pr-10 font-mono text-2xs leading-relaxed">
 				{text}
 			</pre>
 		</div>

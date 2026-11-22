@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const state: { rows: unknown[]; parent: boolean; deleting: boolean; deleted: string[]; inserted: number; onRebuild: (() => void) | null } = {
+const state: { rows: unknown[]; apps: string[]; parent: boolean; deleting: boolean; deleted: string[]; inserted: number; onRebuild: (() => void) | null } = {
 	rows: [],
+	apps: [],
 	parent: true,
 	deleting: false,
 	deleted: [],
@@ -28,7 +29,17 @@ vi.mock('../db', () => ({
 				Object.assign(Promise.resolve([] as unknown[]), {
 					where: () =>
 						Promise.resolve(
-							t.t === 'app_repos' && cols && 'id' in cols ? (state.parent ? [{ id: 'r1' }] : []) : state.rows,
+							t.t === 'app_repos' && !cols
+								? state.parent
+									? [{ id: 'r1', serverId: 's1', containerName: 'shop' }]
+									: []
+								: t.t === 'app_repos' && cols && 'id' in cols
+								? state.parent
+									? [{ id: 'r1' }]
+									: []
+								: t.t === 'app_repos'
+									? state.apps.map((n) => ({ n, containerName: n }))
+									: state.rows,
 						),
 				}),
 		}),
@@ -59,6 +70,7 @@ vi.mock('../ssh', () => ({
 }))
 
 import { PreviewParentGoneError, previewSkipReason, previewTeardownShell, spinOrRedeployPreview, tearDownPreview } from '../preview-deploys'
+import { CloneError } from '../ssh/git'
 
 const repo = { id: 'r1', serverId: 's1', containerName: 'shop', repoUrl: 'git@github.com:o/r.git', healthUrl: null } as never
 const existing = (status: string) => ({
@@ -68,6 +80,7 @@ const existing = (status: string) => ({
 
 beforeEach(() => {
 	state.parent = true
+	state.apps = []
 	state.deleting = false
 	state.deleted = []
 	state.inserted = 0
@@ -152,7 +165,7 @@ describe('preview teardown by label, never compose down', () => {
 		state.rows = [existing('running')]
 		await tearDownPreview('pv1')
 		const cmds = runCommand.mock.calls.map((c) => String(c[1]))
-		expect(cmds.some((c) => c.includes('label=com.docker.compose.project=pv-shop-feature') && c.includes(`${RM} '/opt/apps/pv-shop-feature'`))).toBe(true)
+		expect(cmds.some((c) => c.includes('label=com.docker.compose.project=pv-shop-feature') && c.includes(`${RM} -- '/opt/apps/pv-shop-feature'`))).toBe(true)
 		expect(cmds.some((c) => /docker compose/.test(c))).toBe(false)
 	})
 
@@ -161,7 +174,7 @@ describe('preview teardown by label, never compose down', () => {
 		rebuildDeploy.mockRejectedValue(new Error('compose guard: refused'))
 		await expect(spinOrRedeployPreview(repo, 'feature')).rejects.toThrow('refused')
 		const wd = String(gitCloneRepo.mock.calls[0]?.[1])
-		expect(runCommand.mock.calls.some((c) => String(c[1]).includes(`${RM} '${wd}'`))).toBe(true)
+		expect(runCommand.mock.calls.some((c) => String(c[1]).includes(`${RM} -- '${wd}'`))).toBe(true)
 	})
 
 	it('a failed redeploy of a running preview keeps its checkout', async () => {
@@ -213,7 +226,7 @@ describe('a preview never outlives its app', () => {
 		await expect(spinOrRedeployPreview(repo, 'feature')).rejects.toBeInstanceOf(PreviewParentGoneError)
 		const cmds = runCommand.mock.calls.map((c) => String(c[1]))
 		const wd = String(gitCloneRepo.mock.calls[0]?.[1])
-		expect(cmds.some((c) => c.includes('label=com.docker.compose.project=pv-shop-') && c.includes(`${RM} '${wd}'`))).toBe(true)
+		expect(cmds.some((c) => c.includes('label=com.docker.compose.project=pv-shop-') && c.includes(`${RM} -- '${wd}'`))).toBe(true)
 		expect(state.deleted).toEqual(['preview_deploys'])
 	})
 	it('a delete started while a redeploy built: the running preview is removed too', async () => {
@@ -223,7 +236,105 @@ describe('a preview never outlives its app', () => {
 		}
 		await expect(spinOrRedeployPreview(repo, 'feature')).rejects.toThrow(/is being deleted/)
 		const cmds = runCommand.mock.calls.map((c) => String(c[1]))
-		expect(cmds.some((c) => c.includes('label=com.docker.compose.project=pv-shop-feature') && c.includes(`${RM} '/opt/apps/pv-shop-feature'`))).toBe(true)
+		expect(cmds.some((c) => c.includes('label=com.docker.compose.project=pv-shop-feature') && c.includes(`${RM} -- '/opt/apps/pv-shop-feature'`))).toBe(true)
 		expect(state.deleted).toEqual(['preview_deploys'])
+	})
+})
+
+describe('a failed preview row and a later app of the same name', () => {
+	const RM = 'rm -' + 'rf'
+	const failedOldStyle = { ...existing('failed'), containerName: 'shop-feature', workingDir: '/opt/apps/shop-feature' }
+	const failedPv = { ...existing('failed'), containerName: 'pv-legacy-x', workingDir: '/opt/apps/pv-legacy-x' }
+	const cmds = () => runCommand.mock.calls.map((c) => String(c[1]))
+	// nothing that removes a dir or a container ran
+	const noCleanup = () => {
+		expect(cmds().some((c) => c.includes(RM))).toBe(false)
+		expect(cmds().some((c) => c.includes('docker rm'))).toBe(false)
+	}
+
+	it('an app registered at the name since: the spin fails and says what to do, nothing cloned or removed', async () => {
+		state.rows = [failedOldStyle]
+		state.apps = ['shop', 'shop-feature']
+		await expect(spinOrRedeployPreview(repo, 'feature')).rejects.toThrow(
+			/is now an app's name; the preview was not set up again and nothing on the server was touched\. Delete this preview in powder: its teardown leaves \/opt\/apps\/shop-feature \(the app's\) in place, nothing else to do\./,
+		)
+		expect(gitCloneRepo).not.toHaveBeenCalled()
+		expect(writeFileSecret).not.toHaveBeenCalled()
+		noCleanup()
+	})
+
+	it.each([
+		['an old-style name', failedOldStyle, '/opt/apps/shop-feature'],
+		['a pv- name', failedPv, '/opt/apps/pv-legacy-x'],
+	])("a dir that is not this preview's clone (%s): refused, no cleanup at all", async (_n, row, wd) => {
+		state.rows = [row]
+		runCommand.mockImplementation(async (_s: unknown, cmd: string) => ({
+			code: 0,
+			stdout: cmd.includes('echo foreign') ? 'foreign' : 'ok',
+			stderr: '',
+		}))
+		await expect(spinOrRedeployPreview(repo, 'feature')).rejects.toThrow(
+			new RegExp(`${wd.replace(/\//g, '\\/')} exists on the server and is not this preview's own clone; the preview was not set up again and .* was not touched\\. If nothing needs .*, move it away by hand on the server and push the branch again`),
+		)
+		expect(gitCloneRepo).not.toHaveBeenCalled()
+		noCleanup()
+	})
+
+	it('a refused clone under a pv- name: the spin fails with its reason and removes nothing', async () => {
+		state.rows = [failedPv]
+		gitCloneRepo.mockRejectedValue(new CloneError('clone refused: /opt/apps/pv-legacy-x already exists and powder cannot prove it cloned it for preview:pv1; nothing was changed', true, false, null))
+		await expect(spinOrRedeployPreview(repo, 'feature')).rejects.toThrow(/clone refused: .* cannot prove/)
+		noCleanup()
+	})
+
+	it('a clone that failed before it was placed (network, link check) removes nothing', async () => {
+		state.rows = []
+		gitCloneRepo.mockRejectedValue(new CloneError('fatal: could not read from remote', false, false, null))
+		await expect(spinOrRedeployPreview(repo, 'feature')).rejects.toThrow(/could not read/)
+		noCleanup()
+	})
+
+	it('a clone that was placed and then failed: the cleanup removes only by the row marker', async () => {
+		state.rows = []
+		gitCloneRepo.mockRejectedValue(new CloneError('clone refused: the repo tracks hostile symlink(s) (removed)', false, true, null))
+		await expect(spinOrRedeployPreview(repo, 'feature')).rejects.toThrow(/hostile/)
+		const cleanup = cmds().filter((c) => c.includes(RM))
+		expect(cleanup).toHaveLength(1)
+		expect(cleanup[0]).toContain("'powder-clone-target v1 preview:pv_new'")
+		expect(cleanup[0]).not.toContain('docker ps -a --format') // no pre-marker rule
+	})
+
+	it("a legitimate re-spin of the preview's own dir clones with the row's purpose", async () => {
+		state.rows = [existing('failed')]
+		await spinOrRedeployPreview(repo, 'feature')
+		const check = cmds().find((c) => c.includes('echo foreign'))
+		expect(check).toContain("'powder-clone-target v1 preview:pv1'")
+		expect(gitCloneRepo).toHaveBeenCalledTimes(1)
+		expect(gitCloneRepo.mock.calls[0]?.[1]).toBe('/opt/apps/pv-shop-feature')
+		expect(gitCloneRepo.mock.calls[0]?.[5]).toBe('preview:pv1')
+	})
+
+	it('a new preview clones with its new row id as the purpose', async () => {
+		state.rows = []
+		await spinOrRedeployPreview(repo, 'feature')
+		expect(gitCloneRepo.mock.calls[0]?.[5]).toBe('preview:pv_new')
+	})
+
+	it("teardown removes only by the row marker (no other rule), and says when it left the dir", async () => {
+		state.rows = [existing('running')]
+		runCommand.mockImplementation(async (_s: unknown, cmd: string, _t?: number, _c?: unknown, opts?: { stdin?: string }) => {
+			// answer the removal script with its own "left" status line (nonce on stdin)
+			const nonce = cmd.includes('__PV_') ? opts?.stdin?.trim() : undefined
+			return { code: 0, stdout: nonce ? `__PV_${nonce}__ dir=left containers=0\n` : 'ok', stderr: '' }
+		})
+		const r = await tearDownPreview('pv1')
+		expect(r.note).toBe('left /opt/apps/pv-shop-feature in place: powder cannot prove it created it; remove it by hand if it is not needed')
+		const removal = cmds().find((c) => c.includes(RM)) ?? ''
+		expect(removal).not.toContain('docker ps -a --format')
+		expect(removal).toContain("'powder-clone-target v1 preview:pv1'")
+		// the container teardown sits inside the marker branch
+		expect(removal.indexOf('docker rm')).toBeGreaterThan(removal.indexOf("'powder-clone-target v1 preview:pv1'"))
+		// the env file goes only after a proven removal
+		expect(cmds().some((c) => c.startsWith('rm -f ') && c.includes('.env'))).toBe(false)
 	})
 })

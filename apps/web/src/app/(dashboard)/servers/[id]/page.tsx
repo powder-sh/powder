@@ -12,6 +12,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import { CopyButton } from '@/components/ui/copy-button'
 import { Field, Input, Select } from '@/components/ui/input'
 import { PageHeader } from '@/components/ui/page-header'
 import { SkeletonList } from '@/components/ui/skeleton'
@@ -582,7 +583,8 @@ function BootstrapCard({
 	const replaceSteps = allSteps.filter((s) => s.replaces)
 
 	return (
-		<Card>
+		// id server-check: the setup checklist links to this card for a failed check
+		<Card id="server-check">
 			<CardHeader>
 				<div className="flex flex-wrap items-center justify-between gap-2">
 					<CardTitle>server check</CardTitle>
@@ -650,9 +652,21 @@ function BootstrapCard({
 						<p className="text-xs font-medium">last fix run</p>
 						{results.map((r) => (
 							<div key={r.id} className="space-y-1">
-								<StatusLabel tone={r.ok ? 'success' : 'destructive'}>{r.title}</StatusLabel>
+								<div className="flex items-center justify-between gap-2">
+									<StatusLabel tone={r.ok ? 'success' : 'destructive'}>{r.title}</StatusLabel>
+									{r.output && (
+										<CopyButton
+											value={r.output}
+											label={`copy the output of ${r.title}`}
+											targetId={`fix-output-${r.id}`}
+										/>
+									)}
+								</div>
 								{r.output && (
-									<pre className="ph-no-capture max-h-48 overflow-auto rounded-md bg-muted px-2 py-1.5 font-mono text-2xs">
+									<pre
+										id={`fix-output-${r.id}`}
+										className="ph-no-capture max-h-48 overflow-auto rounded-md bg-muted px-2 py-1.5 font-mono text-2xs"
+									>
 										{r.output}
 									</pre>
 								)}

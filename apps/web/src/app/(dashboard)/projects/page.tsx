@@ -1,7 +1,7 @@
 'use client'
 
 // Apps: the dashboard home. One table, one row per app. Status, counters,
-// filters and sorting come from lib/apps-table.ts (unit-tested). Deploy and
+// filters and sorting come from lib/apps-table.ts (unit-tested). Redeploy and
 // Restart call the existing routes, which keep their own auth checks.
 
 import { SetupChecklistCard } from '@/components/setup-checklist-card'
@@ -26,6 +26,7 @@ import {
 	filterApps,
 	fleetHeartbeat,
 	parseStatusFilter,
+	redeployHint,
 	shortSha,
 	sortApps,
 } from '@/lib/apps-table'
@@ -34,7 +35,9 @@ import { cn } from '@/lib/cn'
 import { deployStatus } from '@/lib/deploy-status'
 import { emptyDays, sumDeployDays } from '@/lib/deploy-days'
 import { timeAgoDays } from '@/lib/format'
-import { Activity, Box, KeyRound, Plus, RotateCw, Search, Upload } from 'lucide-react'
+import { tileBorders, tileLayout } from '@/lib/status-tiles'
+import { useHint } from '@/components/ui/tooltip'
+import { Activity, Box, KeyRound, Plus, RefreshCw, RotateCw, Search } from 'lucide-react'
 import Link from 'next/link'
 import { usePathname, useRouter, useSearchParams } from 'next/navigation'
 import { Suspense, useCallback, useEffect, useMemo, useState } from 'react'
@@ -110,11 +113,11 @@ function Apps() {
 		[apps, status, server, q],
 	)
 
-	async function act(app: AppRow, kind: 'deploy' | 'restart') {
+	async function act(app: AppRow, kind: 'redeploy' | 'restart') {
 		setBusy(`${app.id}:${kind}`)
 		try {
 			const url =
-				kind === 'deploy'
+				kind === 'redeploy'
 					? `/api/projects/${app.id}/redeploy`
 					: `/api/servers/${encodeURIComponent(app.serverId)}/containers/${encodeURIComponent(app.containerName)}/restart`
 			const res = await fetch(url, { method: 'POST' })
@@ -123,8 +126,8 @@ function Apps() {
 				toast.error(`${kind} failed: ${err.error ?? res.status}`)
 			} else {
 				toast.success(
-					kind === 'deploy'
-						? `deploy started: ${app.containerName}`
+					kind === 'redeploy'
+						? `redeploy started: ${app.containerName}`
 						: `restarted ${app.containerName}`,
 				)
 			}
@@ -238,7 +241,7 @@ function Apps() {
 										key={a.id}
 										app={a}
 										busy={busy}
-										onDeploy={() => act(a, 'deploy')}
+										onRedeploy={() => act(a, 'redeploy')}
 										onRestart={() => setRestartApp(a)}
 									/>
 								))}
@@ -265,7 +268,7 @@ function Apps() {
 												key={a.id}
 												app={a}
 												busy={busy}
-												onDeploy={() => act(a, 'deploy')}
+												onRedeploy={() => act(a, 'redeploy')}
 												onRestart={() => setRestartApp(a)}
 											/>
 										))}
@@ -315,11 +318,15 @@ function FleetSummary({
 		>
 			<nav
 				aria-label="filter apps by state"
-				className="grid grid-cols-5 divide-x divide-border border-b border-border lg:border-b-0 lg:border-r"
+				className={cn(
+					'grid border-b border-border lg:border-b-0 lg:border-r',
+					tileLayout(APP_STATES.length).grid,
+				)}
 			>
-				{APP_STATES.map((s) => (
+				{APP_STATES.map((s, i) => (
 					<Counter
 						key={s}
+						className={tileBorders(APP_STATES.length, i)}
 						state={s}
 						n={counters[s]}
 						href={hrefFor(status === s ? 'all' : s)}
@@ -358,7 +365,7 @@ function FleetSummary({
 	)
 }
 
-function Counter(props: { state: AppState; n: number; href: string; active: boolean }) {
+function Counter(props: { state: AppState; n: number; href: string; active: boolean; className?: string }) {
 	const m = APP_STATE[props.state]
 	return (
 		<Link
@@ -369,6 +376,7 @@ function Counter(props: { state: AppState; n: number; href: string; active: bool
 				'relative flex min-w-0 flex-col justify-center px-2.5 py-2.5 transition-colors hover:bg-accent/40 sm:px-4 sm:py-3 lg:min-w-26',
 				props.active && 'bg-accent/70',
 				props.n === 0 && !props.active && 'text-muted-foreground',
+				props.className,
 			)}
 		>
 			<span
@@ -422,14 +430,17 @@ function LastDeploy({ app }: { app: AppRow }) {
 function RowActions(props: {
 	app: AppRow
 	busy: string | null
-	onDeploy: () => void
+	onRedeploy: () => void
 	onRestart: () => void
 	className?: string
 }) {
 	const a = props.app
 	const s = deriveStatus(a)
 	const rowBusy = props.busy?.startsWith(`${a.id}:`) ?? false
-	const deploying = props.busy === `${a.id}:deploy`
+	const deploying = props.busy === `${a.id}:redeploy`
+	const redeployTip = useHint(redeployHint(a.branch, appRowHealth(a) === 'not_deployed'))
+	const restartHint = useHint('restart the running container. no pull, no rebuild.')
+	const envHint = useHint('environment variables. changes apply on the next deploy.')
 	return (
 		<div className={cn('flex items-center gap-1.5', props.className)}>
 			<Button
@@ -437,26 +448,31 @@ function RowActions(props: {
 				variant="outline"
 				disabled={rowBusy || s === 'deploying'}
 				loading={deploying}
-				onClick={props.onDeploy}
-				aria-label={`deploy ${a.containerName}`}
+				onClick={props.onRedeploy}
+				aria-label={`redeploy ${a.containerName}`}
+				{...redeployTip.props}
 			>
-				{!deploying && <Upload className="h-3.5 w-3.5" />}
-				deploy
+				{!deploying && <RefreshCw className="h-3.5 w-3.5" />}
+				redeploy
 			</Button>
+			{redeployTip.tooltip}
 			<Button
 				size="sm"
 				variant="ghost"
 				disabled={rowBusy || s === 'deploying'}
 				onClick={props.onRestart}
 				aria-label={`restart ${a.containerName}`}
+				{...restartHint.props}
 			>
 				<RotateCw className="h-3.5 w-3.5" />
 				restart
 			</Button>
+			{restartHint.tooltip}
 			<Link
 				href={`/projects/${a.id}/env`}
 				aria-label={`env vars for ${a.containerName}`}
 				className={buttonVariants({ variant: 'ghost', size: 'sm' })}
+				{...envHint.props}
 			>
 				<KeyRound className="h-3.5 w-3.5" />
 				env
@@ -464,21 +480,30 @@ function RowActions(props: {
 					<span className="tabular-nums text-muted-foreground">{a.envCount}</span>
 				)}
 			</Link>
+			{envHint.tooltip}
 		</div>
 	)
 }
 
 // Last two weeks of deploys under the name; nothing when there were none.
-function RowStrip({ app, className }: { app: AppRow; className?: string }) {
+function RowStrip({
+	app,
+	className,
+	inLink = false,
+}: {
+	app: AppRow
+	className?: string
+	inLink?: boolean
+}) {
 	const days = (app.deployDays ?? emptyDays()).slice(-ROW_DAYS)
 	if (stripEmpty(days)) return null
-	return <DeployStrip days={days} className={className} />
+	return <DeployStrip days={days} className={className} focusable={!inLink} />
 }
 
 function Row(props: {
 	app: AppRow
 	busy: string | null
-	onDeploy: () => void
+	onRedeploy: () => void
 	onRestart: () => void
 }) {
 	const a = props.app
@@ -511,7 +536,7 @@ function Row(props: {
 function MobileRow(props: {
 	app: AppRow
 	busy: string | null
-	onDeploy: () => void
+	onRedeploy: () => void
 	onRestart: () => void
 }) {
 	const a = props.app
@@ -530,7 +555,7 @@ function MobileRow(props: {
 				<div className="mt-2">
 					<LastDeploy app={a} />
 				</div>
-				<RowStrip app={a} className="mt-2.5 [&>span]:flex-1" />
+				<RowStrip app={a} className="mt-2.5 [&>span]:flex-1" inLink />
 			</Link>
 			<div className="border-t border-border px-2 py-1.5">
 				<RowActions {...props} />

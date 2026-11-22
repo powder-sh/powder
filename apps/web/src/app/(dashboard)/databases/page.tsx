@@ -5,6 +5,7 @@ import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { Check, Copy, Database, Eye, EyeOff, RefreshCw } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
+import { CopyButton } from '@/components/ui/copy-button'
 import { Button } from '@/components/ui/button'
 
 interface DbRow {
@@ -148,7 +149,7 @@ function Header({ count }: { count?: number }) {
 
 function DbRow({ row, getFull }: { row: DbRow; getFull: () => Promise<string | null> }) {
 	return (
-		<div className="grid grid-cols-12 gap-3 border-b border-border px-4 py-3 text-sm last:border-b-0">
+		<div className="group grid grid-cols-12 gap-3 border-b border-border px-4 py-3 text-sm last:border-b-0">
 			<div className="col-span-3 min-w-0">
 				<Link
 					href={`/servers/${row.serverId}/${row.containerName}`}
@@ -187,7 +188,12 @@ function DbRow({ row, getFull }: { row: DbRow; getFull: () => Promise<string | n
 			</div>
 			<div className="col-span-4 min-w-0">
 				{row.error ? (
-					<span className="text-2xs text-destructive">{row.error}</span>
+					<span className="flex items-start gap-1">
+						<span className="ph-no-capture min-w-0 text-2xs text-destructive [overflow-wrap:anywhere]">
+							{row.error}
+						</span>
+						<CopyButton value={row.error} label="copy the error" reveal className="-my-1" />
+					</span>
 				) : row.connectionString ? (
 					<UrlField
 						url={row.connectionString}

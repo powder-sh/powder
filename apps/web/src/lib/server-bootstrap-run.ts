@@ -8,6 +8,8 @@ import {
 	checkFileProviderFromInspect,
 	fileProviderFromYml,
 } from './domain-redirects'
+import { type InspectJson, traefikNetworkFlag, traefikNetworkFrom } from './traefik-network'
+import { readTraefikConfig, rememberTraefikNetwork } from './traefik-network-run'
 import {
 	type BootstrapFacts,
 	type BootstrapPlan,
@@ -16,13 +18,20 @@ import {
 	type StepId,
 	checkItems,
 	isCheckGreen,
+	missingPieces,
 	parseCheckOutput,
 	planApply,
 	renderCheckScript,
 } from './server-bootstrap'
 import { HELPER_BIN_DIR, PER_SERVER_HELPERS } from './server-bootstrap'
 import { shippedHelper, shippedHelperShas } from './server-helpers'
-import { type ServerConfig, type ServerRecord, saveServerCheck } from './servers'
+import {
+	type MissingPiece,
+	type ServerConfig,
+	type ServerRecord,
+	saveServerCheck,
+	serverRedirectsInUse,
+} from './servers'
 import { shq } from './shell'
 import { runCommand, writeFileViaSftp } from './ssh'
 
@@ -35,6 +44,9 @@ export interface BootstrapCheckResult {
 	items: CheckItem[]
 	green: boolean
 	plan: BootstrapPlan
+	/** A domain redirect is set up on this server (redirectRowInUse), so the Traefik
+	 *  file provider and its folder are required. */
+	redirectsInUse: boolean
 }
 
 export interface BootstrapStepResult {
@@ -50,15 +62,54 @@ function cache(): Map<string, BootstrapCheckResult> {
 	return g.__powderBootstrapCache
 }
 
-/** Green/red of the last check for the server's current proxy: the in-process
- *  result, else the persisted one (survives restarts). null = never checked. */
+// What a red Traefik-server result named before the check followed the server's real
+// Traefik setup: `web` required whatever Traefik routes over, and the file provider
+// and its folder required whether or not a domain redirect uses them. The current
+// check never names network-web as missing, and words the other two differently.
+const OLDER_RULE_DETAILS = new Set([
+	'missing: powder writes the Traefik rules for domain redirects here',
+])
+function namedUnderOlderRule(m: MissingPiece): boolean {
+	return (
+		m.id === 'network-web' ||
+		OLDER_RULE_DETAILS.has(m.detail) ||
+		(m.id === 'traefik-file-provider' && m.detail.startsWith('no watched file provider on '))
+	)
+}
+
+/** A persisted result that can still be shown: same proxy, and either green or
+ *  saved with its missing pieces. A red result saved without them (before 0068), or
+ *  one that names a piece only an older, stricter rule required (namedUnderOlderRule),
+ *  counts as not checked: it is re-checked on the next sync. */
+function usableStoredCheck(
+	server: Pick<ServerRecord, 'proxy' | 'lastCheck'>,
+): ServerRecord['lastCheck'] {
+	const proxy: BootstrapProxy = server.proxy ?? 'nginx'
+	const last = server.lastCheck
+	if (!last || last.proxy !== proxy) return null
+	if (last.green) return last
+	if (last.missing === null || last.missing.some(namedUnderOlderRule)) return null
+	return last
+}
+
+/** The last check for the server's current proxy: the in-process result, else
+ *  the persisted one (survives restarts). null = never checked (or only a stale
+ *  red result from before 0068, see usableStoredCheck). */
+export function lastCheckResult(
+	server: Pick<ServerRecord, 'id' | 'proxy' | 'lastCheck'>,
+): { green: boolean; missing: MissingPiece[] } | null {
+	const proxy: BootstrapProxy = server.proxy ?? 'nginx'
+	const hit = cachedBootstrapCheck(server.id, proxy)
+	if (hit) return { green: hit.green, missing: missingPieces(hit.items) }
+	const last = usableStoredCheck(server)
+	return last ? { green: last.green, missing: last.missing ?? [] } : null
+}
+
+/** Green/red of the last check (lastCheckResult). null = never checked. */
 export function lastCheckGreen(
 	server: Pick<ServerRecord, 'id' | 'proxy' | 'lastCheck'>,
 ): boolean | null {
-	const proxy: BootstrapProxy = server.proxy ?? 'nginx'
-	const hit = cachedBootstrapCheck(server.id, proxy)
-	if (hit) return hit.green
-	return server.lastCheck && server.lastCheck.proxy === proxy ? server.lastCheck.green : null
+	return lastCheckResult(server)?.green ?? null
 }
 
 /** Re-check when the last check is older than this (background, on sync). */
@@ -70,8 +121,8 @@ export function checkIsStale(
 ): boolean {
 	const proxy: BootstrapProxy = server.proxy ?? 'nginx'
 	if (cachedBootstrapCheck(server.id, proxy)) return false
-	const last = server.lastCheck
-	return !last || last.proxy !== proxy || now - last.at.getTime() > CHECK_STALE_MS
+	const last = usableStoredCheck(server)
+	return !last || now - last.at.getTime() > CHECK_STALE_MS
 }
 
 /** Cached result, dropped when the server's proxy changed since. */
@@ -83,25 +134,41 @@ export function cachedBootstrapCheck(
 	return hit && hit.proxy === proxy ? hit : null
 }
 
-type InspectArg = Parameters<typeof checkFileProviderFromInspect>[0]
-
-async function fileProviderState(
+/** The traefik container's file provider and routing network, from its inspect JSON
+ *  and (only when the flags do not settle both) its mounted config file, read once. */
+async function traefikState(
 	server: ServerConfig,
 	inspectJson: string,
-): Promise<BootstrapFacts['traefikFileProvider']> {
-	let inspect: InspectArg
+	partial: ReturnType<typeof parseCheckOutput>['facts'],
+): Promise<Pick<BootstrapFacts, 'traefikFileProvider' | 'traefikNetwork'>> {
+	const networks = partial.dockerNetworks ?? null
+	if (partial.traefik === 'absent') {
+		return { traefikFileProvider: 'n/a', traefikNetwork: traefikNetworkFrom({ traefik: false, inspect: null, networks }) }
+	}
+	let inspect: InspectJson | null
 	try {
-		inspect = (JSON.parse(inspectJson) as InspectArg[])[0] ?? {}
+		inspect = (JSON.parse(inspectJson) as InspectJson[])[0] ?? {}
 	} catch {
-		return 'missing'
+		inspect = null
 	}
-	const check = checkFileProviderFromInspect(inspect)
-	if (check.state === 'ok') return 'ok'
-	if (check.state === 'need-config') {
-		const cat = await runCommand(server, `cat ${shq(check.configHostPath)}`, 10_000)
-		if (cat.code === 0 && fileProviderFromYml(cat.stdout, inspect)) return 'ok'
+	const attached = partial.traefikAttached ?? null
+	const project = partial.traefikProject ?? null
+	if (!inspect) {
+		return {
+			traefikFileProvider: 'missing',
+			traefikNetwork: traefikNetworkFrom({ traefik: true, inspect: null, networks, attached, project }),
+		}
 	}
-	return 'missing'
+	const fp = checkFileProviderFromInspect(inspect)
+	const config =
+		fp.state === 'need-config' || !traefikNetworkFlag(inspect) ? await readTraefikConfig(server, inspect) : null
+	return {
+		traefikFileProvider:
+			fp.state === 'ok' || (fp.state === 'need-config' && config && fileProviderFromYml(config.text, inspect))
+				? 'ok'
+				: 'missing',
+		traefikNetwork: traefikNetworkFrom({ traefik: true, inspect, config, networks, attached, project }),
+	}
 }
 
 const inflight = globalThis as {
@@ -160,15 +227,22 @@ async function runBootstrapCheckNow(server: ServerConfig): Promise<BootstrapChec
 		throw new Error(res.stderr.trim() || `check failed (exit ${res.code})`)
 	}
 	const { facts: partial, inspectJson } = parseCheckOutput(res.stdout)
-	const facts: BootstrapFacts = {
-		...partial,
-		traefikFileProvider:
-			partial.traefik === 'absent' ? 'n/a' : await fileProviderState(server, inspectJson),
-	}
+	const facts: BootstrapFacts = { ...partial, ...(await traefikState(server, inspectJson, partial)) }
 	// No column value on a hand-built config = the DB default, nginx.
 	const proxy: BootstrapProxy = server.proxy ?? 'nginx'
 	const shipped = shippedHelperShas()
-	const items = checkItems(facts, TRAEFIK_DYNAMIC_DIR, proxy, shipped)
+	// Only Traefik servers ask: elsewhere the file provider is never required. A failed
+	// query is the cautious side (required).
+	let redirectsInUse = false
+	if (proxy === 'traefik') {
+		try {
+			redirectsInUse = await serverRedirectsInUse(server.id)
+		} catch {
+			redirectsInUse = true
+		}
+	}
+	if (proxy === 'traefik' && facts.traefikNetwork) await rememberTraefikNetwork(server, facts.traefikNetwork)
+	const items = checkItems(facts, TRAEFIK_DYNAMIC_DIR, proxy, shipped, redirectsInUse)
 	const result: BootstrapCheckResult = {
 		serverId: server.id,
 		proxy,
@@ -176,11 +250,17 @@ async function runBootstrapCheckNow(server: ServerConfig): Promise<BootstrapChec
 		facts,
 		items,
 		green: isCheckGreen(items),
-		plan: planApply(facts, shq(TRAEFIK_DYNAMIC_DIR), proxy, shipped),
+		plan: planApply(facts, shq(TRAEFIK_DYNAMIC_DIR), proxy, shipped, redirectsInUse),
+		redirectsInUse,
 	}
 	cache().set(server.id, result)
 	// Best effort: a failed write only means the next restart shows it unchecked.
-	await saveServerCheck(server.id, { green: result.green, proxy, at: new Date(result.at) }).catch(
+	await saveServerCheck(server.id, {
+		green: result.green,
+		proxy,
+		at: new Date(result.at),
+		missing: missingPieces(items),
+	}).catch(
 		(err) => console.warn(`[server-check] could not save result for ${server.id}`, err),
 	)
 	return result

@@ -112,7 +112,7 @@ describe('control bytes BuildKit reads as whitespace', () => {
 			expect(refused(df), `byte ${b}`).toContain(CTL)
 			expect(dfrOne(df).code, `byte ${b}`).not.toBe(0)
 		}
-	}, 60_000)
+	})
 	it('refuses a control byte in a heredoc body', () => {
 		expect(
 			refused('# syntax=docker/dockerfile:1\nFROM x\nRUN <<EOF\necho a\x0bb\nEOF\n'),

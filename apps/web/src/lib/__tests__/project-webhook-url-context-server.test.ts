@@ -47,6 +47,8 @@ vi.mock('@/lib/ssh', () => ({
 	getContainerHostNetInfo: async () => new Map(),
 }))
 vi.mock('@/lib/managed-containers', () => ({ managedContainerNames: async () => [] }))
+// the recent-deploys query has its own test (project-deploys-query.test.ts)
+vi.mock('@/lib/project-deploys-db', () => ({ recentDeploysQuery: async () => [] }))
 vi.mock('@/lib/deploy-days-db', () => ({ deployDaysFor: async () => new Map() }))
 vi.mock('@/lib/hosts', () => ({
 	webhookUrl: (token: string) => `https://example.com/api/webhooks/deploy/${token}`,

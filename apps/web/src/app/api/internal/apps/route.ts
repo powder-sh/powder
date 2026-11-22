@@ -96,8 +96,16 @@ export async function GET(req: Request) {
 		server: server
 			? { id: server.id, name: server.name, host: server.host, kind: server.kind }
 			: { id: repo.serverId, name: repo.serverId, host: null, kind: null },
+		// an explicit pick: no deploy text leaves unmasked (failed_step comes from script output)
 		deploys: recent.map((d) => ({
-			...d,
+			id: d.id,
+			kind: d.kind,
+			status: d.status,
+			gitSha: d.gitSha,
+			gitBranch: d.gitBranch,
+			imageTag: d.imageTag,
+			triggeredBy: d.triggeredBy,
+			failedStep: redactNullable(d.failedStep),
 			errorSummary: redactNullable(d.errorSummary),
 			startedAt: d.startedAt?.toISOString() ?? null,
 			finishedAt: d.finishedAt?.toISOString() ?? null,

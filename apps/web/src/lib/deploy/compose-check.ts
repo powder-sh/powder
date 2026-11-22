@@ -32,6 +32,7 @@ import {
 import type { ServerConfig } from '../servers'
 import { shq } from '../shell'
 import { runCommand } from '../ssh/connection'
+import { knownTraefikNetwork } from '../traefik-network'
 import { ALL_PROFILES, composeConfigHashShell } from './compose-hash'
 import { type ComposeView, composeViewDiff, composeViewOf } from './compose-diff'
 import { onServerComposeGuardShell } from './fragments'
@@ -564,6 +565,9 @@ export function deployGuardContext(
 		/** where this deploy renders the app's env file (any path, also one inside
 		 *  the app dir): no service may bind it. */
 		envTarget?: string | null
+		/** the network the server's Traefik routes over when it is not `web`
+		 *  (traefik-network-run.ts knownTraefikNetwork): shared on this server. */
+		traefikNetwork?: string | null
 	},
 ): ComposeGuardContext {
 	// the app's own containers are those of the project named after the app (the
@@ -577,6 +581,7 @@ export function deployGuardContext(
 	const foreign = input.containers.filter((c) => c.project !== project)
 	return {
 		appName: p.appName,
+		...(p.traefikNetwork ? { traefikNetwork: p.traefikNetwork } : {}),
 		projectDir,
 		protectedPaths: [
 			...p.composeFiles,
@@ -1002,7 +1007,13 @@ export async function checkComposeForDeploy(
 	// the config moved since the last successful deploy (or in this push): the rules
 	// that judge a change, not a standing setup, run too (env_loopback).
 	const changed = unapproved || repoStructural
-	const ctx = { ...deployGuardContext(input, { ...p, serverId: server.id }), checkEnvLoopback: changed }
+	// the server's own Traefik network counts as shared here when it is not `web`
+	// (no SSH: the cached or stored answer, traefik-network-run.ts)
+	const tnet = knownTraefikNetwork(server)
+	const ctx = {
+		...deployGuardContext(input, { ...p, serverId: server.id, ...(tnet !== 'web' ? { traefikNetwork: tnet } : {}) }),
+		checkEnvLoopback: changed,
+	}
 	// what moved, versus the stored view of the last successful deploy.
 	const changeReport = unapproved ? composeChangeReport(p.approvedView, diffView, p.composeFiles) : ''
 	// say when Host rules are enforced because a proxy was seen on the server.

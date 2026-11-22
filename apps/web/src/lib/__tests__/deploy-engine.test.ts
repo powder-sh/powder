@@ -2,9 +2,10 @@ import { execFileSync } from 'node:child_process'
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { deployFailureFromError, DeployStepError, parseDeployFailure } from '../deploy-failure'
 import { overridePathFor } from '../compose-override'
+import { hostAppsDir } from '../deploy/fragments'
 import { shouldRollbackAfterFailure } from '../deploy-runner'
 import { parseHealthUrl, rollbackSummary } from '../deploys'
 import { pathsMatch } from '../paths-match'
@@ -210,6 +211,14 @@ describe('buildDeployScript', () => {
 		expect(s).toMatch(/flock -w "\$\(left 300\)"/)
 		expect(s).toMatch(/HAS_INFRA=1 /)
 	})
+	// The snapshots pin the production script text: host config paths as on a server
+	// (/opt/apps), not this file's hermetic stand-in (deploy/fragments.ts hostAppsDir).
+	beforeEach(() => {
+		vi.stubEnv('POWDER_TEST_HOST_APPS_DIR', '')
+	})
+	afterEach(() => {
+		vi.unstubAllEnvs()
+	})
 	it('matches the snapshot', () => {
 		expect(buildDeployScript({ ...baseScript, wantSha: 'c'.repeat(40) })).toMatchSnapshot()
 	})
@@ -347,7 +356,7 @@ describe('zero-downtime bridge', () => {
 		const f = bridgeShellFunctions("-f 'c.yml'", 'app', '/opt/apps/demo')
 		expect(f).toContain("grep -v '^com\\.docker\\.compose\\.'")
 		expect(f).toContain('--memory "$__cap" --memory-swap "$__cap"')
-		expect(f).toContain('/opt/apps/.mem-cap')
+		expect(f).toContain(`${hostAppsDir()}/.mem-cap`)
 		expect(f).toContain('-powder-bridge')
 		expect(f).toContain('--restart=no')
 		// the only publish is the opt-in host-port mode, loopback only

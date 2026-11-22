@@ -10,7 +10,7 @@ import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { HOST_STATE_ENV, hermeticRoot, pathWithout } from './hermetic'
 
-const SET_BY_HERMETIC = new Set(['GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL', 'XDG_CONFIG_HOME'])
+const SET_BY_HERMETIC = new Set(['GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL', 'GIT_CEILING_DIRECTORIES', 'XDG_CONFIG_HOME'])
 const sh = (cmd: string, env: NodeJS.ProcessEnv = process.env) =>
 	spawnSync('bash', ['-c', cmd], { env, encoding: 'utf8' })
 

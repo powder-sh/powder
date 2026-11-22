@@ -8,23 +8,31 @@
 //
 // Every row that is not proven yet lists its records with a copy button each
 // and the stored error from the last check (redacted server-side).
+//
+// A live apex row also says what its www does (and a www row what its apex does):
+// GET .../domains/www probes it live, on load and on "recheck" (lib/www-status.ts).
 
 import { AgentHelp } from '@/components/agent-help'
 import { Badge, type BadgeVariant } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import { CopyButton } from '@/components/ui/copy-button'
 import { Input } from '@/components/ui/input'
 import { SkeletonList } from '@/components/ui/skeleton'
+import { StatusDot } from '@/components/ui/status'
 import { domainPrompt } from '@/lib/agent-help-prompts'
+import { cn } from '@/lib/cn'
 import { type DnsRecord, domainRecords, needsDnsRecords } from '@/lib/domain-records'
 import { formatDateTime } from '@/lib/format'
-import { AlertCircle, Check, Copy, Globe, RefreshCw, Trash2 } from 'lucide-react'
-import { Fragment, useCallback, useEffect, useState } from 'react'
+import { type WwwCheck, wwwSibling, wwwStatusLine } from '@/lib/www-status'
+import { AlertCircle, Globe, RefreshCw, Trash2 } from 'lucide-react'
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
 import { useProject } from '../_lib/project-context'
 
 interface AppDomain {
 	id: string
 	appRepoId: string
+	previewDeployId?: string | null
 	hostname: string
 	status: 'pending' | 'verified' | 'verify_failed' | 'live' | 'apply_failed' | 'failed'
 	statusError: string | null
@@ -33,6 +41,16 @@ interface AppDomain {
 	appliedAt: string | null
 	appliedError: string | null
 	createdAt: string
+}
+
+/** One row's www line: probing, probed, or the request failed. */
+type WwwState = { state: 'loading' } | { state: 'error' } | { state: 'done'; check: WwwCheck }
+
+/** The rows that get a www line: live, not a preview's, an apex or www.<apex>. */
+function wwwCandidates(domains: AppDomain[]): string[] {
+	return domains
+		.filter((d) => d.status === 'live' && !d.previewDeployId && wwwSibling(d.hostname) !== null)
+		.map((d) => d.hostname)
 }
 
 interface DomainsResponse {
@@ -62,6 +80,7 @@ export default function DomainsPage() {
 	const [busy, setBusy] = useState<string | null>(null)
 	const [error, setError] = useState<string | null>(null)
 	const [confirmRemove, setConfirmRemove] = useState<string | null>(null)
+	const [www, setWww] = useState<Record<string, WwwState>>({})
 
 	const load = useCallback(async () => {
 		const res = await fetch(`/api/projects/${id}/domains`)
@@ -72,6 +91,37 @@ export default function DomainsPage() {
 	useEffect(() => {
 		load()
 	}, [load])
+
+	// A stable key, so a reload with the same live rows does not probe again.
+	const wwwHosts = useMemo(() => (data ? wwwCandidates(data.domains) : []), [data])
+	const wwwKey = wwwHosts.join(' ')
+
+	const loadWww = useCallback(
+		async (fresh: boolean) => {
+			const hosts = wwwKey ? wwwKey.split(' ') : []
+			if (hosts.length === 0) return
+			setWww((prev) => {
+				const next = { ...prev }
+				for (const h of hosts) next[h] = { state: 'loading' }
+				return next
+			})
+			const result: Record<string, WwwState> = {}
+			try {
+				const res = await fetch(`/api/projects/${id}/domains/www${fresh ? '?fresh=1' : ''}`)
+				const json = res.ok ? ((await res.json()) as { checks?: WwwCheck[] }) : {}
+				for (const c of json.checks ?? []) result[c.hostname] = { state: 'done', check: c }
+			} catch {
+				// every host below falls back to "could not check"
+			}
+			for (const h of hosts) result[h] ??= { state: 'error' }
+			setWww(result)
+		},
+		[id, wwwKey],
+	)
+
+	useEffect(() => {
+		void loadWww(false)
+	}, [loadWww])
 
 	const addDomain = async () => {
 		setError(null)
@@ -192,6 +242,8 @@ export default function DomainsPage() {
 							autoAssigned={data.autoAssigned}
 							ingressIp={data.ingressIp ?? null}
 							busy={busy === d.hostname}
+							www={www[d.hostname]}
+							onRecheckWww={() => void loadWww(true)}
 							onVerify={() => post(d.hostname, 'verify')}
 							onApply={() => post(d.hostname, 'apply')}
 							onRemove={() => setConfirmRemove(d.hostname)}
@@ -231,6 +283,8 @@ function DomainRow({
 	autoAssigned,
 	ingressIp,
 	busy,
+	www,
+	onRecheckWww,
 	onVerify,
 	onApply,
 	onRemove,
@@ -239,6 +293,8 @@ function DomainRow({
 	autoAssigned: string | null
 	ingressIp: string | null
 	busy: boolean
+	www?: WwwState
+	onRecheckWww: () => void
 	onVerify: () => void
 	onApply: () => void
 	onRemove: () => void
@@ -285,7 +341,14 @@ function DomainRow({
 			{showErr && (
 				<div className="flex items-start gap-2 border-t border-destructive/20 bg-destructive/5 px-4 py-2.5 text-xs text-destructive">
 					<AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-					<p className="ph-no-capture min-w-0 font-mono [overflow-wrap:anywhere]">{err}</p>
+					<p className="ph-no-capture min-w-0 flex-1 font-mono [overflow-wrap:anywhere]">{err}</p>
+					{err && (
+						<CopyButton
+							value={`${domain.hostname}: ${err}`}
+							label="copy the error"
+							className="-my-1.5 text-destructive/80 hover:text-destructive"
+						/>
+					)}
 				</div>
 			)}
 
@@ -312,12 +375,59 @@ function DomainRow({
 				</div>
 			)}
 
-			{domain.status === 'live' && domain.appliedAt && (
-				<div className="border-t border-border px-4 py-1.5 text-xs text-muted-foreground">
-					live since {formatDateTime(domain.appliedAt)}
+			{domain.status === 'live' && (domain.appliedAt || www) && (
+				<div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 border-t border-border px-4 py-1.5 text-xs text-muted-foreground">
+					{www && (
+						<WwwLine hostname={domain.hostname} www={www} onRecheck={onRecheckWww} />
+					)}
+					{domain.appliedAt && <span>live since {formatDateTime(domain.appliedAt)}</span>}
 				</div>
 			)}
 		</div>
+	)
+}
+
+// What the www (or apex) sibling of a live domain does, from a live probe.
+function WwwLine({
+	hostname,
+	www,
+	onRecheck,
+}: {
+	hostname: string
+	www: WwwState
+	onRecheck: () => void
+}) {
+	const sibling = wwwSibling(hostname) ?? hostname
+	const loading = www.state === 'loading'
+	const { text, tone } = loading
+		? { text: `checking ${sibling}`, tone: 'neutral' as const }
+		: www.state === 'done'
+			? wwwStatusLine(www.check)
+			: { text: `could not check ${sibling}`, tone: 'neutral' as const }
+	return (
+		<span className="flex min-w-0 items-center gap-1.5" aria-live="polite">
+			<StatusDot tone={tone} pulse={loading} />
+			<span
+				className={cn(
+					'min-w-0 [overflow-wrap:anywhere]',
+					loading && 'animate-shimmer',
+					tone === 'destructive' && 'text-destructive',
+					tone === 'warning' && 'text-warning',
+					tone === 'success' && 'text-foreground',
+				)}
+			>
+				{text}
+			</span>
+			<button
+				type="button"
+				onClick={onRecheck}
+				disabled={loading}
+				aria-label={`check ${sibling} again`}
+				className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50 sm:-my-1 sm:h-6 sm:w-6"
+			>
+				<RefreshCw className={cn('h-3 w-3', loading && 'motion-safe:animate-spin')} aria-hidden="true" />
+			</button>
+		</span>
 	)
 }
 
@@ -357,29 +467,12 @@ function DnsText({ value }: { value: string }) {
 }
 
 function CopyValue({ value, label }: { value: string; label: string }) {
-	const [copied, setCopied] = useState(false)
 	return (
 		<span className="flex min-w-0 items-center gap-1">
 			<code className="ph-no-capture min-w-0 flex-1 font-mono [overflow-wrap:anywhere]">
 				<DnsText value={value} />
 			</code>
-			<button
-				type="button"
-				aria-label={label}
-				title="copy"
-				onClick={() => {
-					navigator.clipboard
-						.writeText(value)
-						.then(() => {
-							setCopied(true)
-							setTimeout(() => setCopied(false), 1500)
-						})
-						.catch(() => {})
-				}}
-				className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground sm:h-7 sm:w-7"
-			>
-				{copied ? <Check className="h-3.5 w-3.5 text-success" /> : <Copy className="h-3.5 w-3.5" />}
-			</button>
+			<CopyButton value={value} label={label} size="sm" />
 		</span>
 	)
 }

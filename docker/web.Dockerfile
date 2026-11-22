@@ -4,7 +4,7 @@
 # produces a slim runtime image using next standalone output
 
 FROM node:22-bookworm-slim@sha256:5ec23b7c622b00547753bc6ffd78085dd868a68aeb41c8e0a1418f033e13d96d AS base
-RUN corepack enable && corepack prepare pnpm@10.21.0 --activate
+RUN corepack enable && corepack prepare pnpm@10.34.9 --activate
 WORKDIR /app
 
 # ── deps ────────────────────────────────────────────────────────────────────
@@ -56,8 +56,19 @@ WORKDIR /app
 # openssh-client gives us ssh-keygen + libcrypto for ssh2 native; not strictly
 # required (ssh2 has pure-js fallback) but nice to have for diagnostics.
 # postgresql-client: the entrypoint applies pending migrations with psql.
-RUN apt-get update -qq && apt-get upgrade -y && apt-get install -y --no-install-recommends openssh-client postgresql-client \
+# OS_PATCH_WEEK (ISO week, e.g. 2026-W47, passed by the self-deploy paths) is part
+# of this layer's cache key: the base image is pinned by digest, so without it
+# BuildKit reuses the first `apt-get upgrade` forever and Debian security fixes
+# never land. A new week re-runs the upgrade once; builds within a week stay cached.
+ARG OS_PATCH_WEEK=""
+RUN echo "os patch week: ${OS_PATCH_WEEK:-unset}" && apt-get update -qq && apt-get upgrade -y && apt-get install -y --no-install-recommends openssh-client postgresql-client \
 	&& rm -rf /var/lib/apt/lists/*
+
+# No package manager at runtime: the server runs `node apps/web/server.js` and the
+# entrypoint only needs bash + psql. npm, npx, corepack and yarn ship in the node base
+# image with their own bundled dependencies (tar, glob, minimatch, sigstore, pacote,
+# ...), which were most of the image scanner's HIGH findings.
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack /usr/local/bin/yarn /usr/local/bin/yarnpkg /opt/yarn-*
 
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
@@ -89,13 +100,19 @@ CMD ["node", "apps/web/server.js"]
 # web image, but it's a single internal replica with no inbound traffic — fine.
 # It orchestrates builds over SSH on the TARGET servers (it doesn't build images
 # locally), so it stays light on CPU/RAM despite shipping the toolchain.
-FROM base AS runner-worker
+# Starts from the plain node image, not `base`: the worker runs node + tsx and needs
+# no package manager (pnpm, npm, npx, corepack and yarn and their bundled
+# dependencies were the scanner's HIGH findings in this image).
+FROM node:22-bookworm-slim@sha256:5ec23b7c622b00547753bc6ffd78085dd868a68aeb41c8e0a1418f033e13d96d AS runner-worker
 WORKDIR /app
 
 # openssh-client: same rationale as the web runner (ssh2 native libcrypto +
 # diagnostics). The worker SSHes every managed server to drive deploys.
-RUN apt-get update -qq && apt-get upgrade -y && apt-get install -y --no-install-recommends openssh-client \
-	&& rm -rf /var/lib/apt/lists/*
+# OS_PATCH_WEEK: same weekly refresh of the upgrade layer as the web runner.
+ARG OS_PATCH_WEEK=""
+RUN echo "os patch week: ${OS_PATCH_WEEK:-unset}" && apt-get update -qq && apt-get upgrade -y && apt-get install -y --no-install-recommends openssh-client \
+	&& rm -rf /var/lib/apt/lists/* \
+	&& rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack /usr/local/bin/yarn /usr/local/bin/yarnpkg /opt/yarn-*
 
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
@@ -107,5 +124,8 @@ COPY --from=builder /app/apps/web ./apps/web
 COPY --from=builder /app/packages/db ./packages/db
 COPY --from=builder /app/package.json /app/pnpm-workspace.yaml /app/pnpm-lock.yaml /app/tsconfig.json ./
 
-# `pnpm -F @powder/web run worker` runs `tsx src/worker.ts` with cwd=apps/web.
-CMD ["pnpm", "-F", "@powder/web", "run", "worker"]
+# Same as `pnpm -F @powder/web run worker` (tsx src/worker.ts, cwd apps/web), without
+# pnpm: node loads tsx in-process, so node is PID 1 and gets SIGTERM directly (the
+# worker drains in-flight deploys on SIGTERM, see worker.ts).
+WORKDIR /app/apps/web
+CMD ["node", "--import", "tsx", "src/worker.ts"]

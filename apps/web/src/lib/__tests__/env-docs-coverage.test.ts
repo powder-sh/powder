@@ -23,10 +23,13 @@ const IGNORED: Record<string, string> = {
 	HOSTNAME: 'set by the image',
 	CI: 'set by CI runners',
 	POWDER_BUILD_CACHE_ID: 'exported by bin/install.sh and bin/self-deploy.sh from POWDER_BUILD_CACHE_ID_FILE',
+	OS_PATCH_WEEK: 'the current ISO week, exported by bin/install.sh, bin/self-deploy.sh and the dashboard self-deploy',
 	POWDER_SKIP_BOOT_MIGRATIONS: 'set by bin/self-deploy.sh --skip-migrations for one recreate (docs/upgrading)',
 	POWDER_MIGRATIONS_LIB: 'test-only path override in docker/powder-entrypoint.sh',
 	POWDER_MEMINFO_FILE: 'test-only path override for /proc/meminfo in bin/install.sh',
 	POWDER_SINGLE_TENANT: 'removed; only read to log that it is ignored',
+	VITEST: 'set by vitest; gates the test-only POWDER_TEST_HOST_APPS_DIR override',
+	POWDER_TEST_HOST_APPS_DIR: 'test-only path override for /opt/apps host config files in deploy/fragments.ts (honoured only under vitest)',
 }
 
 const SCRIPTS = [

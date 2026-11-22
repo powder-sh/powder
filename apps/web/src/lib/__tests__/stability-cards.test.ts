@@ -11,7 +11,27 @@ import {
 	stripStabilityMarkers,
 	testGatePresenceShell,
 } from '../deploy/stability'
-import { type DeployWarnings, healthUrlState, reportDeployWarningsToHq, stabilityCardPlan } from '../hq'
+import { type DeployWarnings, healthUrlState, postComposeDriftInventory, reportDeployWarningsToHq, stabilityCardPlan } from '../hq'
+import type { ComposeDriftStore } from '../deploy/compose-drift-inventory'
+
+/** In-memory compose-drift state (the server keeps it in powder_meta). `known` = the apps
+ *  powder has: list() drops the rows of any other app, as the powder_meta store does. */
+function memStore(
+	seed: Record<string, 'drift' | 'standing'> = {},
+	known: (ref: string) => boolean = () => true,
+): ComposeDriftStore & { rows: Map<string, 'drift' | 'standing'> } {
+	const rows = new Map<string, 'drift' | 'standing'>(Object.entries(seed))
+	return {
+		rows,
+		get: async (r) => rows.get(r) ?? null,
+		set: async (r, v) => void rows.set(r, v),
+		del: async (r) => void rows.delete(r),
+		list: async () => {
+			for (const r of [...rows.keys()]) if (!known(r)) rows.delete(r)
+			return [...rows.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([ref, value]) => ({ ref, value }))
+		},
+	}
+}
 
 // Deploy-setup markers and their warning cards. A marker is only trusted with the
 // run's nonce, a malformed or missing one is "unknown" (no card raised or
@@ -163,15 +183,211 @@ describe('deploy-setup cards', () => {
 		process.env.POWDER_STABILITY_CARDS = 'on'
 		const bodies = capture()
 		const cards = () => bodies.filter((b) => b.source_ref === 'compose-drift:web1/demo')
-		await reportDeployWarningsToHq({ ...base, composeDrift: 'drift' })
+		const store = memStore()
+		await reportDeployWarningsToHq({ ...base, composeDrift: 'drift' }, store)
 		expect(cards()).toHaveLength(1)
 		expect(cards()[0]).toMatchObject({ severity: 'warn', project: 'demo', source: 'powder-deploy-warn' })
 		expect(String(cards()[0]?.body)).toContain('Apply the change to the server file too')
-		await reportDeployWarningsToHq({ ...base, composeDrift: null })
-		await reportDeployWarningsToHq({ ...base })
+		await reportDeployWarningsToHq({ ...base, composeDrift: null }, store)
+		await reportDeployWarningsToHq({ ...base }, store)
 		expect(cards()).toHaveLength(1)
-		await reportDeployWarningsToHq({ ...base, composeDrift: 'ok' })
+		// a later deploy that leaves the compose alone neither raises nor resolves it
+		await reportDeployWarningsToHq({ ...base, composeDrift: 'standing' }, store)
+		await reportDeployWarningsToHq({ ...base, composeDrift: 'standing' }, store)
+		expect(cards()).toHaveLength(1)
+		expect(store.rows.get('web1/demo')).toBe('drift')
+		await reportDeployWarningsToHq({ ...base, composeDrift: 'ok' }, store)
 		expect(cards()[1]?.resolve).toBe(true)
+		expect(store.rows.has('web1/demo')).toBe(false)
+	})
+
+	it('compose-drift standing: the first one retires an old-rule card once, then never resolves', async () => {
+		process.env.POWDER_STABILITY_CARDS = 'on'
+		const bodies = capture()
+		const cards = () => bodies.filter((b) => b.source_ref === 'compose-drift:web1/demo')
+		const store = memStore()
+		await reportDeployWarningsToHq({ ...base, composeDrift: 'standing' }, store)
+		expect(cards()).toHaveLength(1)
+		expect(cards()[0]?.resolve).toBe(true)
+		expect(store.rows.get('web1/demo')).toBe('standing')
+		await reportDeployWarningsToHq({ ...base, composeDrift: 'standing' }, store)
+		expect(cards()).toHaveLength(1)
+		// a real change after that raises, and standing does not clear it
+		await reportDeployWarningsToHq({ ...base, composeDrift: 'drift' }, store)
+		await reportDeployWarningsToHq({ ...base, composeDrift: 'standing' }, store)
+		expect(cards()).toHaveLength(2)
+		expect(cards()[1]?.resolve).toBeUndefined()
+		expect(stabilityCardPlan({ ...base, composeDrift: 'standing' }).filter((c) => c.key.startsWith('compose-drift:'))).toEqual([])
+	})
+
+	it('compose-drift: a real change raises once with the plain text, its standing redeploys never re-raise', async () => {
+		process.env.POWDER_STABILITY_CARDS = 'on'
+		const bodies = capture()
+		const raises = () => bodies.filter((b) => b.source_ref === 'compose-drift:web1/demo' && !b.resolve)
+		const store = memStore({ 'web1/demo': 'standing' })
+		for (let i = 0; i < 5; i++) await reportDeployWarningsToHq({ ...base, composeDrift: 'standing' }, store)
+		expect(raises()).toHaveLength(0)
+		await reportDeployWarningsToHq({ ...base, composeDrift: 'drift' }, store)
+		for (let i = 0; i < 5; i++) await reportDeployWarningsToHq({ ...base, composeDrift: 'standing' }, store)
+		expect(raises()).toHaveLength(1)
+		expect(raises()[0]).toMatchObject({ severity: 'warn', channel: 'general', project: 'demo', title: 'demo: committed compose changes are not deployed' })
+		expect(String(raises()[0]?.body)).toContain("powder runs the server's compose file")
+		expect(bodies.filter((b) => b.source_ref === 'compose-drift:web1/demo' && b.resolve)).toHaveLength(0)
+	})
+
+	it('compose-drift inventory: one HQ-only task lists the standing apps, resolved when empty', async () => {
+		process.env.POWDER_STABILITY_CARDS = 'on'
+		const bodies = capture()
+		const inv = () => bodies.filter((b) => b.source_ref === 'compose-drift-standing:fleet')
+		const store = memStore({ 'web2/other': 'standing' })
+		await reportDeployWarningsToHq({ ...base, composeDrift: 'standing' }, store)
+		expect(inv()).toHaveLength(1)
+		expect(inv()[0]).toMatchObject({ source: 'powder-deploy-warn', severity: 'info', refresh_text: true })
+		expect(inv()[0]?.channel).toBeUndefined()
+		expect(inv()[0]?.project).toBeUndefined()
+		expect(String(inv()[0]?.title)).toContain('on 2 apps')
+		expect(String(inv()[0]?.body)).toContain('- web1/demo\n- web2/other')
+		// a real change moves the app to its own card: it leaves the standing list
+		await reportDeployWarningsToHq({ ...base, composeDrift: 'drift' }, store)
+		expect(String(inv()[1]?.title)).toContain('on 1 app')
+		expect(String(inv()[1]?.body)).not.toContain('web1/demo')
+		await reportDeployWarningsToHq({ ...base, composeDrift: 'ok' }, store)
+		await reportDeployWarningsToHq({ ...base, app: 'other', server: 'web2', composeDrift: 'ok' }, store)
+		expect(inv()[3]?.resolve).toBe(true)
+		// unknown posts nothing and touches no state
+		await reportDeployWarningsToHq({ ...base, composeDrift: null }, store)
+		expect(inv()).toHaveLength(4)
+	})
+
+	// With reopen:false a closed inventory would never open again, so an app joining the
+	// standing set later would be invisible. It reopens on a join, and only then.
+	it('compose-drift inventory: reopens when an app joins the standing set, not on other deploys', async () => {
+		process.env.POWDER_STABILITY_CARDS = 'on'
+		const bodies = capture()
+		const inv = () => bodies.filter((b) => b.source_ref === 'compose-drift-standing:fleet')
+		const store = memStore()
+		await reportDeployWarningsToHq({ ...base, composeDrift: 'standing' }, store)
+		expect(inv()[0]?.reopen).toBe(true)
+		// the same app again, a drift, an ok of another app: no join, a closed inventory stays closed
+		await reportDeployWarningsToHq({ ...base, composeDrift: 'standing' }, store)
+		await reportDeployWarningsToHq({ ...base, app: 'blog', composeDrift: 'drift' }, store)
+		await reportDeployWarningsToHq({ ...base, app: 'shop', composeDrift: 'ok' }, store)
+		expect(inv().slice(1).map((b) => b.reopen)).toEqual([false, false, false])
+		// a new app joins: this post reopens it
+		await reportDeployWarningsToHq({ ...base, app: 'wiki', composeDrift: 'standing' }, store)
+		expect(inv()[4]).toMatchObject({ reopen: true })
+		expect(String(inv()[4]?.body)).toContain('- web1/wiki')
+		// an app that went ok and comes back standing joins again
+		await reportDeployWarningsToHq({ ...base, composeDrift: 'ok' }, store)
+		await reportDeployWarningsToHq({ ...base, composeDrift: 'standing' }, store)
+		expect(inv()[6]).toMatchObject({ reopen: true })
+		// an app powder does not have never joins (and never retires a card)
+		const ghost = memStore({}, (r) => r !== 'web1/ghost')
+		for (let i = 0; i < 3; i++) await reportDeployWarningsToHq({ ...base, app: 'ghost', composeDrift: 'standing' }, ghost)
+		expect(inv().slice(7).every((b) => b.reopen === false || b.resolve === true)).toBe(true)
+		expect(bodies.filter((b) => b.source_ref === 'compose-drift:web1/ghost')).toEqual([])
+	})
+
+	// The drift row is written before the card is raised: otherwise a failed write would let
+	// the next standing deploy take the new card for an old-rule one and close it.
+	it('compose-drift: the drift row is written before the card; a failed write raises nothing', async () => {
+		process.env.POWDER_STABILITY_CARDS = 'on'
+		const bodies = capture()
+		const order: string[] = []
+		const store = memStore()
+		const tracked: ComposeDriftStore = {
+			...store,
+			set: async (r, v) => {
+				order.push(`set ${v}`)
+				await store.set(r, v)
+			},
+		}
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(async (_u: string, i: { body: string }) => {
+				const b = JSON.parse(i.body)
+				if (b.source_ref === 'compose-drift:web1/demo') order.push(b.resolve ? 'resolve' : 'raise')
+				bodies.push(b)
+				return new Response('ok')
+			}),
+		)
+		await reportDeployWarningsToHq({ ...base, composeDrift: 'drift' }, tracked)
+		expect(order).toEqual(['set drift', 'raise'])
+
+		const err = vi.spyOn(console, 'error').mockImplementation(() => {})
+		const failing = memStore()
+		const broken: ComposeDriftStore = {
+			...failing,
+			set: async () => {
+				throw new Error('db down')
+			},
+		}
+		const before = bodies.length
+		await expect(reportDeployWarningsToHq({ ...base, app: 'shop', composeDrift: 'drift' }, broken)).resolves.toBeUndefined()
+		expect(bodies.slice(before).filter((b) => String(b.source_ref).startsWith('compose-drift'))).toEqual([])
+		expect(String(err.mock.calls[0]?.[0])).toContain('compose-drift state write failed for web1/shop')
+		// the store is back: the next standing deploy has no row, so it retires a card
+		// that was never raised (no-op), never a new-rule one
+		await reportDeployWarningsToHq({ ...base, app: 'shop', composeDrift: 'standing' }, failing)
+		expect(bodies.filter((b) => b.source_ref === 'compose-drift:web1/shop' && !b.resolve)).toEqual([])
+	})
+
+	// Two deploys finishing together would each post the list they had read, so an older
+	// list could land last. Posts run in order and read the list when sent.
+	it('compose-drift inventory: concurrent posts land in order, the last one has the latest list', async () => {
+		process.env.POWDER_STABILITY_CARDS = 'on'
+		const bodies = capture()
+		const inv = () => bodies.filter((b) => b.source_ref === 'compose-drift-standing:fleet')
+		const store = memStore({ 'web1/a': 'standing' })
+		let release: () => void = () => {}
+		const gate = new Promise<void>((r) => {
+			release = r
+		})
+		let calls = 0
+		const slow: ComposeDriftStore = {
+			...store,
+			list: async () => {
+				const snap = await store.list()
+				if (++calls === 1) await gate
+				return snap
+			},
+		}
+		const first = postComposeDriftInventory('powder-deploy-warn', slow, false)
+		// the first post has read its list and waits; another deploy changes the state
+		await vi.waitFor(() => expect(calls).toBe(1))
+		store.rows.set('web1/b', 'standing')
+		const second = postComposeDriftInventory('powder-deploy-warn', slow, false)
+		release()
+		await Promise.all([first, second])
+		expect(inv().map((b) => b.title)).toEqual([
+			'Repo docker-compose.yml differs from the server compose on 1 app',
+			'Repo docker-compose.yml differs from the server compose on 2 apps',
+		])
+		// a failed post does not stop the chain
+		const err = vi.spyOn(console, 'error').mockImplementation(() => {})
+		const broken: ComposeDriftStore = { ...store, list: async () => Promise.reject(new Error('db down')) }
+		await postComposeDriftInventory('powder-deploy-warn', broken, false)
+		await postComposeDriftInventory('powder-deploy-warn', store, false)
+		expect(inv()).toHaveLength(3)
+		expect(err).toHaveBeenCalled()
+	})
+
+	it('compose-drift: a store error resolves nothing and never throws', async () => {
+		process.env.POWDER_STABILITY_CARDS = 'on'
+		const bodies = capture()
+		const err = vi.spyOn(console, 'error').mockImplementation(() => {})
+		const broken: ComposeDriftStore = {
+			get: async () => {
+				throw new Error('db down')
+			},
+			set: async () => {},
+			del: async () => {},
+			list: async () => [],
+		}
+		await expect(reportDeployWarningsToHq({ ...base, composeDrift: 'standing' }, broken)).resolves.toBeUndefined()
+		expect(bodies.filter((b) => String(b.source_ref).startsWith('compose-drift'))).toEqual([])
+		expect(err).toHaveBeenCalled()
+		expect(parseStabilityMarkers(`${M} compose-drift standing\n`, NONCE).composeDrift).toBe('standing')
 	})
 
 	it('migrate-path: names each case, [] resolves, malformed marker is unknown', async () => {
@@ -241,9 +457,12 @@ describe('deploy-setup cards', () => {
 	it('switch off: no card posted, the raise is logged as would warn', async () => {
 		const bodies = capture()
 		const log = vi.spyOn(console, 'log').mockImplementation(() => {})
-		await reportDeployWarningsToHq({ ...base, composeDrift: 'drift' })
-		await reportDeployWarningsToHq({ ...base, composeDrift: 'ok' })
-		expect(bodies.filter((b) => String(b.source_ref).startsWith('compose-drift:'))).toEqual([])
+		const store = memStore()
+		await reportDeployWarningsToHq({ ...base, composeDrift: 'drift' }, store)
+		await reportDeployWarningsToHq({ ...base, composeDrift: 'ok' }, store)
+		await reportDeployWarningsToHq({ ...base, composeDrift: 'standing' }, store)
+		expect(bodies.filter((b) => String(b.source_ref).startsWith('compose-drift'))).toEqual([])
+		expect(store.rows.size).toBe(0)
 		const lines = log.mock.calls.map((c) => String(c[0]))
 		expect(lines).toHaveLength(1)
 		expect(lines[0]).toMatch(/^\[stability\] would warn: compose-drift:web1\/demo the repo's docker-compose\.yml differs/)

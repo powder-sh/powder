@@ -4,6 +4,7 @@ import { OVERRIDE_FILE, composeStateBase, isPowderTempComposeFile, isSafeOverrid
 import { appLockDirShell, appLockPath } from '../deploy-supersede'
 import type { ServerConfig } from '../servers'
 import { composeProjectNameFor } from '../compose-safety'
+import { createHash } from 'node:crypto'
 import { shq } from '../shell'
 import { SIDE_RUN_CAPS } from '../side-run'
 import { runCommand } from '../ssh/connection'
@@ -1326,8 +1327,10 @@ export function parseNginxUpstreamVerdict(out: string, nonce: string): NginxUpst
 // Shared awk prelude over `nginx -T`: strips comments, joins the dump into one line
 // and walks every `upstream <name> { ... }` block (no nested braces in an upstream),
 // calling blk(name, body). POSIX awk only (mawk on the hosts): no regex intervals.
-// Prints nothing of the config itself.
-const UPSTREAM_WALK =
+// Prints nothing of the config itself. Exported for the parity test: the servers list
+// reads upstream blocks in TypeScript (parseUpstreamBlocks in ssh/discovery.ts), and
+// nginx-upstream-parity.test.ts checks both readings agree on the same nginx text.
+export const UPSTREAM_WALK =
 	String.raw`{ sub(/#.*/, ""); buf = buf " " $0 } ` +
 	String.raw`END { gsub(/[\t\r\n]/, " ", buf); ` +
 	String.raw`while (match(buf, /[ ;{}]upstream[ ]+[^ {};]+[ ]*[{][^}]*[}]/)) { ` +
@@ -1453,7 +1456,38 @@ export function bridgeSkipClass(why: string): BridgeVerdict {
  *  bridged: the clone publishes no ports and the old container keeps its binding
  *  through the overlap. A binding on any other interface (0.0.0.0, a LAN ip, an
  *  empty HostIp) still skips, as verdict `host-ports`.
- *  In host-port mode only, extra_hosts are copied as --add-host when every entry
+ *  DNS-ALIAS MODE (a proxy CONTAINER that reaches apps by docker DNS name, e.g.
+ *  servers.proxy = 'nginx-container'): label powder.bridge.dns-alias=true next to
+ *  powder.bridge.enabled=true, without powder.bridge.host-port (both set skips; a
+ *  traefik-routed app keeps the traefik mode). The clone joins every network of the
+ *  old container; on each user-defined one it carries the old container's NAME as a
+ *  network alias (`docker create --network-alias` on the first, `docker network
+ *  connect --alias` on the rest; the default bridge network is joined plain), plus the
+ *  compose service name where the old container already has that alias. Docker DNS
+ *  then answers the name with old + bridge (and after the recreate new + bridge), and
+ *  a proxy that resolves per request and retries the next address on a refused
+ *  connection fails over with no config change:
+ *    resolver 127.0.0.11 valid=2s; set $upstream "http://<container>:<port>";
+ *    proxy_pass $upstream;   # proxy_next_upstream error timeout is nginx's default
+ *  A static `proxy_pass http://<container>:<port>` resolves once and never sees it.
+ *  SECURITY: every alias comes from the old container's own `docker inspect` (.Name,
+ *  .NetworkSettings.Networks[].Aliases), never from a label or compose value, and the
+ *  clone joins only the old container's networks, so an app cannot answer under
+ *  another app's name. No other alias is copied. The clone publishes no host port
+ *  (loopback-only bindings stay on the old container; any other interface skips as
+ *  host-ports), drops its traefik.* labels (traefik.enable=false) and needs no
+ *  healthcheck. App port for the readiness probe (bridge_http on the clone's IP):
+ *  label powder.bridge.port (1-65535), else the image's single exposed tcp port, else
+ *  skip. Ordering: the alias is in DNS from `docker start`, before the app listens;
+ *  the proxy's connections to it are refused and retried on the old container, which
+ *  is still up (it is stopped only by the recreate, after the bridge answered).
+ *  Handoff: the bridge stays >= 6 s after the new container answers (sleep 3, drain,
+ *  sleep 3, `docker stop -t <grace>`), longer than the resolver TTL the proxy uses (2 s),
+ *  so a cached answer always holds a live address. The old container is stopped by
+ *  bridge_drain_old (drainShellFunctions), not by the recreate: new connections are
+ *  refused first, then requests in flight finish (all modes). The host nginx
+ *  checks (bridge_nginx_scan / _check) do not run for a dns-alias app.
+ *  In host-port and dns-alias modes, extra_hosts are copied as --add-host when every entry
  *  is `name:ip` / `name:host-gateway` (strict charset); any other entry skips.
  *  Traefik mode still skips on any extra_hosts.
  *  Skipped (current behaviour kept) when: no running container, host ports
@@ -1469,15 +1503,185 @@ export function bridgeSkipClass(why: string): BridgeVerdict {
  *  would split into extra label-file lines, e.g. smuggled traefik.* labels),
  *  host lacks curl, or the bridge does not
  *  answer HTTP within 60s. Pure string builder: unit-tested + bash -n checked. */
-export function bridgeShellFunctions(cf: string, service: string, workingDir: string, nonce = ''): string {
+
+/** Grace for the old container's requests in flight when it carries no
+ *  stop_grace_period (docker .Config.StopTimeout). */
+export const DRAIN_DEFAULT_GRACE_SEC = 30
+
+/** Grace ceiling, also bounded by the deploy budget (cap ... 120). */
+export const DRAIN_MAX_GRACE_SEC = 600
+
+/** Outcome of bridge_drain_old, printed as the stability marker `stop-drain <v>`
+ *  (deploy/stability.ts) and turned into one HQ card per app (hq.ts):
+ *  - ok: new connections were refused before the stop and the old container exited
+ *    on SIGTERM within its grace
+ *  - no-route-away: the bridge did not answer, or the reject rule could not be set or
+ *    did not take effect: requests that reach the old container while it stops can fail
+ *  - sigterm-ignored: killed after the grace while idle (no request lost, but PID 1 does
+ *    not pass SIGTERM on, so every deploy waits the full grace)
+ *  - killed: killed after the grace with connections open: requests in flight were cut */
+export const DRAIN_VERDICTS = ['ok', 'no-route-away', 'sigterm-ignored', 'killed'] as const
+export type DrainVerdict = (typeof DRAIN_VERDICTS)[number]
+
+/** Lossless stop of the old container in a bridged swap. The gap it closes:
+ *  `compose up --force-recreate`
+ *  sent SIGTERM while the proxy still routed to the old container. Traefik's docker
+ *  provider drops a container only on its `die` event (plus its 2 s throttle), so it
+ *  sent new requests to a closed listener (refused) and then to a vanished IP
+ *  (~1 s, no route), and each answered 502, a POST included. On host nginx the
+ *  same window loses POSTs for good: docker-proxy accepts nginx's connection, fails
+ *  to reach the stopped app and closes it after nginx sent the request, which nginx
+ *  never passes to the backup (non-idempotent); the new container's docker-proxy
+ *  then listens ~2 s before its app does.
+ *
+ *  bridge_drain_old, called right before the recreate when a bridge is up and
+ *  answering, and only when the drain is on for the app (drain-mode.ts: POWDER_DRAIN=on,
+ *  or canary + POWDER_DRAIN_APPS). Off, none of it is rendered: the script is exactly
+ *  what it was before the drain (bridgeShellFunctions `drain`, script.ts):
+ *  1. route away: new TCP connections to the old container are refused (RST), never
+ *     accepted, so no request is lost and the proxy re-sends them: host-port mode
+ *     inserts `iptables -I INPUT -i lo -p tcp -d 127.0.0.1 --dport <app host port>
+ *     --syn -j REJECT` (comment `powder-drain 127.0.0.1:<port>`; nginx tries the
+ *     bridge, its `backup` upstream, on a refused connect, POST included); dns-alias
+ *     mode, and traefik mode when every router of the old container lists a retry
+ *     middleware its own labels define (bridge_has_retry: without one Traefik answers
+ *     502 instead of re-sending), insert the same REJECT for the app port inside the
+ *     old container's network namespace (nsenter; it dies with the container). Verified
+ *     with a probe that must be refused; otherwise the rule is removed and the
+ *     verdict is no-route-away.
+ *  2. requests in flight finish: wait until the old container has no established
+ *     connection on the app port (nsenter ss; up to the grace in host-port / dns-alias
+ *     mode, up to 5 s in traefik mode where the proxy keeps idle keep-alive
+ *     connections), then `docker stop -t <grace>` (SIGTERM, then SIGKILL after the
+ *     grace; 10 s once idle). Grace = the container's stop_grace_period, else 30 s,
+ *     at most 600 s and the deploy budget.
+ *  3. host-port mode keeps the reject rule through the recreate (the new container's
+ *     docker-proxy accepts before its app listens) and bridge_handoff removes it once
+ *     the new container answers on its own IP. bridge_stop (EXIT trap, retries) also
+ *     removes it, and bridge_start clears a stale one left by a killed deploy.
+ *  4. a deploy that exits before the swap succeeded starts the stopped old container
+ *     again (bridge_restore_old, EXIT trap, before bridge_stop removes the bridge).
+ *  5. no rule outlives the deploy: drain_trap_first runs first in the EXIT trap (deletes
+ *     the rules before any output, then survives a dead stdout), a detached reaper per
+ *     rule (setsid, own token) deletes it after grace + 240 s (netns: + 60 s), the
+ *     worker's abort path (run.ts restoreSharedTagAfterAbort, drainAbortClearShell) and
+ *     the next bridge_start_body delete the app's rules. Rules carry the comment
+ *     `powder-drain <127.0.0.1|netns>:<port> <token> <drainRuleId>`.
+ *  Never fails a deploy (every path returns 0). Not bridged = unchanged: compose
+ *  stops the old container. */
+/** The app's id inside a powder-drain rule comment (`powder-drain <where>:<port> <token>
+ *  <id>`): the working dir's basename and the service, [A-Za-z0-9_-] only, so it is safe
+ *  in a grep pattern and a comment. The worker's abort path derives the same id. */
+export function drainRuleId(workingDir: string, service: string): string {
+	const base = workingDir.split('/').filter(Boolean).pop() ?? 'app'
+	// readable part + a hash of the exact pair: `/opt/apps/foo` + `bar-baz` and
+	// `/opt/apps/foo-bar` + `baz` read alike but never share an id
+	const h = createHash('sha256').update(`${workingDir}\0${service}`).digest('hex').slice(0, 10)
+	return `${`${base}-${service}`.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 60)}-${h}`
+}
+
+/** drain_rule / drain_clear for one app id. drain_rule <-I|-D> <host|netns> <port> <token>
+ *  [pid]: one REJECT of new TCP connections, on the host's loopback port or inside a
+ *  container's network namespace. drain_clear <host|netns> [pid]: deletes every
+ *  powder-drain rule of THIS app there (any port, any token), found by its comment in
+ *  `iptables -S INPUT`. Silent, always returns 0. */
+export function drainClearFunctions(id: string): string {
+	const i = id.replace(/[^A-Za-z0-9_-]/g, '_') || 'app'
+	return (
+		String.raw`drain_rule() { if [ "$2" = host ]; then iptables -w 5 "$1" INPUT -i lo -p tcp -d 127.0.0.1 --dport "$3" --syn -m comment --comment "powder-drain 127.0.0.1:$3 $4 ${i}" -j REJECT --reject-with tcp-reset; else nsenter -t "$5" -n iptables -w 5 "$1" INPUT -p tcp --dport "$3" --syn -m comment --comment "powder-drain netns:$3 $4 ${i}" -j REJECT --reject-with tcp-reset; fi; }; ` +
+		String.raw`drain_clear() { __dl=""; if [ "$1" = host ]; then command -v iptables >/dev/null 2>&1 || return 0; __dl=$(iptables -w 5 -S INPUT 2>/dev/null | grep -oE 'powder-drain 127[.]0[.]0[.]1:[0-9]+ [A-Za-z0-9]+ [A-Za-z0-9_-]+"' || true); else case "$2" in ''|0|*[!0-9]*) return 0 ;; esac; command -v nsenter >/dev/null 2>&1 || return 0; __dl=$(nsenter -t "$2" -n iptables -w 5 -S INPUT 2>/dev/null | grep -oE 'powder-drain netns:[0-9]+ [A-Za-z0-9]+ [A-Za-z0-9_-]+"' || true); fi; [ -n "$__dl" ] || return 0; ` +
+		String.raw`printf '%s\n' "$__dl" | sort -u | while read -r __x __a __t __r; do [ "$__r" = ${shq(i + '"')} ] || continue; __p="${'$'}{__a##*:}"; case "$__p" in ''|*[!0-9]*) continue ;; esac; case "$__t" in ''|*[!A-Za-z0-9]*) continue ;; esac; __n=0; while [ "$__n" -lt 20 ] && drain_rule -D "$1" "$__p" "$__t" "$2" >/dev/null 2>&1; do __n=$((__n+1)); done; done; return 0; }; `
+	)
+}
+
+/** For the worker's abort path (deploy/run.ts restoreSharedTagAfterAbort: the script died
+ *  without its EXIT trap): delete this app's powder-drain rules on the host and inside the
+ *  container's netns. Silent, never fails; ends with `; `. */
+export function drainAbortClearShell(id: string, containerName: string): string {
+	return `{ ${drainClearFunctions(id)}drain_clear host; __dp=$(docker inspect -f '{{.State.Pid}}' ${shq(containerName)} 2>/dev/null || true); drain_clear netns "$__dp"; } >/dev/null 2>&1; `
+}
+
+export function drainShellFunctions(psq: string, stabMark = '', id = 'app'): string {
+	const sm = /^__POWDER_STAB_[A-Za-z0-9]+__$/.test(stabMark) ? stabMark : ''
+	const i = id.replace(/[^A-Za-z0-9_-]/g, '_') || 'app'
+	return (
+		String.raw`drain_mark() { ${sm ? `echo ${shq(sm)}" stop-drain $1"; ` : ''}return 0; }; ` +
+		drainClearFunctions(i) +
+		// A detached reaper per inserted rule: deletes exactly that rule (its own token) after
+		// $4 seconds, in its own session, so neither a dropped SSH channel, a SIGKILL of the
+		// script nor timeout -k on its process group keeps the rule. B_REAPER=off: tests only.
+		String.raw`drain_reaper() { [ "${'$'}{B_REAPER:-on}" = off ] && return 0; if [ "$1" = host ]; then __rc="iptables -w 5 -D INPUT -i lo -p tcp -d 127.0.0.1 --dport $2 --syn -m comment --comment 'powder-drain 127.0.0.1:$2 $3 ${i}' -j REJECT --reject-with tcp-reset"; else __rc="nsenter -t $5 -n iptables -w 5 -D INPUT -p tcp --dport $2 --syn -m comment --comment 'powder-drain netns:$2 $3 ${i}' -j REJECT --reject-with tcp-reset"; fi; ` +
+		// 7>&- 8>&- 9>&-: the reaper must not inherit the per-app lock (fd 9, appLockShell) or
+		// the build locks, or it would hold them until it fires.
+		String.raw`if command -v setsid >/dev/null 2>&1; then ( setsid sh -c "sleep $4; $__rc" </dev/null >/dev/null 2>&1 7>&- 8>&- 9>&- & ); else ( nohup sh -c "sleep $4; $__rc" </dev/null >/dev/null 2>&1 7>&- 8>&- 9>&- & ); fi; return 0; }; ` +
+		// FIRST thing of the EXIT trap: delete the rules before any echo or docker call, then
+		// make the rest of the trap survive a dead stdout (SSH channel gone): no SIGPIPE, no
+		// set -e, and output to /dev/null once a write fails.
+		String.raw`drain_trap_first() { set +e; trap '' PIPE; drain_clear host >/dev/null 2>&1; if [ -n "$B_NSPID" ]; then drain_clear netns "$B_NSPID" >/dev/null 2>&1; fi; B_RULE=""; B_NSPID=""; if ! printf '\n' 2>/dev/null; then B_DEAD=1; exec >/dev/null 2>&1; fi; return 0; }; ` +
+		// curl exit 7 = could not connect (refused): the probe never reached the app.
+		String.raw`bridge_refused() { curl -s -o /dev/null --max-time 3 "http://$1:$2/" >/dev/null 2>&1; [ "$?" = 7 ]; }; ` +
+		String.raw`bridge_lo_http() { __lc=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$1/" 2>/dev/null || true); case "$__lc" in [234][0-9][0-9]) return 0 ;; *) return 1 ;; esac; }; ` +
+		// established connections on the app port inside the container (x = unknown)
+		String.raw`bridge_conns() { __cp=$(docker inspect -f '{{.State.Pid}}' "$1" 2>/dev/null || true); case "$__cp" in ''|0|*[!0-9]*) echo x; return 0 ;; esac; if ! command -v nsenter >/dev/null 2>&1 || ! command -v ss >/dev/null 2>&1; then echo x; return 0; fi; __ssl=$(nsenter -t "$__cp" -n ss -Htn state established "( sport = :$2 )" 2>/dev/null) || { echo x; return 0; }; printf '%s\n' "$__ssl" | grep -c . || true; }; ` +
+		// Traefik re-sends a refused request only through a retry middleware on the router:
+		// every router of the old container (its labels, $B_LF) must list one that the same
+		// labels define with retry.attempts >= 2. Hand-written labels without one: no REJECT.
+		String.raw`bridge_has_retry() { [ -n "$B_LF" ] && [ -f "$B_LF" ] || return 1; __rr=""; while IFS= read -r __l; do case "$__l" in traefik.http.routers.*.rule=*) __x="${'$'}{__l#traefik.http.routers.}"; __rr="$__rr ${'$'}{__x%%.rule=*}" ;; esac; done < "$B_LF"; [ -n "$__rr" ] || return 1; ` +
+		String.raw`for __r in $__rr; do case "$__r" in *[!A-Za-z0-9_-]*) return 1 ;; esac; __ok=0; __ms=""; while IFS= read -r __l; do case "$__l" in "traefik.http.routers.$__r.middlewares="*) __ms="${'$'}{__l#*=}" ;; esac; done < "$B_LF"; ` +
+		String.raw`for __m in $(printf '%s' "$__ms" | tr ',' ' '); do __m="${'$'}{__m%@docker}"; case "$__m" in ''|*[!A-Za-z0-9_-]*) continue ;; esac; while IFS= read -r __l; do case "$__l" in "traefik.http.middlewares.$__m.retry.attempts="*) __v="${'$'}{__l#*=}"; case "$__v" in ''|*[!0-9]*|0*|1) ;; *) __ok=1 ;; esac ;; esac; done < "$B_LF"; done; [ "$__ok" = 1 ] || return 1; done; return 0; }; ` +
+		String.raw`bridge_restore_old() { if [ -z "$B_OLD" ] || [ "${'$'}{SWAPPED:-0}" = 1 ]; then return 0; fi; if docker inspect "$B_OLD" >/dev/null 2>&1 && [ "$(docker inspect -f '{{.State.Running}}' "$B_OLD" 2>/dev/null)" != true ]; then if docker start "$B_OLD" >/dev/null 2>&1; then echo "[drain] the deploy stopped after the old container was stopped: started it again"; bridge_wait 60 "$B_OLD" "$B_PORT" bridge_http || true; else echo "[drain] WARNING: could not start the old container again"; fi; fi; B_OLD=""; return 0; }; ` +
+		String.raw`bridge_drain_old() { B_OLD=""; if [ -z "$BRIDGE" ] || ! docker inspect "$BRIDGE" >/dev/null 2>&1; then return 0; fi; ` +
+		String.raw`__o=$(${psq} || true); if [ -z "$__o" ] || [ "$(docker inspect -f '{{.State.Running}}' "$__o" 2>/dev/null)" != true ]; then return 0; fi; ` +
+		String.raw`__g=$(docker inspect -f '{{.Config.StopTimeout}}' "$__o" 2>/dev/null || true); case "$__g" in ''|0|*[!0-9]*) __g=${DRAIN_DEFAULT_GRACE_SEC} ;; esac; if [ "${'$'}{#__g}" -gt 3 ] || [ "$__g" -gt ${DRAIN_MAX_GRACE_SEC} ]; then __g=${DRAIN_MAX_GRACE_SEC}; fi; __g=$(cap "$__g" 120); B_DRAIN_G="$__g"; ` +
+		String.raw`__bok=0; if [ -n "$B_HP" ]; then bridge_lo_http "$B_HP" && __bok=1; else bridge_http "$BRIDGE" "$B_PORT" && __bok=1; fi; ` +
+		String.raw`if [ "$__bok" != 1 ]; then echo "[drain] WARNING: the bridge is not answering: compose stops the old container as before"; drain_mark no-route-away; return 0; fi; ` +
+		String.raw`__ra=0; __why=""; __pid=$(docker inspect -f '{{.State.Pid}}' "$__o" 2>/dev/null || true); B_RTOK="d$(date +%s)$$"; ` +
+		// host-port: the rule outlives the old container (kept until the new one answers):
+		// reaper after the grace + 240 s (idle wait, stop, recreate, the 90 s handoff wait).
+		String.raw`if [ -n "$B_HP" ]; then if [ -z "$B_AHP" ] || ! command -v iptables >/dev/null 2>&1; then __why="iptables is not installed"; elif drain_rule -I host "$B_AHP" "$B_RTOK" >/dev/null 2>&1; then B_RULE="$B_AHP"; drain_reaper host "$B_AHP" "$B_RTOK" "${'$'}{B_REAP_SEC:-$((__g + 240))}"; if bridge_refused 127.0.0.1 "$B_AHP"; then __ra=1; else drain_clear host; B_RULE=""; __why="the reject rule did not take effect (a probe of 127.0.0.1:$B_AHP still connected)"; fi; else __why="the reject rule could not be inserted"; fi; ` +
+		String.raw`elif [ -z "$B_DNS" ] && ! bridge_has_retry; then __why="its Traefik router has no retry middleware (powder renders <app>-retry; hand-written labels need one), so Traefik would not re-send a refused request"; ` +
+		// traefik (with a retry middleware) and dns-alias: the rule lives in the old container's
+		// netns and dies with it; reaper after the grace + 60 s.
+		String.raw`else __oip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$__o" 2>/dev/null | awk '{print $1}'); case "$__pid" in ''|0|*[!0-9]*) __why="no process id for the old container" ;; *) if [ -z "$__oip" ] || ! command -v nsenter >/dev/null 2>&1; then __why="nsenter is not installed or the old container has no IP"; elif drain_rule -I netns "$B_PORT" "$B_RTOK" "$__pid" >/dev/null 2>&1; then B_NSPID="$__pid"; drain_reaper netns "$B_PORT" "$B_RTOK" "${'$'}{B_REAP_SEC:-$((__g + 60))}" "$__pid"; if bridge_refused "$__oip" "$B_PORT"; then __ra=1; else drain_clear netns "$__pid"; B_NSPID=""; __why="the reject rule did not take effect (a probe of $__oip:$B_PORT still connected)"; fi; else __why="the reject rule could not be inserted in the container's network namespace"; fi ;; esac; fi; ` +
+		String.raw`if [ "$__ra" = 1 ]; then if [ -n "$B_HP" ]; then echo "[drain] new connections to 127.0.0.1:$B_AHP refused: nginx sends them to the bridge (backup upstream)"; elif [ -n "$B_DNS" ]; then echo "[drain] new connections to the old container refused: the proxy retries them on the next address (the bridge)"; else echo "[drain] new connections to the old container refused: Traefik's retry middleware re-sends them to the bridge"; fi; ` +
+		String.raw`else echo "[drain] WARNING: not refusing new connections to the old container: $__why. A request that reaches it while it stops can fail"; drain_mark no-route-away; fi; ` +
+		String.raw`__idle=n; __nc=""; __iw="$__g"; if [ -z "$B_HP$B_DNS" ] && [ "$__iw" -gt 5 ]; then __iw=5; fi; __w0=$(date +%s); ` +
+		String.raw`if [ "$__ra" = 1 ]; then while :; do __nc=$(bridge_conns "$__o" "$B_PORT"); case "$__nc" in 0) __idle=y; break ;; ''|*[!0-9]*) __nc=x; break ;; esac; if [ "$(( $(date +%s) - __w0 ))" -ge "$__iw" ]; then break; fi; sleep 0.2; done; fi; ` +
+		String.raw`__st="$__g"; if [ "$__idle" = y ]; then __st=10; echo "[drain] old container idle (no open connection on :$B_PORT) after $(( $(date +%s) - __w0 ))s"; elif [ "$__nc" = x ]; then echo "[drain] could not count the old container's open connections (nsenter or ss missing): SIGTERM with the full grace"; elif [ -n "$B_HP$B_DNS" ] && [ "$__ra" = 1 ]; then __st=10; echo "[drain] old container still has open connections after ${'$'}{__g}s"; fi; ` +
+		String.raw`B_OLD="$__o"; __t0=$(date +%s); echo "[drain] stopping the old container (SIGTERM, then SIGKILL after ${'$'}{__st}s)"; docker stop -t "$__st" "$__o" >/dev/null 2>&1 || true; __dt=$(( $(date +%s) - __t0 )); B_NSPID=""; ` +
+		String.raw`__ec=$(docker inspect -f '{{.State.ExitCode}}' "$__o" 2>/dev/null || true); ` +
+		String.raw`if [ "$__ec" = 137 ]; then if [ "$__idle" = y ]; then echo "[drain] WARNING: the old container ignored SIGTERM and was killed after ${'$'}{__st}s (it was idle: no request lost); its PID 1 does not pass SIGTERM to the server: use an exec-form CMD (CMD [\"node\", \"server.js\"]) or exec in the start script"; drain_mark sigterm-ignored; ` +
+		String.raw`else echo "[drain] WARNING: the old container was killed after ${'$'}{__st}s with connections open or uncounted: requests in flight may have been cut (PID 1 not passing SIGTERM on, a proxy reusing keep-alive connections to it, or a request longer than stop_grace_period)"; drain_mark killed; fi; ` +
+		String.raw`elif [ "$__idle" = y ]; then echo "[drain] old container stopped ${'$'}{__dt}s after SIGTERM (exit ${'$'}{__ec:-?}), with no request in flight"; if [ "$__ra" = 1 ]; then drain_mark ok; fi; ` +
+		String.raw`else echo "[drain] old container stopped ${'$'}{__dt}s after SIGTERM (exit ${'$'}{__ec:-?})"; if [ "$__ra" = 1 ]; then drain_mark ok; fi; fi; return 0; }; `
+	)
+}
+
+/**
+ * The server-level dir that holds host config files the bridge and swap-check scripts
+ * read (.mem-cap). Always /opt/apps on a server. Only under vitest (VITEST set) does
+ * POWDER_TEST_HOST_APPS_DIR (set by __tests__/hermetic.ts to an empty dir in the test
+ * file's private root) replace it, so a generated script run by a unit test never reads
+ * the real host file of the machine running the suite (a host cap there would
+ * change the generated output). Guard: __tests__/host-paths-guard.test.ts.
+ */
+export function hostAppsDir(env: Record<string, string | undefined> = process.env): string {
+	const t = env.VITEST ? env.POWDER_TEST_HOST_APPS_DIR : undefined
+	return t && /^\/[A-Za-z0-9/_.-]+$/.test(t) ? t : '/opt/apps'
+}
+
+export function bridgeShellFunctions(cf: string, service: string, workingDir: string, nonce = '', stabMark = '', drain = false): string {
 	const tag = `${workingDir}|${service}`
 	const psq = `docker compose ${cf} ps -q ${shq(service)} 2>/dev/null | head -1`
 	const skip = (why: string) => `echo "[bridge] skipped: ${why}"; bridge_unbridged ${bridgeSkipClass(why)} ${shq(why)}; bridge_stop; return 0;`
 	const mark = bridgeVerdictMarkerFor(nonce)
 	const nmark = nginxUpstreamMarkerFor(nonce)
 	return (
-		String.raw`BRIDGE=""; B_PORT=3000; B_HP=""; B_LF=""; B_EF=""; ` +
-		String.raw`bridge_stop() { if [ -n "$BRIDGE" ]; then if [ "$(docker inspect -f '{{index .Config.Labels "powder.bridge"}}' "$BRIDGE" 2>/dev/null)" = ${shq(tag)} ]; then docker rm -f "$BRIDGE" >/dev/null 2>&1 || true; echo "[bridge] removed $BRIDGE"; fi; __bs=0; while [ "$__bs" -lt 10 ] && [ -n "$(docker ps -aq --filter ${shq('label=powder.bridge=' + tag)} 2>/dev/null)" ]; do docker ps -aq --filter ${shq('label=powder.bridge=' + tag)} 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1 || true; __bs=$((__bs+1)); sleep 2; done; fi; BRIDGE=""; rm -f "$B_LF" "$B_EF" 2>/dev/null || true; B_LF=""; B_EF=""; return 0; }; ` +
+		// Every drain part below is rendered only with `drain` (drain-mode.ts): off, the
+		// functions are exactly what they were before the drain.
+		String.raw`BRIDGE=""; B_PORT=3000; B_HP=""; B_DNS=""; B_LF=""; B_EF=""; ` +
+		(drain ? String.raw`B_AHP=""; B_RULE=""; B_NSPID=""; B_RTOK=""; B_OLD=""; B_DEAD=""; B_DRAIN_G=10; ` + drainShellFunctions(psq, stabMark, drainRuleId(workingDir, service)) : '') +
+		String.raw`bridge_stop() { ${drain ? String.raw`if [ -n "$B_RULE" ]; then drain_clear host; echo "[drain] new connections to 127.0.0.1:$B_RULE allowed again"; B_RULE=""; fi; ` : ''}if [ -n "$BRIDGE" ]; then if [ "$(docker inspect -f '{{index .Config.Labels "powder.bridge"}}' "$BRIDGE" 2>/dev/null)" = ${shq(tag)} ]; then docker rm -f "$BRIDGE" >/dev/null 2>&1 || true; echo "[bridge] removed $BRIDGE"; fi; __bs=0; while [ "$__bs" -lt 10 ] && [ -n "$(docker ps -aq --filter ${shq('label=powder.bridge=' + tag)} 2>/dev/null)" ]; do docker ps -aq --filter ${shq('label=powder.bridge=' + tag)} 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1 || true; __bs=$((__bs+1)); sleep 2; done; fi; BRIDGE=""; rm -f "$B_LF" "$B_EF" 2>/dev/null || true; B_LF=""; B_EF=""; return 0; }; ` +
 		String.raw`bridge_http() { __ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$1" 2>/dev/null | awk '{print $1}'); [ -n "$__ip" ] || return 1; __code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://$__ip:$2/" 2>/dev/null || true); case "$__code" in [234][0-9][0-9]) return 0 ;; *) return 1 ;; esac; }; ` +
 		String.raw`bridge_probe() { __hs=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$1" 2>/dev/null || true); if [ -n "$__hs" ]; then [ "$__hs" = healthy ]; return; fi; bridge_http "$1" "$2"; }; ` +
 		String.raw`bridge_wait() { __pf=bridge_probe; if [ -n "$4" ]; then __pf="$4"; fi; __end=$(( $(date +%s) + $(cap "$1" 600) )); while [ "$(date +%s)" -lt "$__end" ]; do if $__pf "$2" "$3"; then return 0; fi; sleep 1; done; return 1; }; ` +
@@ -1495,7 +1699,7 @@ export function bridgeShellFunctions(cf: string, service: string, workingDir: st
 		String.raw`bridge_nginx_check() { __nx=$(bridge_nginx_dump) || return 0; __nv=$(printf '%s\n' "$__nx" | awk -v b="$1" ${shq(NGINX_BRIDGE_AWK)} 2>/dev/null || true); __nx=""; ` +
 		String.raw`case "$__nv" in ok) echo "[bridge] nginx lists 127.0.0.1:$1 as a backup upstream" ;; no-upstream) echo "[bridge] WARNING: no nginx upstream lists 'server 127.0.0.1:$1 backup;' - the bridge runs but gets no traffic, expect 502s during the swap; add the bridge as a backup upstream in the vhost" ;; *) return 0 ;; esac; B_NGA="$__nv"; return 0; }; ` +
 		String.raw`bridge_routed() { __tl=$(docker inspect -f '{{range $k,$v := .Config.Labels}}{{$k}}={{$v}}{{"\n"}}{{end}}' "$1" 2>/dev/null || true); printf '%s\n' "$__tl" | grep -qiE '^traefik\.enable=(1|t|true)$' && printf '%s\n' "$__tl" | grep -q '^traefik\.http\.routers\.'; }; ` +
-		String.raw`bridge_unbridged() { if bridge_routed "$__old"; then if [ "$1" = internal ]; then echo "[bridge] WARNING: traefik app not bridged: $2 - expect 502s during the swap (a powder self-check tripped: this is a powder bug, nothing in the app needs to change)"; else echo "[bridge] WARNING: traefik app not bridged: $2 - expect 502s during the swap (for a missing label or healthcheck: add HEALTHCHECK + LABEL powder.bridge.enabled=true to the Dockerfile; the server compose is not synced from the repo)"; fi; bridge_mark "$1"; else echo "[bridge] not traefik-routed"; bridge_mark not-routed; fi; return 0; }; ` +
+		String.raw`bridge_unbridged() { if bridge_routed "$__old"; then if [ "$1" = internal ]; then echo "[bridge] WARNING: traefik app not bridged: $2 - expect 502s during the swap (a powder self-check tripped: this is a powder bug, nothing in the app needs to change)"; else echo "[bridge] WARNING: traefik app not bridged: $2 - expect 502s during the swap (for a missing label or healthcheck: add HEALTHCHECK + LABEL powder.bridge.enabled=true to the Dockerfile; the server compose is not synced from the repo)"; fi; bridge_mark "$1"; elif [ -n "$B_DNS" ]; then echo "[bridge] WARNING: dns-alias app not bridged: $2 - expect 502s during the swap (the proxy resolves the app name to the old container only while it is recreated)"; bridge_mark "$1"; else echo "[bridge] not traefik-routed"; bridge_mark not-routed; fi; return 0; }; ` +
 		// An app without the bridge label that traefik does not route: tell an
 		// nginx-fronted one (nginx -T names 127.0.0.1:<its published loopback port>)
 		// and a host-network one apart from not-routed. Runs in a command
@@ -1510,8 +1714,21 @@ export function bridgeShellFunctions(cf: string, service: string, workingDir: st
 		String.raw`case "$__uk" in host-network) echo "[bridge] WARNING: host-network app not bridged (network_mode: host) - expect 502s during the swap; the bridge needs a bridge network: move the app off host networking (publish 127.0.0.1:<port>, point nginx at it), then enable the bridge"; bridge_mark host-network ;; ` +
 		String.raw`nginx-unbridged) echo "[bridge] WARNING: nginx-fronted app not bridged (host nginx proxies to its 127.0.0.1 port) - expect 502s during the swap; add LABEL powder.bridge.enabled=true and powder.bridge.host-port=<app port + 10000>, and the backup upstream server 127.0.0.1:<that port> backup; in the vhost"; bridge_mark nginx-unbridged ;; ` +
 		String.raw`*) bridge_unbridged no-label 'not enabled (label powder.bridge.enabled=true)' ;; esac; return 0; }; ` +
-		String.raw`bridge_start() { bridge_nginx_scan; B_NGA=""; bridge_start_body; ${nmark ? `if [ -n "$B_NGA" ]; then echo ${shq(nmark)}" app $B_NGA"; fi; ` : ''}return 0; }; ` +
-		String.raw`bridge_start_body() { ` +
+		// DNS-alias apps sit behind a proxy that resolves them by docker DNS, not host
+		// nginx: the host nginx checks do not apply (host nginx may be installed but
+		// unused), so they are skipped and post no nginx card for this deploy.
+		// dns-alias helpers (use $__al, $__nal and the service name set by
+		// bridge_start_body): bridge_dns_args <net> <flag> fills __da with
+		// `<flag> <name>` pairs for that network and __dns with the names;
+		// bridge_net_connect joins a further network, with the aliases when it is
+		// user-defined. Without dns-alias mode it is the plain `docker network connect`.
+		String.raw`bridge_dns_args() { __da=("$2" "$__al"); __dns="$__al"; __svc=${shq(service)}; if [ "$__svc" != "$__al" ] && [[ "$__svc" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]]; then __nas=$(printf '%s\n' "$__nal" | awk -F'|' -v n="$1" '$1 == n { print $2 }' | head -1); case " $__nas " in *" $__svc "*) __da+=("$2" "$__svc"); __dns="$__dns $__svc" ;; esac; fi; return 0; }; ` +
+		String.raw`bridge_net_connect() { if [ -n "$B_DNS" ]; then case "$1" in bridge|host|none) ;; *) bridge_dns_args "$1" --alias; docker network connect "${'$'}{__da[@]}" "$1" "$2"; return ;; esac; fi; docker network connect "$1" "$2"; }; ` +
+		String.raw`bridge_start() { __dpre=""; __dpo=$(${psq} || true); if [ -n "$__dpo" ]; then __dpre=$(docker inspect -f '{{index .Config.Labels "powder.bridge.dns-alias"}}' "$__dpo" 2>/dev/null || true); fi; if [ "$__dpre" = true ]; then echo "[nginx] host nginx checks not run (powder.bridge.dns-alias app: its proxy reaches it by docker DNS name)"; else bridge_nginx_scan; fi; B_NGA=""; bridge_start_body; ${nmark ? `if [ -n "$B_NGA" ]; then echo ${shq(nmark)}" app $B_NGA"; fi; ` : ''}return 0; }; ` +
+		// A killed deploy can leave this app's powder-drain rules (host, or in the old
+		// container's netns): delete them before anything else, the stale bridge included.
+		String.raw`bridge_start_body() { B_DNS=""; ` +
+		(drain ? String.raw`drain_clear host; __dpo2=$(${psq} || true); if [ -n "$__dpo2" ]; then drain_clear netns "$(docker inspect -f '{{.State.Pid}}' "$__dpo2" 2>/dev/null || true)"; fi; ` : '') +
 		String.raw`docker ps -aq --filter ${shq('label=powder.bridge=' + tag)} 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1 || true; ` +
 		String.raw`if ! command -v curl >/dev/null 2>&1; then echo "[bridge] skipped: curl not installed on host"; return 0; fi; ` +
 		String.raw`__old=$(${psq} || true); ` +
@@ -1526,7 +1743,21 @@ export function bridgeShellFunctions(cf: string, service: string, workingDir: st
 		// traefik mode with published ports: loopback-only bindings (127.0.0.1 / ::1) on a
 		// traefik-routed app are tolerated (the clone publishes none, the old container
 		// keeps its binding); any other interface, or an app traefik does not route, skips.
-		String.raw`if [ -z "$B_HP" ]; then B_NGA=n/a; if [ "$__pb" != 0 ]; then ` +
+		// DNS-alias mode (a proxy container that resolves the app by its docker DNS
+		// name per request): label powder.bridge.dns-alias=true. A traefik-routed app
+		// keeps the traefik mode; host-port and dns-alias together is refused.
+		String.raw`__dl=$(docker inspect -f '{{index .Config.Labels "powder.bridge.dns-alias"}}' "$__old" 2>/dev/null || true); if [ "$__dl" = true ]; then if [ -n "$B_HP" ]; then B_DNS=1; ${skip('powder.bridge.dns-alias and powder.bridge.host-port are both set (use one bridge mode)')} fi; if bridge_routed "$__old"; then echo "[bridge] powder.bridge.dns-alias ignored: the app is traefik-routed, the traefik mode bridges it"; else B_DNS=1; fi; fi; ` +
+		// dns-alias: the clone publishes no host port; loopback-only bindings stay on the
+		// old container. The app port (readiness probe) is the label powder.bridge.port,
+		// else the image's single exposed tcp port.
+		String.raw`if [ -n "$B_DNS" ]; then B_NGA=n/a; if [ "$__pb" != 0 ]; then ` +
+		String.raw`__pbl=$(docker inspect -f '{{range $p,$v := .HostConfig.PortBindings}}{{range $v}}{{$p}}|{{.HostIp}}|{{.HostPort}}{{println}}{{end}}{{end}}' "$__old" 2>/dev/null) || { ${skip('could not read port bindings of the current container')} }; __pbl=$(printf '%s\n' "$__pbl" | grep -v '^$' || true); ` +
+		String.raw`if [ -z "$__pbl" ] || printf '%s\n' "$__pbl" | grep -qvE '^[^|]+[|](127[.]0[.]0[.]1|::1|\[::1\])[|]'; then ${skip('dns-alias app publishes host ports on a public interface (bind them to 127.0.0.1 or drop the ports line in the server compose; the proxy reaches the app over the docker network)')} fi; ` +
+		String.raw`echo "[bridge] loopback-only host ports stay on the old container; the bridge publishes none"; fi; ` +
+		String.raw`__bp=$(docker inspect -f '{{index .Config.Labels "powder.bridge.port"}}' "$__old" 2>/dev/null || true); if [ -n "$__bp" ]; then case "$__bp" in *[!0-9]*|0*) ${skip('invalid powder.bridge.port label (want 1-65535)')} ;; esac; if [ "${'$'}{#__bp}" -gt 5 ] || [ "$__bp" -gt 65535 ]; then ${skip('invalid powder.bridge.port label (want 1-65535)')} fi; B_PORT="$__bp"; else ` +
+		String.raw`__ep=$(docker inspect -f '{{range $p,$v := .Config.ExposedPorts}}{{$p}} {{end}}' "$__old" 2>/dev/null) || { ${skip('could not read exposed ports of the current container')} }; __ep=$(printf '%s\n' "$__ep" | tr ' ' '\n' | grep -v '^$' || true); ` +
+		String.raw`if [ "$(printf '%s\n' "$__ep" | grep -c .)" != 1 ] || ! [[ "$__ep" =~ ^([1-9][0-9]{0,4})/tcp$ ]] || [ "${'$'}{BASH_REMATCH[1]}" -gt 65535 ]; then ${skip('dns-alias mode needs the app port: the image does not expose exactly one tcp port (set label powder.bridge.port=<port>)')} fi; B_PORT="${'$'}{BASH_REMATCH[1]}"; fi; ` +
+		String.raw`elif [ -z "$B_HP" ]; then B_NGA=n/a; if [ "$__pb" != 0 ]; then ` +
 		String.raw`__pbl=$(docker inspect -f '{{range $p,$v := .HostConfig.PortBindings}}{{range $v}}{{$p}}|{{.HostIp}}|{{.HostPort}}{{println}}{{end}}{{end}}' "$__old" 2>/dev/null) || { ${skip('could not read port bindings of the current container')} }; __pbl=$(printf '%s\n' "$__pbl" | grep -v '^$' || true); ` +
 		String.raw`if [ -z "$__pbl" ] || printf '%s\n' "$__pbl" | grep -qvE '^[^|]+[|](127[.]0[.]0[.]1|::1|\[::1\])[|]'; then ${skip('app publishes host ports on a public interface (drop the ports line of this service in the server compose: traefik reaches the app over the docker network; an nginx-fronted app sets label powder.bridge.host-port)')} fi; ` +
 		String.raw`if ! bridge_routed "$__old"; then ${skip('app publishes host ports and is not traefik-routed (set label powder.bridge.host-port for an nginx-fronted app)')} fi; ` +
@@ -1535,16 +1766,16 @@ export function bridgeShellFunctions(cf: string, service: string, workingDir: st
 		String.raw`__pbl=$(docker inspect -f '{{range $p,$v := .HostConfig.PortBindings}}{{range $v}}{{$p}}|{{.HostIp}}|{{.HostPort}}{{println}}{{end}}{{end}}' "$__old" 2>/dev/null) || { ${skip('could not read port bindings of the current container')} }; __pbl=$(printf '%s\n' "$__pbl" | grep -v '^$' || true); ` +
 		String.raw`if [ "$__pb" != 1 ] || [ "$(printf '%s\n' "$__pbl" | grep -c .)" != 1 ]; then ${skip('host-port mode needs exactly one published port')} fi; ` +
 		String.raw`if ! [[ "$__pbl" =~ ^([0-9]{1,5})/tcp\|127\.0\.0\.1\|([0-9]{1,5})$ ]]; then ${skip('host-port mode needs a tcp port bound to 127.0.0.1 only')} fi; ` +
-		String.raw`B_PORT="${'$'}{BASH_REMATCH[1]}"; __ahp="${'$'}{BASH_REMATCH[2]}"; case "$__ahp" in 0*) ${skip('unexpected app host port')} ;; esac; if [ "$B_HP" != "$((__ahp + 10000))" ]; then ${skip('powder.bridge.host-port must be the app host port + 10000')} fi; bridge_nginx_check "$B_HP"; fi; ` +
+		String.raw`B_PORT="${'$'}{BASH_REMATCH[1]}"; __ahp="${'$'}{BASH_REMATCH[2]}"; case "$__ahp" in 0*) ${skip('unexpected app host port')} ;; esac; if [ "$B_HP" != "$((__ahp + 10000))" ]; then ${skip('powder.bridge.host-port must be the app host port + 10000')} fi; ${drain ? 'B_AHP="$__ahp"; ' : ''}bridge_nginx_check "$B_HP"; fi; ` +
 		String.raw`__nm=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$__old" 2>/dev/null || true); ` +
 		String.raw`case "$__nm" in host|none|container:*) __bad=1 ;; *) __bad=0 ;; esac; if [ "$__bad" = 1 ]; then ${skip('non-bridge network mode')} fi; ` +
 		String.raw`__mc=$(docker inspect -f '{{len .Mounts}}' "$__old" 2>/dev/null || echo x); __bc=$(docker inspect -f '{{len .HostConfig.Binds}}' "$__old" 2>/dev/null || echo y); ` +
 		String.raw`if [ "$__mc" != "$__bc" ]; then ${skip('mounts not expressible as binds')} fi; ` +
-		String.raw`__hx=$(docker inspect -f '{{len .HostConfig.ExtraHosts}}|{{len .HostConfig.Tmpfs}}|{{len .HostConfig.CapAdd}}|{{len .HostConfig.Sysctls}}|{{.HostConfig.Init}}|{{.HostConfig.ShmSize}}' "$__old" 2>/dev/null || echo x); __xh="${'$'}{__hx%%|*}"; case "$__xh" in ''|*[!0-9]*) __bad=1 ;; *) case "${'$'}{__hx#*|}" in '0|0|0|<nil>|67108864'|'0|0|0|false|67108864') __bad=0 ;; *) __bad=1 ;; esac ;; esac; if [ -z "$B_HP" ] && [ "$__xh" != 0 ]; then __bad=1; fi; if [ "$__bad" = 1 ]; then ${skip('extra_hosts/tmpfs/cap_add/sysctls/init/shm_size set')} fi; ` +
+		String.raw`__hx=$(docker inspect -f '{{len .HostConfig.ExtraHosts}}|{{len .HostConfig.Tmpfs}}|{{len .HostConfig.CapAdd}}|{{len .HostConfig.Sysctls}}|{{.HostConfig.Init}}|{{.HostConfig.ShmSize}}' "$__old" 2>/dev/null || echo x); __xh="${'$'}{__hx%%|*}"; case "$__xh" in ''|*[!0-9]*) __bad=1 ;; *) case "${'$'}{__hx#*|}" in '0|0|0|<nil>|67108864'|'0|0|0|false|67108864') __bad=0 ;; *) __bad=1 ;; esac ;; esac; if [ -z "$B_HP$B_DNS" ] && [ "$__xh" != 0 ]; then __bad=1; fi; if [ "$__bad" = 1 ]; then ${skip('extra_hosts/tmpfs/cap_add/sysctls/init/shm_size set')} fi; ` +
 		String.raw`if docker inspect -f '{{json .Config.Env}}' "$__old" 2>/dev/null | grep -qF '\n'; then ${skip('multi-line env value')} fi; ` +
 		String.raw`if docker inspect -f '{{json .Config.Labels}}' "$__old" 2>/dev/null | grep -qE ${shq(JSON_LINEBREAK_ERE)}; then ${skip('label key or value with a line break (CR/LF)')} fi; ` +
 		String.raw`__img=$(docker inspect -f '{{.Image}}' "$__old" 2>/dev/null || true); ` +
-		String.raw`if [ -z "$B_HP" ] && [ -z "$(docker inspect -f '{{if .Config.Healthcheck}}y{{end}}' "$__old" 2>/dev/null)" ]; then ${skip('current container has no healthcheck (required for opt-in)')} fi; ` +
+		String.raw`if [ -z "$B_HP$B_DNS" ] && [ -z "$(docker inspect -f '{{if .Config.Healthcheck}}y{{end}}' "$__old" 2>/dev/null)" ]; then ${skip('current container has no healthcheck (required for opt-in)')} fi; ` +
 		String.raw`if docker inspect -f '{{json .Config.Cmd}} {{json .Config.Entrypoint}}' "$__old" 2>/dev/null | grep -qE ` + shq(BOOT_SCHEMA_PUSH_ERE) + String.raw`; then if [ "$(docker inspect -f '{{index .Config.Labels "powder.bridge.boot-push-ok"}}' "$__old" 2>/dev/null)" != true ]; then ${skip('boot-time schema push in command (re-running it can revert newer schema changes; set label powder.bridge.boot-push-ok=true to allow)')} fi; fi; ` +
 		String.raw`__c1=$(docker inspect -f '{{json .Config.Cmd}}{{json .Config.Entrypoint}}' "$__old" 2>/dev/null || echo a); __c2=$(docker inspect --type image -f '{{json .Config.Cmd}}{{json .Config.Entrypoint}}' "$__img" 2>/dev/null || echo b); ` +
 		String.raw`if [ -z "$__img" ] || [ "$__c1" != "$__c2" ]; then ${skip('command/entrypoint overridden or image unreadable')} fi; ` +
@@ -1556,19 +1787,20 @@ export function bridgeShellFunctions(cf: string, service: string, workingDir: st
 		String.raw`docker inspect -f '{{range $k,$v := .Config.Labels}}{{$k}}={{$v}}{{"\n"}}{{end}}' "$__old" 2>/dev/null > "$B_LF" || true; ` +
 		String.raw`__lc=$(docker inspect -f '{{len .Config.Labels}}' "$__old" 2>/dev/null || true); case "$__lc" in ''|*[!0-9]*) ${skip('could not read labels of the current container')} ;; esac; __fl=$(wc -l < "$B_LF" | tr -d ' '); if [ "$__fl" -gt 0 ] 2>/dev/null && [ -z "$(tail -n 1 "$B_LF")" ]; then __fl=$((__fl-1)); fi; if [ "$__fl" != "$__lc" ] || LC_ALL=C grep -q "$(printf '\r')" "$B_LF"; then ${skip('label file line count differs from the label count (powder self-check)')} fi; ` +
 		String.raw`grep -v '^com\.docker\.compose\.' "$B_LF" | grep -v '^$' > "$B_LF.f" || true; mv -f "$B_LF.f" "$B_LF" || { ${skip('label file rewrite failed')} }; ` +
-		String.raw`if [ -n "$B_HP" ]; then grep -v '^traefik\.' "$B_LF" > "$B_LF.f" || true; mv -f "$B_LF.f" "$B_LF" || { ${skip('label file rewrite failed')} }; printf 'traefik.enable=false\n' >> "$B_LF"; else ` +
+		String.raw`if [ -n "$B_HP$B_DNS" ]; then grep -v '^traefik\.' "$B_LF" > "$B_LF.f" || true; mv -f "$B_LF.f" "$B_LF" || { ${skip('label file rewrite failed')} }; printf 'traefik.enable=false\n' >> "$B_LF"; else ` +
 		String.raw`if ! grep -q '^traefik\.http\.routers\.' "$B_LF" || ! grep -q '^traefik\.http\.services\.' "$B_LF" || grep -q '^traefik\.enable=false' "$B_LF"; then ${skip('no explicit traefik router+service labels (worker / non-http / default-named)')} fi; ` +
 		String.raw`for __r in $(grep -oE '^traefik\.http\.routers\.[^.=]+' "$B_LF" | sort -u); do if ! grep -qF "$__r.rule=" "$B_LF"; then ${skip('traefik router without an explicit rule label')} fi; done; ` +
 		String.raw`B_PORT=$(grep -m1 -E '^traefik\.http\.services\.[^=]*\.loadbalancer\.server\.port=' "$B_LF" | cut -d= -f2 || true); case "$B_PORT" in ''|*[!0-9]*) B_PORT=$(docker inspect -f '{{range $p,$v := .Config.ExposedPorts}}{{$p}} {{end}}' "$__old" 2>/dev/null | awk '{split($1,a,"/"); print a[1]}'); case "$B_PORT" in ''|*[!0-9]*) B_PORT=3000 ;; esac ;; esac; fi; ` +
+		(drain ? String.raw`if [ -z "$B_HP$B_DNS" ]; then sed -E 's/^(traefik\.http\.routers\.[^.=]+)\./\1-powder-bridge./' "$B_LF" > "$B_LF.f" && mv -f "$B_LF.f" "$B_LF" || { ${skip('label file rewrite failed')} }; fi; ` : '') +
 		String.raw`docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$__old" 2>/dev/null | grep -v '^$' > "$B_EF" || true; ` +
 		String.raw`set --; ` +
 		String.raw`while IFS= read -r __b; do if [ -n "$__b" ]; then set -- "$@" -v "$__b"; fi; done < <(docker inspect -f '{{range .HostConfig.Binds}}{{println .}}{{end}}' "$__old" 2>/dev/null); ` +
 		String.raw`__u=$(docker inspect -f '{{.Config.User}}' "$__old" 2>/dev/null || true); if [ -n "$__u" ]; then set -- "$@" --user "$__u"; fi; ` +
 		String.raw`__w=$(docker inspect -f '{{.Config.WorkingDir}}' "$__old" 2>/dev/null || true); if [ -n "$__w" ]; then set -- "$@" --workdir "$__w"; fi; ` +
-		// host-port mode only (traefik mode skipped above on any extra_hosts): copied as
+		// host-port and dns-alias modes only (traefik mode skipped above on any extra_hosts): copied as
 		// --add-host (e.g. host.docker.internal:host-gateway for a DB on the host); any
 		// entry outside name:ip / name:host-gateway skips.
-		String.raw`if [ -n "$B_HP" ] && [ "$__xh" != 0 ]; then __eh=$(docker inspect -f '{{range .HostConfig.ExtraHosts}}{{println .}}{{end}}' "$__old" 2>/dev/null) || { ${skip('could not read extra_hosts of the current container')} }; __ehn=0; while IFS= read -r __h; do if [ -z "$__h" ]; then continue; fi; if [[ "$__h" =~ ^([A-Za-z0-9][A-Za-z0-9._-]{0,252})[:=](host-gateway|[0-9]{1,3}(\.[0-9]{1,3}){3}|[0-9A-Fa-f:]*:[0-9A-Fa-f:]*)$ ]]; then set -- "$@" --add-host "${'$'}{BASH_REMATCH[1]}:${'$'}{BASH_REMATCH[2]}"; __ehn=$((__ehn+1)); else ${skip('unexpected extra_hosts entry')} fi; done < <(printf '%s\n' "$__eh"); if [ "$__ehn" != "$__xh" ]; then ${skip('extra_hosts count mismatch')} fi; fi; ` +
+		String.raw`if [ -n "$B_HP$B_DNS" ] && [ "$__xh" != 0 ]; then __eh=$(docker inspect -f '{{range .HostConfig.ExtraHosts}}{{println .}}{{end}}' "$__old" 2>/dev/null) || { ${skip('could not read extra_hosts of the current container')} }; __ehn=0; while IFS= read -r __h; do if [ -z "$__h" ]; then continue; fi; if [[ "$__h" =~ ^([A-Za-z0-9][A-Za-z0-9._-]{0,252})[:=](host-gateway|[0-9]{1,3}(\.[0-9]{1,3}){3}|[0-9A-Fa-f:]*:[0-9A-Fa-f:]*)$ ]]; then set -- "$@" --add-host "${'$'}{BASH_REMATCH[1]}:${'$'}{BASH_REMATCH[2]}"; __ehn=$((__ehn+1)); else ${skip('unexpected extra_hosts entry')} fi; done < <(printf '%s\n' "$__eh"); if [ "$__ehn" != "$__xh" ]; then ${skip('extra_hosts count mismatch')} fi; fi; ` +
 		// the bridge runs the app's image with the app's env next to the app, so it
 		// keeps the running container's hardening: its cap_drop, security_opt (e.g.
 		// no-new-privileges), read_only and pids_limit, plus NET_RAW always dropped (as
@@ -1581,17 +1813,36 @@ export function bridgeShellFunctions(cf: string, service: string, workingDir: st
 		String.raw`__pl=$(docker inspect -f '{{.HostConfig.PidsLimit}}' "$__old" 2>/dev/null) || { ${skip('could not read pids_limit of the current container')} }; case "$__pl" in ''|'<nil>'|0|-*) ;; *[!0-9]*) ${skip('unexpected pids_limit value')} ;; *) set -- "$@" --pids-limit "$__pl" ;; esac; ` +
 		String.raw`__nets=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$__old" 2>/dev/null || true); __n1=$(printf '%s\n' "$__nets" | awk '{print $1}'); ` +
 		String.raw`if [ -z "$__n1" ]; then ${skip('no docker network on current container')} fi; ` +
-		String.raw`__cap=$(cat /opt/apps/.mem-cap 2>/dev/null || echo 2g); ` +
+		// dns-alias: the clone answers under the old container's OWN names only, read
+		// from its own inspect data (never from a label or compose value): its container
+		// name on every user-defined network, plus the compose service name on a network
+		// where the old container already carries it as an alias. The default bridge
+		// network has no aliases: the clone joins it plain, like the other modes.
+		String.raw`__dnl=""; if [ -n "$B_DNS" ]; then __al=$(docker inspect -f '{{.Name}}' "$__old" 2>/dev/null | sed 's#^/##'); ` +
+		String.raw`if ! [[ "$__al" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || [[ "$__al" == *-powder-bridge ]]; then ${skip('dns-alias mode: unexpected container name')} fi; ` +
+		String.raw`__nal=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}|{{range $v.Aliases}}{{.}} {{end}}{{println}}{{end}}' "$__old" 2>/dev/null) || { ${skip('could not read network aliases of the current container')} }; ` +
+		String.raw`__n1=""; for __n in $__nets; do case "$__n" in bridge|host|none) ;; *) __n1="$__n"; break ;; esac; done; ` +
+		String.raw`if [ -z "$__n1" ]; then ${skip('dns-alias mode needs a user-defined docker network (aliases do not work on the default bridge network)')} fi; ` +
+		String.raw`bridge_dns_args "$__n1" --network-alias; set -- "$@" "${'$'}{__da[@]}"; __dnl="$__dns"; fi; ` +
+		String.raw`__cap=$(cat ${hostAppsDir()}/.mem-cap 2>/dev/null || echo 2g); ` +
 		String.raw`if [ -n "$B_HP" ]; then set -- "$@" -p "127.0.0.1:$B_HP:$B_PORT"; fi; ` +
 		String.raw`__name="$(docker inspect -f '{{.Name}}' "$__old" 2>/dev/null | sed 's#^/##')-powder-bridge"; BRIDGE="$__name"; ` +
 		String.raw`if ! docker create --pull=never --name "$__name" --restart=no --memory "$__cap" --memory-swap "$__cap" --network "$__n1" --label ${shq('powder.bridge=' + tag)} ${COMPOSE_LABEL_BLANKS} ${SIDE_RUN_CAPS} --health-cmd 'test -f /tmp/.powder-ready' --health-interval 1s --health-retries 1 --health-start-interval 1s --health-start-period 60s --label-file "$B_LF" --env-file "$B_EF" "$@" "$__img" >/dev/null 2>&1; then ${skip('docker create failed')} fi; rm -f "$B_EF" 2>/dev/null || true; B_EF=""; ` +
-		String.raw`for __n in $__nets; do if [ "$__n" != "$__n1" ]; then if ! docker network connect "$__n" "$__name" >/dev/null 2>&1; then ${skip('docker network connect failed')} fi; fi; done; ` +
+		String.raw`for __n in $__nets; do if [ "$__n" != "$__n1" ]; then if ! bridge_net_connect "$__n" "$__name" >/dev/null 2>&1; then ${skip('docker network connect failed')} fi; fi; done; ` +
 		String.raw`if ! docker start "$__name" >/dev/null 2>&1; then ${skip('docker start failed')} fi; ` +
-		String.raw`if bridge_wait 60 "$__name" "$B_PORT" bridge_http && docker exec "$__name" touch /tmp/.powder-ready >/dev/null 2>&1 && bridge_wait 30 "$__name" "$B_PORT"; then sleep 3; if [ -n "$B_HP" ]; then echo "[bridge] $__name answering on 127.0.0.1:$B_HP (nginx backup upstream) - overlapping old and new during the swap"; else echo "[bridge] $__name answering on :$B_PORT - overlapping old and new during the swap"; fi; bridge_mark bridged; else ${skip('bridge not answering HTTP / not healthy within budget (needs sh+test in image)')} fi; ` +
+		String.raw`if bridge_wait 60 "$__name" "$B_PORT" bridge_http && docker exec "$__name" touch /tmp/.powder-ready >/dev/null 2>&1 && bridge_wait 30 "$__name" "$B_PORT"; then sleep 3; if [ -n "$B_HP" ]; then echo "[bridge] $__name answering on 127.0.0.1:$B_HP (nginx backup upstream) - overlapping old and new during the swap"; elif [ -n "$B_DNS" ]; then echo "[bridge] $__name answering on :$B_PORT (DNS-alias mode: docker DNS also answers $__dnl with the bridge) - overlapping old and new during the swap"; else echo "[bridge] $__name answering on :$B_PORT - overlapping old and new during the swap"; fi; bridge_mark bridged; else ${skip('bridge not answering HTTP / not healthy within budget (needs sh+test in image)')} fi; ` +
 		String.raw`return 0; }; ` +
 		String.raw`bridge_handoff() { if [ -z "$BRIDGE" ]; then return 0; fi; if ! docker inspect "$BRIDGE" >/dev/null 2>&1; then echo "[bridge] already removed (stale-state retry)"; BRIDGE=""; rm -f "$B_LF" "$B_EF" 2>/dev/null || true; return 0; fi; __new=$(${psq} || true); ` +
-		String.raw`if [ -n "$__new" ] && [ -z "$B_HP" ]; then __nl=$(docker inspect -f '{{range $k,$v := .Config.Labels}}{{$k}}={{$v}}{{"\n"}}{{end}}' "$__new" 2>/dev/null | grep '^traefik\.' | sort || true); __bl=$(grep '^traefik\.' "$B_LF" 2>/dev/null | sort || true); if [ "$__nl" != "$__bl" ]; then echo "[bridge] traefik labels differ between bridge and new container; removing bridge now (conflicting routers would be dropped)"; bridge_stop; return 0; fi; fi; ` +
-		String.raw`if [ -n "$__new" ] && bridge_wait 90 "$__new" "$B_PORT"; then sleep 3; echo "[bridge] new container ready; draining bridge"; docker exec "$BRIDGE" rm -f /tmp/.powder-ready >/dev/null 2>&1 || true; sleep 3; docker stop -t 10 "$BRIDGE" >/dev/null 2>&1 || true; elif [ -z "$__new" ]; then echo "[bridge] no new container found after recreate; removing bridge"; else echo "[bridge] new container not ready within 90s; removing bridge anyway (health gate decides)"; fi; ` +
+		(drain
+			? // the bridge's routers have their own names (bridge_start_body): only a service or
+				// middleware the new container defines differently conflicts; one it adds (the
+				// retry middleware when the drain is turned on) does not.
+				String.raw`if [ -n "$__new" ] && [ -z "$B_HP$B_DNS" ]; then __nl=$(docker inspect -f '{{range $k,$v := .Config.Labels}}{{$k}}={{$v}}{{"\n"}}{{end}}' "$__new" 2>/dev/null | grep '^traefik\.' | grep -v '^traefik\.http\.routers\.' | sort || true); __bc=0; while IFS= read -r __bline; do [ -n "$__bline" ] || continue; case "${'$'}{__nl}"$'\n' in "$__bline"$'\n'*|*$'\n'"$__bline"$'\n'*) ;; *) __bc=1 ;; esac; done < <(grep '^traefik\.' "$B_LF" 2>/dev/null | grep -v '^traefik\.http\.routers\.'); if [ "$__bc" = 1 ]; then echo "[bridge] a traefik service or middleware of the new container differs from the bridge's; removing bridge now (conflicting definitions would be dropped)"; bridge_stop; return 0; fi; fi; `
+			: String.raw`if [ -n "$__new" ] && [ -z "$B_HP$B_DNS" ]; then __nl=$(docker inspect -f '{{range $k,$v := .Config.Labels}}{{$k}}={{$v}}{{"\n"}}{{end}}' "$__new" 2>/dev/null | grep '^traefik\.' | sort || true); __bl=$(grep '^traefik\.' "$B_LF" 2>/dev/null | sort || true); if [ "$__nl" != "$__bl" ]; then echo "[bridge] traefik labels differ between bridge and new container; removing bridge now (conflicting routers would be dropped)"; bridge_stop; return 0; fi; fi; `) +
+		// host-port drain: the new container answers on its own IP, so new connections to
+		// the app port are allowed again (nginx's primary); the bridge, a backup, then gets
+		// none. Its requests in flight finish inside the same grace as the old container's.
+		String.raw`if [ -n "$__new" ] && bridge_wait 90 "$__new" "$B_PORT"; then ${drain ? String.raw`if [ -n "$B_RULE" ]; then drain_clear host; echo "[drain] new container ready; new connections to 127.0.0.1:$B_RULE go to it again"; B_RULE=""; fi; ` : ''}sleep 3; echo "[bridge] new container ready; draining bridge"; docker exec "$BRIDGE" rm -f /tmp/.powder-ready >/dev/null 2>&1 || true; sleep 3; docker stop -t ${drain ? '"$B_DRAIN_G"' : '10'} "$BRIDGE" >/dev/null 2>&1 || true; elif [ -z "$__new" ]; then echo "[bridge] no new container found after recreate; removing bridge"; else echo "[bridge] new container not ready within 90s; removing bridge anyway (health gate decides)"; fi; ` +
 		String.raw`bridge_stop; return 0; }; `
 	)
 }
@@ -1708,7 +1959,7 @@ export function swapCheckShellFunctions(
 		String.raw`__nm=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$__old" 2>/dev/null || true); ` +
 		String.raw`case "$__nm" in host) echo "swap-check: skipped (host-network app)"; return 0 ;; none|container:*) ${skip('non-bridge network mode')} ;; esac; ` +
 		String.raw`if ! docker compose ${cf} run -d --no-deps --name "$SC_NAME" --label traefik.enable=false --label powder.candidate=1 --label ${shq('powder.candidate.app=' + tag)} ${shq(service)} >/dev/null 2>&1 </dev/null; then ${skip('docker compose run failed')} fi; ` +
-		String.raw`__cap=$(cat /opt/apps/.mem-cap 2>/dev/null || true); if [ -z "$__cap" ]; then __cap=$(docker inspect -f '{{.HostConfig.Memory}}' "$__old" 2>/dev/null || echo 0); case "$__cap" in ''|*[!0-9]*|0) __cap="" ;; esac; fi; if [ -n "$__cap" ]; then docker update --memory "$__cap" --memory-swap "$__cap" "$SC_NAME" >/dev/null 2>&1 || true; fi; ` +
+		String.raw`__cap=$(cat ${hostAppsDir()}/.mem-cap 2>/dev/null || true); if [ -z "$__cap" ]; then __cap=$(docker inspect -f '{{.HostConfig.Memory}}' "$__old" 2>/dev/null || echo 0); case "$__cap" in ''|*[!0-9]*|0) __cap="" ;; esac; fi; if [ -n "$__cap" ]; then docker update --memory "$__cap" --memory-swap "$__cap" "$SC_NAME" >/dev/null 2>&1 || true; fi; ` +
 		String.raw`__lport=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$SC_NAME" 2>/dev/null | sed -n 's/^PORT=\([0-9][0-9]*\)$/\1/p' | head -1); ` +
 		String.raw`case "$__lport" in ''|*[!0-9]*) __lport=$(docker inspect -f '{{range $p,$v := .HostConfig.PortBindings}}{{$p}} {{end}}' "$__old" 2>/dev/null | awk '{split($1,a,"/"); print a[1]}') ;; esac; ` +
 		String.raw`case "$__lport" in ''|*[!0-9]*) __lport=$(docker inspect -f '{{range $k,$v := .Config.Labels}}{{$k}}={{$v}}{{"\n"}}{{end}}' "$__old" 2>/dev/null | grep -m1 -E '^traefik\.http\.services\.[^=]*\.loadbalancer\.server\.port=' | cut -d= -f2 || true) ;; esac; ` +
@@ -1832,8 +2083,12 @@ export function testGateShell(p: {
 	 *  login hosts the deploy's probe read (root's own on this server are added). */
 	loginSelf?: string
 	loginHosts?: readonly string[]
+	/** shell printing the run's nonced result mark (deploy/stability.ts test-gate-result);
+	 *  '' or unset prints none. Called right after the FAILED and passed lines. */
+	resultMark?: (result: 'passed' | 'failed') => string
 }): string {
 	const t = p.tag
+	const mark = (r: 'passed' | 'failed') => p.resultMark?.(r) ?? ''
 	const self = (p.loginSelf ?? p.app ?? '').toLowerCase().replace(/[^a-z0-9._-]/g, '')
 	const hosts = (p.loginHosts ?? []).map((h) => h.toLowerCase()).filter((h) => /^[a-z0-9.:-]+$/.test(h)).join(' ')
 	const app = (p.app ?? 'app').replace(/[^A-Za-z0-9._-]/g, '_')
@@ -1879,8 +2134,8 @@ export function testGateShell(p: {
 		`( set -o pipefail; ${p.run} docker run --rm --pull=never --network "$TG_NET" "$@" --pids-limit 2048 --security-opt no-new-privileges --cap-drop NET_RAW `,
 		`--label traefik.enable=false --label com.docker.compose.project= --label com.docker.compose.service= --label ${shq(`powder.testgate=${p.label}`)} -v "$TG_SRC":/src:ro -w /w "$TG_REF" sh -lc 'cp -a /src/. /w/ && sh .powder/test.sh' 2>&1 | { head -c 2000000; cat >/dev/null; } ) && TG_RC=0 || TG_RC=$?; `,
 		`${testGateStopShell(p.label)}; rm -rf "$TG_SRC"; `,
-		`if [ "$TG_RC" -ne 0 ]; then echo "${t} FAILED (exit $TG_RC) - NOT swapping; the old container keeps serving the previous version"; ` +
+		`if [ "$TG_RC" -ne 0 ]; then echo "${t} FAILED (exit $TG_RC) - NOT swapping; the old container keeps serving the previous version"; ${mark('failed')}` +
 			(p.testsFailedExit ? `case "$TG_RC" in ${TEST_GATE_INFRA_RCS}) exit 1;; esac; exit ${Math.trunc(p.testsFailedExit)}; fi; ` : `exit 1; fi; `),
-		`echo "${t} passed"; `,
+		`echo "${t} passed"; ${mark('passed')}`,
 	].join('')
 }

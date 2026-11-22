@@ -16,6 +16,7 @@ import { Spinner } from '@/components/ui/spinner'
 import { StatusDot, StatusLabel, type StatusTone } from '@/components/ui/status'
 import { cn } from '@/lib/cn'
 import type { DeployDay } from '@/lib/deploy-days'
+import { tileBorders, tileLayout } from '@/lib/status-tiles'
 import {
 	ArrowDown,
 	ChevronDown,
@@ -326,9 +327,12 @@ function AppsList({ billing, onOpenDeploy }: { billing: Billing; onOpenDeploy: (
 					<div className="mt-4 grid grid-cols-1 overflow-hidden rounded-lg border border-border bg-background/40 lg:grid-cols-[auto_minmax(0,1fr)]">
 						<fieldset
 							aria-label="filter apps by status"
-							className="grid min-w-0 grid-cols-4 divide-x divide-border border-b border-border lg:border-b-0 lg:border-r"
+							className={cn(
+								'grid min-w-0 border-b border-border lg:border-b-0 lg:border-r',
+								tileLayout(STATUSES.length).grid,
+							)}
 						>
-							{STATUSES.map((s) => {
+							{STATUSES.map((s, i) => {
 								const active = filter === s
 								const n = counts[s]
 								return (
@@ -340,6 +344,7 @@ function AppsList({ billing, onOpenDeploy }: { billing: Billing; onOpenDeploy: (
 										className={cn(
 											'relative flex min-h-14 min-w-0 flex-col justify-center px-3 py-2.5 text-left transition-colors hover:bg-accent/60 focus-visible:z-10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:px-4 lg:min-w-26',
 											active && 'bg-accent',
+											tileBorders(STATUSES.length, i),
 										)}
 									>
 										<span
@@ -448,7 +453,7 @@ function AppItem({
 						{a.domain ?? 'worker, no domain'}
 						<span className="md:hidden"> · {a.server}</span>
 					</span>
-					<DeployStrip days={a.days} className="mt-2 h-2.5" />
+					<DeployStrip days={a.days} className="mt-2 h-2.5" focusable={false} />
 				</span>
 				<span className="hidden truncate text-sm text-muted-foreground md:block">{a.server}</span>
 				<span className="flex items-center gap-2 justify-self-end md:justify-self-start">

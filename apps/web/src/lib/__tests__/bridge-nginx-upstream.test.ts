@@ -280,11 +280,13 @@ describe('bridge_nginx_scan / bridge_start', () => {
 	})
 	it('bridge_start: scan first, per-app check only in host-port mode, n/a outside it', () => {
 		const s = fns()
-		expect(s).toContain('bridge_start() { bridge_nginx_scan; B_NGA=""; bridge_start_body;')
+		// the scan runs first, except for a dns-alias app (no host nginx in its path)
+		expect(s).toContain('then echo "[nginx] host nginx checks not run (powder.bridge.dns-alias app: its proxy reaches it by docker DNS name)"; else bridge_nginx_scan; fi; B_NGA=""; bridge_start_body;')
 		expect(s).toContain(
 			'app host port + 10000\'; bridge_stop; return 0; fi; bridge_nginx_check "$B_HP"; fi; ',
 		)
-		expect(s).toContain('if [ -z "$B_HP" ]; then B_NGA=n/a;')
+		expect(s).toContain('elif [ -z "$B_HP" ]; then B_NGA=n/a;')
+		expect(s).toContain('if [ -n "$B_DNS" ]; then B_NGA=n/a;')
 		expect(s).toContain('not enabled (label powder.bridge.enabled=true)"; B_NGA=n/a;')
 	})
 	it('generated shell passes bash -n', () => {

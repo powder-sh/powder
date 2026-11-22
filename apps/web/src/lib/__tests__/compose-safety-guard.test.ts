@@ -96,6 +96,17 @@ describe('compose safety authority: shapes that must pass', () => {
 	it('the resolved standard app', () => {
 		expect(codes(resolved())).toEqual([])
 	})
+	it('the bridge mode labels (traefik, host-port, dns-alias) are not runtime markers', () => {
+		const labels = {
+			'powder.bridge.enabled': 'true',
+			'powder.bridge.dns-alias': 'true',
+			'powder.bridge.port': '3000',
+			'powder.bridge.host-port': '13000',
+			'powder.bridge.boot-push-ok': 'true',
+		}
+		expect(codes(resolved({ labels }))).toEqual([])
+		expect(codes(resolved({ labels: { 'powder.bridge': '/opt/apps/victim|app' } }))).toContain('powder_label')
+	})
 	it('blog (workdir layout, bundled postgres, initdb binds, a port on a private address)', () => {
 		const doc = {
 			name: 'blog',

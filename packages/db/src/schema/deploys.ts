@@ -17,6 +17,13 @@ export const deployKind = pgEnum('deploy_kind', [
 // worker. The worker flips it to 'running' when it claims (FOR UPDATE SKIP
 // LOCKED). When POWDER_DEPLOY_WORKER is off, rows go straight to 'running'
 // (in-web mode: the web process runs them), so 'queued' is never used.
+/** The test gate's result as the deploy recorded it (deploys.test_gate, 0066), from the
+ *  deploy script's nonced mark, never from a log search: 'passed' = .powder/test.sh ran and
+ *  exited 0, 'failed' = the deploy failed at the test gate, 'none' = no .powder/test.sh.
+ *  NULL = not recorded (the deploy died before the gate, or a row from before 0066). */
+export const TEST_GATE_VALUES = ['passed', 'failed', 'none'] as const
+export type TestGate = (typeof TEST_GATE_VALUES)[number]
+
 export const deployStatus = pgEnum('deploy_status', ['queued', 'running', 'success', 'failed'])
 
 export const deploys = pgTable(
@@ -45,8 +52,14 @@ export const deploys = pgTable(
 		exitCode: integer('exit_code'),
 		errorSummary: text('error_summary'),
 		triggeredBy: text('triggered_by'),
+		// The commit this deploy put into production: set after the swap only, so a failure
+		// before the swap leaves it NULL (rollback targets and last-good lookups rely on that).
 		gitSha: text('git_sha'),
 		gitBranch: text('git_branch'),
+		// The commit this deploy synced or built, live or not (0070): written when the deploy
+		// ends, on success and failure. NULL = unknown. Displays read it through
+		// apps/web/src/lib/deploy-commit.ts, never on its own.
+		builtSha: text('built_sha'),
 		imageTag: text('image_tag'),
 		// sha256 of the resolved compose config this deploy ran with (0056). Set on
 		// success only; the next deploy enforces the high-severity compose rules
@@ -76,6 +89,9 @@ export const deploys = pgTable(
 		// Settle window (0063, apps/web/src/lib/deploy-settle.ts): a queued webhook push
 		// is not claimed before this time. NULL = claim at once. Status stays 'queued'.
 		notBefore: timestamp('not_before', { withTimezone: true }),
+		// The test gate's result (0066, TestGate above). Written by finishDeploy on success
+		// and failure alike; NULL = not recorded.
+		testGate: text('test_gate').$type<TestGate>(),
 	},
 	(t) => ({
 		// The cross-process deploy lock (0035): at most one RUNNING and at most

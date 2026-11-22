@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto'
-import { appRepos, createId, db, eq, prefixes, servers } from './db'
+import { appRepos, createId, db, eq, prefixes, previewDeploys, servers } from './db'
 import type { AppRepo } from './db'
 import { decryptSecret, encryptSecret } from './crypto'
 import { branchProblem, repoUrlProblem } from './git-input'
@@ -43,6 +43,19 @@ export async function projectNameProblem(
 	const names = await appNamesOnServer(serverId, q)
 	// also the `<app>-db` backup convention (backup-db-owner.ts).
 	return projectNameCollisionError(containerName, names) ?? appNameDbClash(containerName, names)
+}
+
+/** A new app may not take the name of any preview row (any status, any server): a
+ *  preview spin re-clones its row's working dir, /opt/apps/<name>, and its cleanup
+ *  removes it. Null when free. */
+export async function previewNameProblem(containerName: string, q: Pick<typeof db, 'select'> = db): Promise<string | null> {
+	const rows = await q
+		.select({ id: previewDeploys.id })
+		.from(previewDeploys)
+		.where(eq(previewDeploys.containerName, containerName))
+	return rows.length
+		? `"${containerName}" is the name of a preview of another app; pick another name, or delete that preview first`
+		: null
 }
 
 /** The app_repos container names on a server. */

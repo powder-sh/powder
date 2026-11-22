@@ -145,6 +145,12 @@ export interface ComposeGuardContext {
 	 *  runs (deployGuardContext, from the compose check probe): its own ports for
 	 *  env_loopback. Undefined: none known. */
 	serviceImageExposed?: Readonly<Record<string, readonly number[]>>
+	/** the network this app's own server's Traefik routes over (traefik-network.ts), when
+	 *  it is not `web`. The compose powder renders for a new app there joins it
+	 *  (compose-render.ts), so on that server, and only there, it counts as shared like
+	 *  `web` (sharedNetworksFor). Never from the app's compose: the callers pass the
+	 *  server's resolved value (the new-app flow, the deploy's guard). */
+	traefikNetwork?: string | null
 }
 
 /** the login hosts a check assumes: the probed list, else ghcr.io. */
@@ -205,6 +211,15 @@ export function sharedNetworks(env: Record<string, string | undefined> = process
 		.map((n) => n.trim())
 		.filter((n) => /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(n))
 	return [...new Set([...SHARED_NETWORKS, ...extra])]
+}
+
+/** The shared networks for one check: sharedNetworks() plus the server's own Traefik
+ *  network (ctx.traefikNetwork, a valid name only). Not a global widening: another
+ *  server's apps get it only when their own Traefik routes over it. */
+export function sharedNetworksFor(ctx: Pick<ComposeGuardContext, 'traefikNetwork'>): string[] {
+	const base = sharedNetworks()
+	const t = ctx.traefikNetwork
+	return t && /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(t) && !base.includes(t) ? [...base, t] : base
 }
 
 /** logging drivers that keep the logs on the server. */
@@ -1595,10 +1610,10 @@ function checkTopLevelNamed(
 			ownByPrefix(name, ctx, ['-', '_']) ||
 			(projectCtx.appName !== '' && ownByPrefix(name, projectCtx, ['_']))
 		if (kind === 'network') {
-			if (!own && !sharedNetworks().includes(name))
+			if (!own && !sharedNetworksFor(ctx).includes(name))
 				out.push({
 					code: 'network',
-					message: `network "${key}" (${name}) is not this app's own network or a shared one (${sharedNetworks().join(', ')})`,
+					message: `network "${key}" (${name}) is not this app's own network or a shared one (${sharedNetworksFor(ctx).join(', ')})`,
 				})
 		} else if (!own) {
 			out.push({
@@ -1784,7 +1799,7 @@ function checkServiceKeys(
 		checkAliases(svc, def.networks, defs, project, ctx, out)
 		for (const key of keys) {
 			const net = networkRealName(key, defs, project)
-			const shared = sharedNetworks().includes(net)
+			const shared = sharedNetworksFor(ctx).includes(net)
 			// an external network gets the any-state name check only
 			if (!shared) {
 				if (externalNetwork(key, defs) && takenRegardlessOfState(svc, ctx))
@@ -1841,7 +1856,7 @@ function checkAliases(
 	if (!networks || typeof networks !== 'object' || Array.isArray(networks)) return
 	for (const [key, cfg] of Object.entries(networks as Record<string, unknown>)) {
 		const net = networkRealName(key, defs, project)
-		const shared = sharedNetworks().includes(net)
+		const shared = sharedNetworksFor(ctx).includes(net)
 		// shared or external networks get the any-state name check
 		const anyState = shared || externalNetwork(key, defs)
 		const taken = ctx.foreignNamesByNetwork

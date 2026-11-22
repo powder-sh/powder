@@ -26,6 +26,8 @@ vi.mock('@/lib/deploys', () => ({
 vi.mock('@/lib/paths-match', () => ({ pathsMatch: () => true }))
 vi.mock('@/lib/pending-redeploy', () => ({ schedulePendingRedeploy: vi.fn() }))
 vi.mock('@/lib/github-deployments', () => ({
+	notifyCommitPending: () => {},
+	notifyPreviewCommit: async () => {},
 	commentPreviewOnPR: vi.fn(),
 	notifyDeploymentStarted: vi.fn(),
 }))

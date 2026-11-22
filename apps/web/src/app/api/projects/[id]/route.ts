@@ -1,9 +1,11 @@
-// Per-project detail: project metadata + recent deploys with full output/error.
+// Per-project detail: project metadata + recent deploys. A deploy carries the head of
+// its output (preview) and, when it failed, its summary, failed step, exit code and the
+// end of its log (lib/deploy-log-read.ts), never the whole log: that is on /deploys/<id>.
 // Used by /projects/[id] to render the deploy history.
 
 import { redactNullable, redactSecrets, safeSlice } from '@/lib/secret-text'
 import type { NextRequest } from 'next/server'
-import { db, appRepos, appUptimeChecks, cronJobs, deploys, eq, desc, and } from '@/lib/db'
+import { db, appRepos, appUptimeChecks, cronJobs, eq, desc, and } from '@/lib/db'
 import { requireProjectAccess } from '@/lib/access'
 import { settleNote } from '@/lib/deploy-settle'
 import { getServer } from '@/lib/servers'
@@ -17,6 +19,10 @@ import { encryptSecret } from '@/lib/crypto'
 import { sessionOnlyActionDenied } from '@/lib/session-only'
 import { emptyDays } from '@/lib/deploy-days'
 import { deployDaysFor } from '@/lib/deploy-days-db'
+import { failureTailFromWindows } from '@/lib/deploy-log-read'
+import { recentDeploysQuery } from '@/lib/project-deploys-db'
+import { previewBlockReason } from '@/lib/preview-deploys'
+import { isTraefikServer } from '@/lib/traefik-servers'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -33,13 +39,8 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string 
 	if (access instanceof Response) return access
 	const { repo, user } = access
 
-	// Recent deploys (last 30).
-	const recentDeploys = await db
-		.select()
-		.from(deploys)
-		.where(and(eq(deploys.serverId, repo.serverId), eq(deploys.containerName, repo.containerName)))
-		.orderBy(desc(deploys.startedAt))
-		.limit(30)
+	// Recent deploys: windows of the log columns, only for the newest rows (lib/project-deploys-db.ts).
+	const recentDeploys = await recentDeploysQuery(repo.serverId, repo.containerName)
 
 	// Container state: running, missing, or server unreachable (lib/container-state.ts).
 	// ?part=db skips it: that SSH round can take seconds on an unreachable server,
@@ -104,6 +105,13 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string 
 		uptimeEnabled: repo.uptimeEnabled,
 		healthUrl: repo.healthUrl,
 		previewsEnabled: repo.previewsEnabled,
+		// why previews cannot work on this app's server (no Traefik, no base domain), the
+		// same reason the webhook gives when it skips one; null = they can
+		previewBlockReason: previewBlockReason({
+			traefik: !!server && (await isTraefikServer(server)),
+			serverId: repo.serverId,
+			baseDomain: server?.baseDomain ?? null,
+		}),
 		dockerfilePath: repo.dockerfilePath,
 		containerPort: repo.containerPort,
 		autoRollback: repo.autoRollback,
@@ -129,9 +137,18 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string 
 			startedAt: d.startedAt,
 			finishedAt: d.finishedAt,
 			gitSha: d.gitSha,
+			builtSha: d.builtSha,
+			requestedSha: d.requestedSha,
 			gitBranch: d.gitBranch,
 			imageTag: d.imageTag,
-			error: redactNullable(d.error),
+			// a failure: the one-line summary, the step and exit code, and the end of the log
+			// (masked; lib/deploy-log-read.ts). The full log is on /deploys/<id>.
+			failedStep: redactNullable(d.failedStep),
+			exitCode: d.exitCode,
+			errorSummary: redactNullable(d.errorSummary),
+			...(d.status === 'failed'
+				? failureTailFromWindows({ output: d.outputWindow, error: d.error })
+				: { logTail: null, logCut: false }),
 			// masked before the cut, so the 500 characters cannot hold half a secret.
 			outputPreview: d.output ? safeSlice(redactSecrets(d.output), 0, 500) : null,
 			// held on the settle window: when it deploys and how to skip the wait

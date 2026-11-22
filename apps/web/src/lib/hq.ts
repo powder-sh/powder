@@ -15,8 +15,16 @@
 //   POWDER_HQ_INGEST_URL    deploy events endpoint
 //   POWDER_HQ_GENERIC_URL   warning cards endpoint
 //   POWDER_HQ_CRON_URL      cron results endpoint
-import type { BridgeVerdict, NginxUpstreamVerdict } from './deploy/fragments'
+import { type BridgeVerdict, DRAIN_VERDICTS, type DrainVerdict, type NginxUpstreamVerdict } from './deploy/fragments'
 import { MIGRATE_PATH_CASES, type MigratePathCase } from './deploy/stability'
+import {
+	COMPOSE_DRIFT_INVENTORY_REF,
+	type ComposeDriftStep,
+	type ComposeDriftStore,
+	composeDriftStep,
+	powderMetaComposeDriftStore,
+	standingRefs,
+} from './deploy/compose-drift-inventory'
 import { sanitizeNotifyText } from './notify-text'
 import { type SafeText, redactSecrets } from './secret-text'
 import { PUBLIC_REPO_URL } from './site'
@@ -31,15 +39,32 @@ export function hqConfigured(env: NodeJS.ProcessEnv = process.env): boolean {
 	)
 }
 
+/** True when deploy results (failures included) are sent to the ops endpoint:
+ *  POWDER_HQ_INGEST_TOKEN and POWDER_HQ_INGEST_URL, the pair reportDeployToHq
+ *  posts with. POWDER_HQ_GENERIC_URL (warning cards) and POWDER_HQ_CRON_URL
+ *  (cron results) never carry a failed deploy. Presence only. */
+export function hqDeployEventsOn(env: Record<string, string | undefined> = process.env): boolean {
+	return !!env.POWDER_HQ_INGEST_TOKEN?.trim() && !!env.POWDER_HQ_INGEST_URL?.trim()
+}
+
 export type DeployEvent = {
 	app: string
 	server: string
 	status: 'success' | 'failure'
 	sha?: string | null
+	/** what `sha` is (lib/deploy-commit.ts): 'built' = the commit the deploy built (on a
+	 *  success, the one now live), 'requested' = only the commit the push asked for is known. */
+	shaSource?: 'built' | 'requested' | null
 	branch?: string | null
 	durationMs?: number | null
-	/** Leaves powder: must be masked (lib/secret-text.ts). */
+	/** Leaves powder: must be masked (lib/secret-text.ts). A failure with a known step
+	 *  reads `failed during: <step> · <summary>` (deploy-failure.ts opsEventErrorText). */
 	error?: SafeText | null
+	/** failure only: the step it stopped at, normalised like the step in `error`
+	 *  (notify-text.ts safeFailedStep: lower case, [a-z0-9 _:-]); null when unknown */
+	failedStep?: string | null
+	/** failure only: the step's exit code from the deploy script; null when unknown */
+	exitCode?: number | null
 	// deploys.id: stable per deploy row and the same id /api/internal/deploys
 	// lists, so a receiver can match this fire-and-forget event to the row and
 	// find rows whose event never arrived.
@@ -79,9 +104,15 @@ export type DeployWarnings = {
 	 *  per-server nginx-upstream card ([] resolves), `app` the per-app bridge-upstream card
 	 *  (ok / n/a resolve, no-upstream raises); null parts post nothing. */
 	nginxUpstream?: NginxUpstreamVerdict | null
+	/** servers.proxy of the app's server (null / absent = unknown). On an
+	 *  nginx-container server a not-routed app gets the DNS-alias bridge hint
+	 *  (stability card), and a bridge skip card names the DNS-alias mode. */
+	serverProxy?: 'nginx' | 'nginx-container' | 'traefik' | null
 	/** deploy-setup checks (deploy/stability.ts markers), each null = unknown, posts nothing.
-	 *  The repo's docker-compose.yml differs from the runtime compose (drift raises, ok resolves). */
-	composeDrift?: 'drift' | 'ok' | null
+	 *  The repo's docker-compose.yml differs from the runtime compose: `drift` (this deploy's
+	 *  commits changed it) raises, `ok` (both match) resolves, `standing` (differs, unchanged
+	 *  since the last deploy) neither: it feeds the compose-drift inventory (deploy/compose-drift-inventory.ts). */
+	composeDrift?: 'drift' | 'standing' | 'ok' | null
 	/** schema changes that bypass powder-migrate ([] resolves, cases raise). */
 	migratePath?: MigratePathCase[] | null
 	/** app_repos.health_url: `unset` (the gate answered HTTP with no health URL) raises,
@@ -89,6 +120,9 @@ export type DeployWarnings = {
 	healthUrl?: 'set' | 'unset' | 'n/a' | null
 	/** .powder/test.sh in the build context (informational): `absent` raises, `present` resolves. */
 	testGate?: 'present' | 'absent' | null
+	/** how the old container stopped in a bridged swap (fragments.ts drainShellFunctions):
+	 *  `ok` resolves, the other verdicts raise. */
+	stopDrain?: DrainVerdict | null
 }
 
 /** POWDER_STABILITY_CARDS: the deploy-setup warning cards (stabilityCardPlan) are
@@ -102,12 +136,34 @@ export function stabilityCardsOn(env: Record<string, string | undefined> = proce
 /** One deploy-setup warning card: `raise` set = warn card, null = resolve. */
 export type StabilityCard = { key: string; raise: { reason: string; title: string; body: string } | null }
 
+// Fixed card text per stop-drain verdict (fragments.ts DRAIN_VERDICTS) except `ok`.
+const STOP_DRAIN_REASON: Record<Exclude<DrainVerdict, 'ok'>, string> = {
+	'no-route-away':
+		'powder could not refuse new connections to the old container before stopping it (the bridge did not answer, iptables or nsenter is missing on the server, or the reject rule did not take effect), so a request that reached it while it stopped could fail',
+	'sigterm-ignored':
+		"the old container ignored SIGTERM and was killed after its grace period (it was idle, so no request was lost). Its PID 1 does not pass SIGTERM to the server: a shell-form CMD, `sh -c \"... && node server.js\"` without exec, or a package manager that does not forward signals. Use an exec-form CMD (CMD [\"node\", \"server.js\"]) or `exec` the server in the start script",
+	killed:
+		'the old container was killed after its grace period with connections still open, so requests in flight were cut. Causes: PID 1 does not pass SIGTERM to the server (use an exec-form CMD such as CMD ["node", "server.js"]); on a Traefik server, Traefik reuses keep-alive connections to the old container (start Traefik with --serverstransport.maxidleconnsperhost=-1); or a request runs longer than the grace (set stop_grace_period in the compose service)',
+}
+
 // Fixed card text per bridge verdict an app traefik does not route can get.
 const NGINX_BRIDGE_REASON: Record<'nginx-unbridged' | 'host-network', string> = {
 	'nginx-unbridged':
 		'host nginx proxies to the container\'s published 127.0.0.1 port, but the app has no powder.bridge.enabled=true label: enable the bridge (labels powder.bridge.enabled=true and powder.bridge.host-port=<app host port + 10000>) and add the bridge as a backup upstream in the vhost (server 127.0.0.1:<that port> backup; with max_fails=0 on the primary and proxy_next_upstream error timeout;)',
 	'host-network':
 		'runs with network_mode: host, which the bridge cannot clone: move the app off host networking first (a bridge network with a 127.0.0.1:<port> published port that nginx proxies to), then enable the bridge',
+}
+
+// An app traefik does not route on a server whose proxy is an nginx container: the
+// bridge's DNS-alias mode covers it when the proxy resolves the app by docker DNS
+// name per request. The script cannot tell an HTTP app from a worker there, so the
+// text says when it applies.
+const DNS_ALIAS_HINT =
+	'runs on a server whose proxy is an nginx container and is not bridged: if the proxy reaches this app by its docker DNS name (nginx resolver 127.0.0.11 plus a variable proxy_pass), add LABEL powder.bridge.enabled=true and LABEL powder.bridge.dns-alias=true to the Dockerfile (and LABEL powder.bridge.port=<port> unless the image EXPOSEs exactly one port). A worker with no HTTP traffic can ignore this'
+
+/** True when a not-routed verdict should carry the DNS-alias hint instead of resolving. */
+function dnsAliasHint(w: DeployWarnings): boolean {
+	return w.bridge === 'not-routed' && w.serverProxy === 'nginx-container'
 }
 
 /** The deploy-setup warning cards of one deploy (pure: no I/O). Fixed text per
@@ -125,7 +181,18 @@ export function stabilityCardPlan(w: DeployWarnings): StabilityCard[] {
 				body: `The app is not routed by traefik and ${reason}. Without the bridge, compose --force-recreate stops the container and nginx answers 502 until the new one boots. Clears on the first deploy that bridges.`,
 			},
 		})
+	} else if (dnsAliasHint(w)) {
+		cards.push({
+			key: ref('no-bridge'),
+			raise: {
+				reason: DNS_ALIAS_HINT,
+				title: `${w.app}: no zero-downtime swap - 502s on every deploy`,
+				body: `The app ${DNS_ALIAS_HINT}. Without the bridge, compose --force-recreate stops the container and the proxy answers 502 until the new one boots. Clears on the first deploy that bridges.`,
+			},
+		})
 	}
+	// `standing` gets no per-app entry: it never raises or resolves the card (see
+	// reportComposeDriftFollowUp for the compose-drift inventory and the one-time retirement).
 	if (w.composeDrift === 'drift' || w.composeDrift === 'ok') {
 		const reason =
 			"the repo's docker-compose.yml differs from the runtime compose on the server: committed compose changes do not deploy"
@@ -136,7 +203,7 @@ export function stabilityCardPlan(w: DeployWarnings): StabilityCard[] {
 					? {
 							reason,
 							title: `${w.app}: committed compose changes are not deployed`,
-							body: `On ${w.server}, ${reason}; powder runs the server's compose file (/opt/apps/<app>/docker-compose.yml) and never copies the repo's. Apply the change to the server file too, or drop docker-compose.yml from the repo if it is unused. Clears on the next deploy where both match.`,
+							body: `On ${w.server}, ${reason}; powder runs the server's compose file (/opt/apps/<app>/docker-compose.yml) and never copies the repo's. Raised only by a deploy whose commits (since the last successful deploy) changed the repo's docker-compose.yml. Apply the change to the server file too, or drop docker-compose.yml from the repo if it is unused. Clears on the first deploy where both files match; a later deploy that leaves the compose alone does not clear it.`,
 						}
 					: null,
 		})
@@ -167,6 +234,23 @@ export function stabilityCardPlan(w: DeployWarnings): StabilityCard[] {
 							body: `${w.app} on ${w.server} has no health URL, so the deploy health gate passes on any 1xx-4xx answer from /. That only proves the app answers HTTP, not that it works. Set a health URL on the app's Settings tab, on a cheap route that answers 2xx only when the app can serve (e.g. /api/health); the gate then requires a 2xx from it. Clears on the next deploy with one set.`,
 						}
 					: null,
+		})
+	}
+	if (w.stopDrain && (DRAIN_VERDICTS as readonly string[]).includes(w.stopDrain)) {
+		const reason = w.stopDrain === 'ok' ? '' : STOP_DRAIN_REASON[w.stopDrain]
+		cards.push({
+			key: ref('stop-drain'),
+			raise:
+				w.stopDrain === 'ok'
+					? null
+					: {
+							reason,
+							title:
+								w.stopDrain === 'sigterm-ignored'
+									? `${w.app}: ignores SIGTERM - every deploy waits the full stop grace`
+									: `${w.app}: requests can be lost on deploy`,
+							body: `On ${w.server}, in the last deploy's swap ${reason}. Clears on the first deploy whose old container stops cleanly.`,
+						},
 		})
 	}
 	if (w.testGate === 'present' || w.testGate === 'absent') {
@@ -261,36 +345,104 @@ function postGeneric(body: Record<string, unknown>): Promise<void> {
 	return postHq('POWDER_HQ_GENERIC_URL', body, 'warning event')
 }
 
+/** The compose-drift state step of one deploy (cards switch on), run BEFORE any
+ *  compose-drift card is posted: a raise is only safe once its `drift` row is
+ *  written, or the app's next standing deploy would take the card for an old-rule
+ *  one and retire it. null = no marker; 'failed' = the store failed (logged): the
+ *  caller then raises and resolves nothing for compose-drift. */
+async function composeDriftState(w: DeployWarnings, store: ComposeDriftStore): Promise<ComposeDriftStep | 'failed' | null> {
+	const v = w.composeDrift
+	if (v !== 'drift' && v !== 'standing' && v !== 'ok') return null
+	try {
+		return await composeDriftStep(`${w.server}/${w.app}`, v, store)
+	} catch (err) {
+		console.error(
+			`[stability] compose-drift state write failed for ${w.server}/${w.app}, no compose-drift card raised or resolved this deploy:`,
+			err instanceof Error ? err.message : err,
+		)
+		return 'failed'
+	}
+}
+
+// Inventory posts run one after another, and each reads the list when it is sent:
+// deploys on different servers finish in parallel, and a post built from an older
+// read must not land after a newer one. Deploys run in one process (the worker, or
+// web with POWDER_DEPLOY_WORKER off), so an in-process chain orders every post.
+let inventoryChain: Promise<void> = Promise.resolve()
+
+/** Post the inventory of standing compose drift: one HQ task (no channel, so no
+ *  Discord line), its text replaced by every post, resolved when the list is empty.
+ *  `reopen` only when an app joined the standing set with this deploy: a closed
+ *  inventory then opens again, while posts without a new app leave it closed.
+ *  Never rejects. */
+export function postComposeDriftInventory(source: string, store: ComposeDriftStore, reopen: boolean): Promise<void> {
+	const run = inventoryChain.then(async () => {
+		try {
+			const refs = standingRefs(await store.list())
+			await (refs.length > 0
+				? postGeneric({
+						source,
+						source_ref: COMPOSE_DRIFT_INVENTORY_REF,
+						severity: 'info',
+						title: `Repo docker-compose.yml differs from the server compose on ${refs.length} app${refs.length === 1 ? '' : 's'}`,
+						body: `Standing state, not news: powder runs each server's /opt/apps/<app>/docker-compose.yml and never copies the repo's. For each app below, apply the repo compose to the server file or drop docker-compose.yml from the repo. A new committed compose change still raises its own compose-drift card.\n${refs.map((r) => `- ${sanitizeNotifyText(r).slice(0, 120)}`).join('\n')}`.slice(0, 3800),
+						refresh_text: true,
+						reopen,
+					})
+				: postGeneric({ source, source_ref: COMPOSE_DRIFT_INVENTORY_REF, resolve: true, title: 'compose drift inventory empty', body: 'no app has a standing repo compose difference' }))
+		} catch (err) {
+			console.error('[stability] compose-drift inventory skipped:', err instanceof Error ? err.message : err)
+		}
+	})
+	inventoryChain = run
+	return run
+}
+
 /** Post (POWDER_STABILITY_CARDS on) or log (off) the deploy-setup warning cards.
  *  Never throws: a bad input or a bug here must not reach the deploy. */
-async function reportStabilityCards(w: DeployWarnings, source: string): Promise<void> {
+async function reportStabilityCards(w: DeployWarnings, source: string, store: ComposeDriftStore): Promise<void> {
 	try {
 		const plan = stabilityCardPlan(w)
 		if (!stabilityCardsOn()) {
 			for (const c of plan) if (c.raise) console.log(`[stability] would warn: ${c.key} ${c.raise.reason}`)
 			return
 		}
-		await Promise.all(
-			plan.map((c) =>
+		const driftKey = `compose-drift:${w.server}/${w.app}`
+		const drift = await composeDriftState(w, store)
+		const posts = plan
+			.filter((c) => !(drift === 'failed' && c.key === driftKey))
+			.map((c) =>
 				c.raise
 					? postGeneric({ project: w.app, source, source_ref: c.key, severity: 'warn', channel: 'general', title: c.raise.title, body: c.raise.body })
 					: postGeneric({ source, source_ref: c.key, resolve: true, title: `${c.key.split(':')[0]} ok`, body: 'cleared by a deploy without the condition' }),
-			),
-		)
+			)
+		if (drift && drift !== 'failed' && drift.retireOld)
+			posts.push(
+				postGeneric({
+					source,
+					source_ref: driftKey,
+					resolve: true,
+					title: 'compose-drift ok',
+					body: 'standing drift: no commit since the last deploy changed docker-compose.yml (listed in the compose-drift inventory instead)',
+				}),
+			)
+		await Promise.all(posts)
+		if (drift && drift !== 'failed') await postComposeDriftInventory(source, store, drift.joined)
 	} catch (err) {
 		console.error('[stability] warning cards skipped:', err instanceof Error ? err.message : err)
 	}
 }
 
-export async function reportDeployWarningsToHq(w: DeployWarnings): Promise<void> {
+/** `driftStore`: test seam for the compose-drift state (default powder_meta). */
+export async function reportDeployWarningsToHq(w: DeployWarnings, driftStore: ComposeDriftStore = powderMetaComposeDriftStore): Promise<void> {
 	const ref = (kind: string) => `${kind}:${w.server}/${w.app}`
 	const source = 'powder-deploy-warn'
 	// the bridge verdicts of apps traefik does not route (nginx-unbridged,
 	// host-network) raise their no-bridge card through reportStabilityCards; with
 	// the switch off they resolve it, as not-routed does.
-	const stabilityBridge = w.bridge === 'nginx-unbridged' || w.bridge === 'host-network'
+	const stabilityBridge = w.bridge === 'nginx-unbridged' || w.bridge === 'host-network' || dnsAliasHint(w)
 	await Promise.all([
-		reportStabilityCards(w, source),
+		reportStabilityCards(w, source, driftStore),
 		w.envRefusedKeys?.length
 			? postGeneric({
 					project: w.app,
@@ -324,9 +476,9 @@ export async function reportDeployWarningsToHq(w: DeployWarnings): Promise<void>
 					body: `${sanitizeNotifyText(w.portsLeftPublic.join('\n')).slice(0, 600)}\nThese compose ports were NOT bound to 127.0.0.1 (proxy service, unsupported syntax, or the ${'powder.public-port'}=true opt-out). Confirm they are meant to be public.`,
 				})
 			: postGeneric({ source, source_ref: ref('ports-left-public'), resolve: true, title: 'ports ok', body: 'no published ports left public' }),
-		w.bridge === 'bridged' || w.bridge === 'not-routed' || (stabilityBridge && !stabilityCardsOn())
+		w.bridge === 'bridged' || (w.bridge === 'not-routed' && !dnsAliasHint(w)) || (stabilityBridge && !stabilityCardsOn())
 			? postGeneric({ source, source_ref: ref('no-bridge'), resolve: true, title: 'bridge ok', body: 'deploy swap bridged or not traefik-routed' })
-			: w.bridge && w.bridge !== 'nginx-unbridged' && w.bridge !== 'host-network'
+			: w.bridge && w.bridge !== 'nginx-unbridged' && w.bridge !== 'host-network' && w.bridge !== 'not-routed'
 				? postGeneric({
 						project: w.app,
 						source,
@@ -340,7 +492,9 @@ export async function reportDeployWarningsToHq(w: DeployWarnings): Promise<void>
 						body:
 							w.bridge === 'internal'
 								? `The running container is routed by traefik but ${BRIDGE_CARD_REASON.internal}, so compose --force-recreate stops it and traefik answers 502 until the new one boots. This is a powder bug, not an app setting: nothing in the app needs to change. Report it at ${PUBLIC_REPO_URL}/issues with the [bridge] lines of the deploy log (they say which check refused). It most likely hits every bridged app. Clears on the first deploy that bridges.`
-								: `The running container is routed by traefik but ${BRIDGE_CARD_REASON[w.bridge]}, so compose --force-recreate stops it and traefik answers 502 until the new one boots. For a missing label or healthcheck: add a HEALTHCHECK (cheap, DB-free route) and LABEL powder.bridge.enabled=true to the Dockerfile; powder keeps the server compose, so a repo compose edit never deploys. Clears on the first deploy that bridges (the second deploy after the fix).`,
+								: w.serverProxy === 'nginx-container'
+									? `On this nginx-container server the app ${BRIDGE_CARD_REASON[w.bridge]}, so compose --force-recreate stops it and the proxy answers 502 until the new one boots. The [bridge] lines of the deploy log say which check refused; the bridge's DNS-alias mode needs LABEL powder.bridge.enabled=true and LABEL powder.bridge.dns-alias=true. Clears on the first deploy that bridges.`
+									: `The running container is routed by traefik but ${BRIDGE_CARD_REASON[w.bridge]}, so compose --force-recreate stops it and traefik answers 502 until the new one boots. For a missing label or healthcheck: add a HEALTHCHECK (cheap, DB-free route) and LABEL powder.bridge.enabled=true to the Dockerfile; powder keeps the server compose, so a repo compose edit never deploys. Clears on the first deploy that bridges (the second deploy after the fix).`,
 					})
 				: Promise.resolve(),
 		w.nginxUpstream?.server
@@ -376,7 +530,7 @@ export async function reportDeployWarningsToHq(w: DeployWarnings): Promise<void>
 // real risk after the cap prune that follows every builder phase
 // (builder-prune.ts builderDiskRisk: root disk at 75%, or 3 prunes in a row
 // that each left the cache over the cap and larger than the one before), or
-// whose cache prune has been skipped for hours (builds never paused). The
+// whose cache prune has been skipped for a day (builds never paused). The
 // cache over its soft cap alone is no risk. Resolves itself once a prune ran
 // and found no risk.
 export async function reportBuildHostDiskToHq(host: string, overCap: string | null, afterPrune = true): Promise<void> {

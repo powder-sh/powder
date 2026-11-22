@@ -1,0 +1,15 @@
+-- idempotent
+-- deploys.built_sha: the commit this deploy synced or built, whether it then went live or
+--   not. Written by the deploy runner when a deploy ends, on success (the same value as
+--   git_sha) and on failure (the commit the failed run built, from the run's nonced marker,
+--   else the post-swap sha). NULL = unknown: the deploy died before the git sync, a kind
+--   that builds nothing, or a row from before this migration.
+--   git_sha keeps its meaning, the commit this deploy put into production, so a failure
+--   before the swap still leaves it NULL; the readers that rely on that (the CI tab's
+--   deployed commit, rollback targets, the last-good lookups, the webhook replay guard,
+--   automatic rollback) keep working unchanged. Displays name a deploy's commit through one
+--   function (apps/web/src/lib/deploy-commit.ts): git_sha, else built_sha, else
+--   requested_sha labelled as the requested commit.
+-- Nullable text with no default: a catalog-only change, no table rewrite, and the previous
+-- release (which never names the column) keeps working.
+ALTER TABLE "deploys" ADD COLUMN IF NOT EXISTS "built_sha" text;

@@ -23,7 +23,7 @@ const allGood: ChecklistInput = {
 	githubOAuth: true,
 	servers: [srv()],
 	backups: true,
-	notifyWebhook: true,
+	deployFailureRoutes: ['webhook-target'],
 	adminPersisted: true,
 }
 
@@ -56,8 +56,8 @@ describe('first-run checklist', () => {
 		})
 		expect(items.find((i) => i.id === 'server')).toMatchObject({
 			state: 'missing',
-			href: '/servers/b2',
-			action: 'open b2',
+			href: '/servers/b2#server-check',
+			action: 'fix b2',
 		})
 		expect(items.find((i) => i.id === 'base-domain')).toMatchObject({
 			state: 'missing',
@@ -103,7 +103,7 @@ describe('first-run checklist', () => {
 	})
 	it('env items', () => {
 		expect(state({ ...allGood, backups: false }, 'backups')).toBe('missing')
-		expect(state({ ...allGood, notifyWebhook: false }, 'notify-webhook')).toBe('missing')
+		expect(state({ ...allGood, deployFailureRoutes: [] }, 'notify-webhook')).toBe('missing')
 		expect(state({ ...allGood, adminPersisted: false }, 'admin-persisted')).toBe('missing')
 		const admin = buildChecklist({ ...allGood, adminPersisted: false }).find(
 			(i) => i.id === 'admin-persisted',

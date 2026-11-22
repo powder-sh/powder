@@ -2,8 +2,8 @@ import { type CurrentUser, requireUser } from '@/lib/access'
 import { isPersistedAdminId } from '@/lib/admin-ids'
 import { isRoutedDomain } from '@/lib/app-hosts'
 import { appDomains, appRepos, db, notificationTargets } from '@/lib/db'
-import { envWebhookTarget, targetWants } from '@/lib/notify-routing'
-import { lastCheckGreen, runBootstrapCheck } from '@/lib/server-bootstrap-run'
+import { deployFailureRoutes } from '@/lib/deploy-failure-routes'
+import { lastCheckResult, runBootstrapCheck } from '@/lib/server-bootstrap-run'
 import { cachedDnsCheck, runDnsCheck } from '@/lib/server-dns-check'
 import { listAllServers, updateServerStatus } from '@/lib/servers'
 import { BACKUP_ENV_KEYS, buildChecklist, checklistComplete, envSet } from '@/lib/setup-checklist'
@@ -42,35 +42,38 @@ async function defaultHostNeed(): Promise<(serverId: string) => boolean> {
 	return (id) => needs.has(id) || !withApps.has(id)
 }
 
-// Failed deploys reach someone: the env webhook, or a saved target that gets
-// deploy_failed for every app (Settings → Notifications).
-async function deployFailuresRouted(): Promise<boolean> {
-	if (envWebhookTarget()) return true
+// Where failed deploys go (lib/deploy-failure-routes.ts): env presence and the
+// saved targets. Only route names leave this function, never a URL or token.
+async function failedDeployRoutes() {
 	const targets = await db.select().from(notificationTargets)
-	return targets.some((t) => targetWants(t, 'deploy_failed', null))
+	return deployFailureRoutes(process.env, targets)
 }
 
 async function checklist(user: CurrentUser): Promise<Response> {
-	const [all, needsDefaultHost, notify] = await Promise.all([
+	const [all, needsDefaultHost, routes] = await Promise.all([
 		listAllServers(),
 		defaultHostNeed(),
-		deployFailuresRouted(),
+		failedDeployRoutes(),
 	])
 	const items = buildChecklist({
 		githubOAuth: envSet(process.env, ['GITHUB_CLIENT_ID', 'GITHUB_CLIENT_SECRET']),
 		backups: envSet(process.env, BACKUP_ENV_KEYS),
-		notifyWebhook: notify,
+		deployFailureRoutes: routes,
 		adminPersisted: isPersistedAdminId(user.id),
-		servers: all.map((s) => ({
-			id: s.id,
-			name: s.name,
-			status: s.status,
-			proxy: s.proxy ?? 'nginx',
-			baseDomain: s.baseDomain ?? null,
-			checkGreen: lastCheckGreen(s),
-			dnsState: cachedDnsCheck(s.id, s.baseDomain ?? null)?.state ?? null,
-			needsDefaultHost: needsDefaultHost(s.id),
-		})),
+		servers: all.map((s) => {
+			const check = lastCheckResult(s)
+			return {
+				id: s.id,
+				name: s.name,
+				status: s.status,
+				proxy: s.proxy ?? 'nginx',
+				baseDomain: s.baseDomain ?? null,
+				checkGreen: check?.green ?? null,
+				checkMissing: check?.missing ?? [],
+				dnsState: cachedDnsCheck(s.id, s.baseDomain ?? null)?.state ?? null,
+				needsDefaultHost: needsDefaultHost(s.id),
+			}
+		}),
 	})
 	return Response.json({ items, complete: checklistComplete(items) })
 }

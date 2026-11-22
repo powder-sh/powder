@@ -47,7 +47,12 @@ export default async function DashboardLayout({ children }: { children: React.Re
 			</a>
 			<div className="flex h-dvh">
 				<Sidebar user={{ name: session.user.name, email: session.user.email }} />
-				<main id="main" className="min-w-0 flex-1 overflow-y-auto pt-14 md:pt-0">
+				{/* `relative`: the scroll container is the containing block of every absolutely
+				    positioned descendant (sr-only live regions, captions). Without it they
+				    resolve against the page, sit at their unscrolled offset below the h-dvh
+				    shell and give the window a second, empty scroll. Guard:
+				    lib/__tests__/dashboard-scroll-container.test.ts */}
+				<main id="main" className="relative min-w-0 flex-1 overflow-y-auto pt-14 md:pt-0">
 					{/* Streamed in after the page: the (cached) update check must never block render. */}
 					<Suspense fallback={null}>
 						<UpdateBanner />

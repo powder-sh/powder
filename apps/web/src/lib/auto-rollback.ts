@@ -17,6 +17,7 @@
 
 import { randomBytes } from 'node:crypto'
 import { gitCmd, gitHardenShellFunctions } from './git-harden'
+import { appCheckoutDirShell } from './app-checkout'
 import { isPowderSelfContainer } from './secret-mask'
 import { OUTPUT_TRUNCATED_MARKER } from './capped-output'
 import { shq } from './shell'
@@ -361,7 +362,8 @@ export function preflightScript(p: {
 	const g = `${gitCmd('"$G"', '"$G"')} -c core.quotePath=false`
 	return [
 		`cd ${shq(p.workingDir)} || { echo ${m('nowd')}; exit 0; }`,
-		'G="$PWD/src"; [ -d src/.git ] || G="$PWD"',
+		// the checkout: one authority (lib/app-checkout.ts); none = the working dir, where git finds no commit
+		`${appCheckoutDirShell('G_CO')}; G="$PWD"; if [ "$G_CO" = src ]; then G="$PWD/src"; fi`,
 		gitHardenShellFunctions().trimEnd(),
 		`${g} cat-file -e ${p.from}^{commit} 2>/dev/null && ${g} cat-file -e ${p.to}^{commit} 2>/dev/null || { echo ${m('nocommit')}; exit 0; }`,
 		`echo ${m('img')}`,

@@ -94,7 +94,8 @@ describe('GET /api/deploys-list', () => {
 		const { GET } = await import('@/app/api/deploys-list/route')
 		const r = await GET(new Request('http://x/api/deploys-list?limit=abc'))
 		expect(r.status).toBe(200)
-		expect(h.executed[0]).toMatch(/LIMIT \$1\s*\| \[51\]$/)
+		// the list query (the first one reads the stored triggers for the author dropdown)
+		expect(h.executed.find((q) => q.includes('ORDER BY'))).toMatch(/LIMIT \$1\s*\| \[51\]$/)
 	})
 	it('a cursor that is not a timestamp is a 400', async () => {
 		const { GET } = await import('@/app/api/deploys-list/route')

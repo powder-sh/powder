@@ -9,6 +9,7 @@
 import { NO_BASE_DOMAIN_MESSAGE, hostForLabel } from './app-hosts'
 import type { HostServer } from './app-hosts'
 import { isTraefikServer } from './traefik-servers'
+import { resolveRoutingNetwork } from './traefik-network-run'
 import { db, deploys, eq, lte } from './db'
 import type { Deploy, AppRepo } from './db'
 import { getServer } from './servers'
@@ -88,8 +89,11 @@ export async function spawnSnapshot(
 	const expiresAt = new Date(Date.now() + SNAPSHOT_TTL_MS)
 
 	// docker run with traefik labels. Reuses the parent's env file (snapshots
-	// read prod data — that's the whole point: see what was live then). Joins
-	// the same external `web` network so traefik picks it up.
+	// read prod data, that's the whole point: see what was live then). Joins
+	// the network powder routes over on the server (`web` unless its Traefik is declared to route over
+	// another; a validated name, so a bare word) so traefik picks it up. One network
+	// only, so no traefik.docker.network label is needed.
+	const net = await resolveRoutingNetwork(server)
 	const safeImage = deploy.imageTag.replace(/[^A-Za-z0-9._\-:/]/g, '')
 	if (safeImage !== deploy.imageTag) {
 		throw new Error(`unsafe image tag: ${deploy.imageTag}`)
@@ -107,7 +111,7 @@ export async function spawnSnapshot(
 	await assertImageComposeLabels(server, deploy.imageTag)
 	const cmd =
 		`docker rm -f ${shq(containerName)} 2>/dev/null; ` +
-		`docker run -d --pull=never --name ${shq(containerName)} --restart no --network web ${SIDE_RUN_HARDEN}` +
+		`docker run -d --pull=never --name ${shq(containerName)} --restart no --network ${net} ${SIDE_RUN_HARDEN}` +
 		`--env-file ${shq(productionEnv)} ` +
 		`-l traefik.enable=true ` +
 		`-l ${shq(`traefik.http.routers.${containerName}.rule=Host(\`${host}\`)`)} ` +
@@ -186,8 +190,9 @@ export async function atomicRollback(
 
 	const liveName = repo.containerName
 	const tempName = `${liveName}-rb`
-	// The bridge is a bare `docker run --network web` container that cannot reach
-	// the app's DB, so it claims ONLY the default host, never custom domains.
+	// The bridge is a bare `docker run` container on the Traefik network only (`web`
+	// unless the server's Traefik is declared to route over another) that cannot reach the app's
+	// DB, so it claims ONLY the default host, never custom domains.
 	const liveRule = bridgeRuleFor(server, liveName)
 	const productionEnv = `/opt/apps/${liveName}.env`
 	const composeFile = facts?.configFile ?? `/opt/apps/${liveName}/docker-compose.yml`
@@ -237,7 +242,7 @@ export async function atomicRollback(
 		await run(`docker rm -f ${shq(tempName)} 2>/dev/null || true`, `cleanup leftover ${tempName}`)
 		if (!bridged) log.push('(no default host to bridge: server has no base domain, rolling back without the bridge)')
 		else await run(
-			`docker run -d --pull=never --name ${shq(tempName)} --restart no --network web ${SIDE_RUN_HARDEN}` +
+			`docker run -d --pull=never --name ${shq(tempName)} --restart no --network ${await resolveRoutingNetwork(server)} ${SIDE_RUN_HARDEN}` +
 				`--env-file ${shq(productionEnv)} ` +
 				`-l traefik.enable=true ` +
 				`-l ${shq(`traefik.http.routers.${tempName}.rule=${liveRule}`)} ` +

@@ -1,18 +1,70 @@
 // discovery cannot forge records or plant app_domains rows for any hostname.
 import { spawnSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 
-const ran = vi.hoisted(() => ({ cmds: [] as string[], fakeBin: '' }))
+const ran = vi.hoisted(() => ({
+	cmds: [] as string[],
+	fakeBin: '',
+	/** the host proxy master as the fake /proc shows it:
+	 *  running    pid file -> live `nginx` in the host pid namespace
+	 *  stopped    nginx installed, no pid file
+	 *  stale      pid file -> a live `bash` (the pid was reused by another host process)
+	 *  container  pid file -> a live `nginx` in ANOTHER pid namespace (a container's)
+	 *  no-ns      pid file -> a live `nginx` whose /proc/<pid>/ns is unreadable
+	 *  openresty  pid file -> a live `openresty` in the host namespace, nginx binary present
+	 *  off-path   pid file -> a live `nginx` in the host namespace, no nginx binary on PATH
+	 *  absent     nothing installed, no pid file */
+	hostNginx: 'running' as 'running' | 'stopped' | 'stale' | 'container' | 'no-ns' | 'openresty' | 'off-path' | 'absent',
+}))
 vi.mock('../ssh/connection', () => ({
 	runCommand: async (_s: unknown, cmd: string) => {
 		ran.cmds.push(cmd)
 		// the command reads the server's host nginx config: point it at a test dir, never
-		// this host's real proxy config
-		const local = cmd.replaceAll('/etc/nginx/sites-enabled/', `${ran.fakeBin}/sites-enabled/`)
-		const r = spawnSync('bash', ['-c', local], { env: { ...process.env, PATH: `${ran.fakeBin}:${process.env.PATH}` } })
+		// this host's real proxy config (nor its pid files, /proc or /opt/apps)
+		const f = ran.fakeBin
+		const local = cmd
+			.replaceAll('/etc/nginx/sites-enabled/', `${f}/sites-enabled/`)
+			.replaceAll('/etc/nginx/conf.d/', `${f}/conf.d/`)
+			.replaceAll('/var/run/', `${f}/run/`)
+			.replaceAll(' /run/', ` ${f}/run/`)
+			.replaceAll('/usr/local/openresty/nginx/logs/', `${f}/run/`)
+			.replaceAll('/proc/', `${f}/proc/`)
+			// app space for the host-config check only (the container working-dir check keeps
+			// the literal /opt/apps its fixtures print)
+			.replaceAll('readlink -f /opt/apps ', `readlink -f ${f}/opt-apps `)
+			.replaceAll('OPTR:-/opt/apps}', `OPTR:-${f}/opt-apps}`)
+			.replaceAll('inapp() { case "$1" in (/opt/apps|/opt/apps/*|', `inapp() { case "$1" in (${f}/opt-apps|${f}/opt-apps/*|`)
+		if (f) {
+			const st = ran.hostNginx
+			mkdirSync(join(f, 'opt-apps'), { recursive: true })
+			// never this host's own nginx: a test without a fake one gets an nginx that fails
+			if (st !== 'absent' && st !== 'off-path' && !existsSync(join(f, 'nginx')))
+				writeFileSync(join(f, 'nginx'), '#!/bin/bash\nexit 1\n', { mode: 0o755 })
+			if (st === 'off-path') rmSync(join(f, 'nginx'), { force: true })
+			mkdirSync(join(f, 'run'), { recursive: true })
+			// pid 1 and the pid file's process 4242, each with its pid namespace link
+			rmSync(join(f, 'proc', '1'), { recursive: true, force: true })
+			rmSync(join(f, 'proc', '4242'), { recursive: true, force: true })
+			mkdirSync(join(f, 'proc', '1', 'ns'), { recursive: true })
+			symlinkSync('pid:[4026531836]', join(f, 'proc', '1', 'ns', 'pid'))
+			mkdirSync(join(f, 'proc', '4242'), { recursive: true })
+			const comm = st === 'stale' ? 'bash' : st === 'openresty' ? 'openresty' : 'nginx'
+			writeFileSync(join(f, 'proc', '4242', 'comm'), `${comm}\n`)
+			if (st !== 'no-ns') {
+				mkdirSync(join(f, 'proc', '4242', 'ns'))
+				symlinkSync(st === 'container' ? 'pid:[4026532999]' : 'pid:[4026531836]', join(f, 'proc', '4242', 'ns', 'pid'))
+			}
+			if (st === 'stopped' || st === 'absent') rmSync(join(f, 'run', 'nginx.pid'), { force: true })
+			else writeFileSync(join(f, 'run', 'nginx.pid'), '4242\n')
+		}
+		// PATH without any real nginx: the fake bin dir first, then the hermetic system dirs
+		const r = spawnSync('bash', ['-c', local], {
+			env: { ...process.env, PATH: `${f}:${pathWithout(['nginx'])}` },
+			maxBuffer: 64 * 1024 * 1024,
+		})
 		return { stdout: r.stdout.toString(), stderr: r.stderr.toString(), code: r.status ?? 1 }
 	},
 }))
@@ -20,6 +72,17 @@ vi.mock('../ssh/connection', () => ({
 import { getNginxRoutes, parseHostNetInfo } from '../ssh/discovery'
 import { isUnprovenClaim } from '../app-domains'
 import { writeFakeDocker } from './fixtures/fake-docker'
+import { pathWithout } from './hermetic'
+import {
+	CONF_D_HOST_MAP,
+	CONTAINER_NGINX_T,
+	HOST_VHOST_FILES,
+	HOST_VHOST_ROUTES,
+	LEGACY_DIRECT_VHOST,
+	MAPPED_APPS_VHOST,
+	SHOP_BRIDGE_VHOST,
+	hostNginxDumpWithConfD,
+} from './fixtures/nginx-vhosts'
 
 describe('host net info is parsed from JSON, one line per container', () => {
 	it('an env value with a newline cannot forge a second record', () => {
@@ -49,7 +112,8 @@ describe('nginx -T runs only in proxy containers powder does not manage', () => 
 				'case "$1" in',
 				'  ps) printf "%s\\n" app-nginx app-proxy-sidecar edge-nginx other ;;',
 				'  inspect) n="${@: -1}"; case "$n" in app-nginx|app-proxy-sidecar) echo appproj ;; edge-nginx) echo edge ;; *) echo "" ;; esac ;;',
-				`  exec) echo "$2" >> ${JSON.stringify(log)}; echo "server { server_name $2.example.com; proxy_pass http://127.0.0.1:3000; }" ;;`,
+				// the bridge layout (named upstream, primary + backup) the servers really use
+				`  exec) echo "$2" >> ${JSON.stringify(log)}; echo "upstream $2_app { server 127.0.0.1:3000 max_fails=0; server 127.0.0.1:13000 backup; } server { server_name $2.example.com; proxy_pass http://$2_app; }" ;;`,
 				'esac',
 			].join('\n'))
 		ran.fakeBin = dir
@@ -57,7 +121,286 @@ describe('nginx -T runs only in proxy containers powder does not manage', () => 
 		const routes = await getNginxRoutes({ id: 's', host: 'h' } as never, ['app-nginx'])
 		const execd = spawnSync('cat', [log]).stdout.toString().split('\n').filter(Boolean)
 		expect(execd).toEqual(['edge-nginx'])
-		expect(routes.flatMap((r) => r.urls)).toEqual(['http://edge-nginx.example.com'])
+		expect(routes).toEqual([{ host: '127.0.0.1', port: 3000, urls: ['http://edge-nginx.example.com'] }])
+		rmSync(dir, { recursive: true, force: true })
+	})
+})
+
+describe('getNginxRoutes on the real vhost shape (named upstream + bridge backup)', () => {
+	it('host vhost files and a proxy container with upstreams resolve to their primaries', async () => {
+		const dir = mkdtempSync(join(tmpdir(), 'disc-'))
+		mkdirSync(join(dir, 'sites-enabled'))
+		for (const [f, body] of Object.entries(HOST_VHOST_FILES)) writeFileSync(join(dir, 'sites-enabled', f), body)
+		writeFileSync(join(dir, 'nginx-t.txt'), CONTAINER_NGINX_T)
+		writeFakeDocker(dir, [
+			'#!/bin/bash',
+			'case "$1" in',
+			'  ps) printf "%s\\n" edge-nginx ;;',
+			'  inspect) echo "" ;;',
+			`  exec) cat ${JSON.stringify(join(dir, 'nginx-t.txt'))} ;;`,
+			'esac',
+		].join('\n'))
+		ran.fakeBin = dir
+		const routes = await getNginxRoutes({ id: 's', host: 'h' } as never, ['shop'])
+		const byKey = (r: { host: string | null; port: number | null }) => `${r.host}|${r.port}`
+		expect([...routes].sort((a, b) => byKey(a).localeCompare(byKey(b)))).toEqual([
+			...HOST_VHOST_ROUTES,
+			{ host: 'notes-web', port: 3000, urls: ['https://notes.example.com'] },
+		])
+		rmSync(dir, { recursive: true, force: true })
+	})
+})
+
+describe('the host config: nginx -T of a running host nginx, else sites-enabled and conf.d', () => {
+	const fakeDocker = (dir: string) =>
+		writeFakeDocker(dir, ['#!/bin/bash', 'case "$1" in', '  ps) ;;', '  *) echo "" ;;', 'esac'].join('\n'))
+	const ports = (routes: Array<{ port: number | null; urls: string[] }>) =>
+		Object.fromEntries(routes.filter((r) => r.port != null).map((r) => [r.port, r.urls]))
+	const fakeNginxT = (dir: string, dump: string) => {
+		writeFileSync(join(dir, 'dump.txt'), dump)
+		writeFileSync(join(dir, 'nginx'), `#!/bin/bash\n[ "$1" = -T ] && cat ${JSON.stringify(join(dir, 'dump.txt'))}\n`, {
+			mode: 0o755,
+		})
+	}
+	/** create every file a dump's headers name (except `skip`), so the headers resolve */
+	const materialize = (dump: string, skip: string[] = []) => {
+		for (const m of dump.matchAll(/^# configuration file (.*):$/gm)) {
+			const p = m[1] ?? ''
+			if (skip.includes(p) || existsSync(p)) continue
+			mkdirSync(join(p, '..'), { recursive: true })
+			writeFileSync(p, '# placeholder\n')
+		}
+	}
+	const setup = (state: typeof ran.hostNginx = 'running') => {
+		const dir = mkdtempSync(join(tmpdir(), 'disc-'))
+		fakeDocker(dir)
+		ran.fakeBin = dir
+		ran.hostNginx = state
+		return dir
+	}
+	const MAPPED = {
+		3017: ['https://shop.example.com'],
+		3101: ['https://alpha.example.com'],
+		3102: ['https://beta.example.com'],
+		3104: ['https://gamma.example.com'],
+		3201: ['https://orders.example.com'],
+		3202: ['https://desk.example.com'],
+	}
+
+	it('normal case: maps and upstreams in conf.d resolve', async () => {
+		const dir = setup()
+		const dump = hostNginxDumpWithConfD(undefined, join(dir, 'etc-nginx'))
+		materialize(dump)
+		fakeNginxT(dir, dump)
+		const routes = await getNginxRoutes({ id: 's', host: 'h' } as never, [])
+		expect(ports(routes)).toEqual(MAPPED)
+		expect(routes.hostSkipped).toBeUndefined()
+		rmSync(dir, { recursive: true, force: true })
+	})
+
+	it('a file under app space, with a spoofed header inside it: nothing of the host config is read', async () => {
+		const dir = setup()
+		mkdirSync(join(dir, 'opt-apps', 'shop'), { recursive: true })
+		const appFile = join(dir, 'opt-apps', 'shop', 'nginx-extra.conf')
+		writeFileSync(appFile, 'server {}')
+		const dump = hostNginxDumpWithConfD(appFile, join(dir, 'etc-nginx'))
+		materialize(dump, [join(dir, 'etc-nginx', 'fake.conf')])
+		fakeNginxT(dir, dump)
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+		const routes = await getNginxRoutes({ id: 's', host: 'h' } as never, [])
+		expect([...routes]).toEqual([])
+		expect(routes.hostSkipped).toBe('app-space')
+		expect(warn.mock.calls.join(' ')).toContain('host routes not read')
+		warn.mockRestore()
+		rmSync(dir, { recursive: true, force: true })
+	})
+
+	it('a sites-enabled symlink into app space fails closed, in the nginx -T and in the file path', async () => {
+		for (const viaT of [true, false]) {
+			const dir = setup()
+			mkdirSync(join(dir, 'opt-apps', 'shop'), { recursive: true })
+			mkdirSync(join(dir, 'sites-enabled'))
+			writeFileSync(join(dir, 'opt-apps', 'shop', 'vhost'), SHOP_BRIDGE_VHOST)
+			symlinkSync(join(dir, 'opt-apps', 'shop', 'vhost'), join(dir, 'sites-enabled', 'shop'))
+			writeFileSync(join(dir, 'sites-enabled', 'legacy'), LEGACY_DIRECT_VHOST)
+			// nginx prints the include path as written: the symlink, not its target
+			if (viaT)
+				fakeNginxT(
+					dir,
+					`# configuration file ${join(dir, 'sites-enabled', 'shop')}:\n${SHOP_BRIDGE_VHOST}\n# configuration file ${join(dir, 'sites-enabled', 'legacy')}:\n${LEGACY_DIRECT_VHOST}`,
+				)
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+			const routes = await getNginxRoutes({ id: 's', host: 'h' } as never, [])
+			warn.mockRestore()
+			expect([...routes], `viaT=${viaT}`).toEqual([])
+			expect(routes.hostSkipped).toBe('app-space')
+			rmSync(dir, { recursive: true, force: true })
+		}
+	})
+
+	it('nginx -T failing on a running nginx: the sites-enabled and conf.d files', async () => {
+		const dir = setup()
+		mkdirSync(join(dir, 'sites-enabled'))
+		mkdirSync(join(dir, 'conf.d'))
+		writeFileSync(join(dir, 'conf.d', 'apps-map.conf'), CONF_D_HOST_MAP)
+		writeFileSync(join(dir, 'conf.d', 'ignored.txt'), 'server { server_name nope.example.com; proxy_pass http://127.0.0.1:1; }')
+		writeFileSync(join(dir, 'sites-enabled', 'mapped-apps'), MAPPED_APPS_VHOST)
+		const routes = await getNginxRoutes({ id: 's', host: 'h' } as never, [])
+		expect(ports(routes)).toEqual({
+			3101: ['https://alpha.example.com'],
+			3102: ['https://beta.example.com'],
+			3104: ['https://gamma.example.com'],
+		})
+		rmSync(dir, { recursive: true, force: true })
+	})
+
+	it('nginx installed but no master running: the host is skipped, proxy containers are still read', async () => {
+		const dir = setup('stopped')
+		fakeNginxT(dir, hostNginxDumpWithConfD())
+		writeFileSync(join(dir, 'nginx-t.txt'), CONTAINER_NGINX_T)
+		writeFakeDocker(dir, ['#!/bin/bash', 'case "$1" in', '  ps) printf "%s\\n" edge-nginx ;;', '  inspect) echo "" ;;', `  exec) cat ${JSON.stringify(join(dir, 'nginx-t.txt'))} ;;`, 'esac'].join('\n'))
+		const routes = await getNginxRoutes({ id: 's', host: 'h' } as never, [])
+		expect([...routes]).toEqual([{ host: 'notes-web', port: 3000, urls: ['https://notes.example.com'] }])
+		expect(routes.hostSkipped).toBe('not-running')
+		rmSync(dir, { recursive: true, force: true })
+	})
+
+	it('a stale pid file (the pid is not nginx) counts as not running; the config can name the pid file', async () => {
+		const dir = setup('stale')
+		fakeNginxT(dir, hostNginxDumpWithConfD())
+		const stale = await getNginxRoutes({ id: 's', host: 'h' } as never, [])
+		expect([...stale]).toEqual([])
+		expect(stale.hostSkipped).toBe('not-running')
+		rmSync(dir, { recursive: true, force: true })
+
+		const dir2 = setup('stopped')
+		mkdirSync(join(dir2, 'proc', '77', 'ns'), { recursive: true })
+		writeFileSync(join(dir2, 'proc', '77', 'comm'), 'nginx\n')
+		symlinkSync('pid:[4026531836]', join(dir2, 'proc', '77', 'ns', 'pid'))
+		writeFileSync(join(dir2, 'custom.pid'), '77\n')
+		writeFileSync(join(dir2, 'nginx.conf'), '# placeholder\n')
+		fakeNginxT(dir2, `# configuration file ${join(dir2, 'nginx.conf')}:\npid ${join(dir2, 'custom.pid')};\n${LEGACY_DIRECT_VHOST}`)
+		const routes = await getNginxRoutes({ id: 's', host: 'h' } as never, [])
+		expect(ports(routes)).toEqual({ 3005: ['https://legacy.example.com', 'https://www.legacy.example.com'] })
+		rmSync(dir2, { recursive: true, force: true })
+	})
+
+	it('a pid reused by a container nginx (another pid namespace) or an unreadable ns counts as not running', async () => {
+		for (const st of ['container', 'no-ns'] as const) {
+			const dir = setup(st)
+			const dump = hostNginxDumpWithConfD(undefined, join(dir, 'etc-nginx'))
+			materialize(dump)
+			fakeNginxT(dir, dump)
+			const routes = await getNginxRoutes({ id: 's', host: 'h' } as never, [])
+			expect([...routes], st).toEqual([])
+			expect(routes.hostSkipped, st).toBe('not-running')
+			rmSync(dir, { recursive: true, force: true })
+		}
+	})
+
+	it('an openresty master, or a running nginx with no nginx binary on PATH: the file lists are read', async () => {
+		for (const st of ['openresty', 'off-path'] as const) {
+			const dir = setup(st)
+			mkdirSync(join(dir, 'sites-enabled'))
+			writeFileSync(join(dir, 'sites-enabled', 'legacy'), LEGACY_DIRECT_VHOST)
+			// an nginx -T that would claim other hostnames is not used for an openresty master
+			if (st === 'openresty') fakeNginxT(dir, `# configuration file ${join(dir, 'sites-enabled', 'legacy')}:\n${SHOP_BRIDGE_VHOST}`)
+			const routes = await getNginxRoutes({ id: 's', host: 'h' } as never, [])
+			expect(ports(routes), st).toEqual({ 3005: ['https://legacy.example.com', 'https://www.legacy.example.com'] })
+			expect(routes.hostSkipped, st).toBeUndefined()
+			rmSync(dir, { recursive: true, force: true })
+		}
+	})
+
+	it('a file name with a newline cannot slip past the app-space check (dump headers and file list)', async () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+		// via nginx -T: the header is cut at the newline; its first part still names app space
+		const dir = setup()
+		const shopDir = join(dir, 'opt-apps', 'shop')
+		mkdirSync(shopDir, { recursive: true })
+		writeFileSync(join(shopDir, 'a\nb.conf'), 'server {}')
+		const root = join(dir, 'etc-nginx')
+		const dump = `# configuration file ${root}/nginx.conf:\nhttp { include ${shopDir}/*.conf; }\n# configuration file ${shopDir}/a\nb.conf:\nserver { listen 443 ssl; server_name planted.example.com; location / { proxy_pass http://127.0.0.1:3017; } }\n`
+		materialize(dump)
+		fakeNginxT(dir, dump)
+		const viaT = await getNginxRoutes({ id: 's', host: 'h' } as never, [])
+		expect([...viaT]).toEqual([])
+		expect(viaT.hostSkipped).toBe('app-space')
+		rmSync(dir, { recursive: true, force: true })
+
+		// via the file list: a sites-enabled entry named with a newline, linked into app space
+		const dir2 = setup()
+		mkdirSync(join(dir2, 'opt-apps', 'shop'), { recursive: true })
+		mkdirSync(join(dir2, 'sites-enabled'))
+		writeFileSync(join(dir2, 'opt-apps', 'shop', 'vhost'), 'server { listen 443 ssl; server_name planted.example.com; location / { proxy_pass http://127.0.0.1:3017; } }')
+		symlinkSync(join(dir2, 'opt-apps', 'shop', 'vhost'), join(dir2, 'sites-enabled', 'x\ny'))
+		writeFileSync(join(dir2, 'sites-enabled', 'legacy'), LEGACY_DIRECT_VHOST)
+		const viaFiles = await getNginxRoutes({ id: 's', host: 'h' } as never, [])
+		expect([...viaFiles]).toEqual([])
+		expect(viaFiles.hostSkipped).toBe('app-space')
+		rmSync(dir2, { recursive: true, force: true })
+		warn.mockRestore()
+	})
+
+	it('a header whose path does not exist: unverifiable, nothing read', async () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+		const dir = setup()
+		const root = join(dir, 'etc-nginx')
+		const dump = hostNginxDumpWithConfD(undefined, root)
+		materialize(dump, [`${root}/sites-enabled/ports`])
+		fakeNginxT(dir, dump)
+		const routes = await getNginxRoutes({ id: 's', host: 'h' } as never, [])
+		expect([...routes]).toEqual([])
+		expect(routes.hostSkipped).toBe('unverifiable')
+		expect(warn.mock.calls.join(' ')).toContain('could not be checked')
+		warn.mockRestore()
+		rmSync(dir, { recursive: true, force: true })
+	})
+
+	it('output cut at the cap is flagged too large', async () => {
+		const { MAX_NGINX_PARSE_CHARS } = await import('../ssh/discovery')
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+		const dir = setup()
+		const root = join(dir, 'etc-nginx')
+		const big = `# configuration file ${root}/nginx.conf:\n${'#'.repeat(MAX_NGINX_PARSE_CHARS)}\n${LEGACY_DIRECT_VHOST}`
+		materialize(big)
+		fakeNginxT(dir, big)
+		const routes = await getNginxRoutes({ id: 's', host: 'h' } as never, [])
+		expect(routes.tooLarge).toBe(true)
+		expect([...routes]).toEqual([])
+		expect(warn.mock.calls.join(' ')).toContain('some routes not read')
+		warn.mockRestore()
+		rmSync(dir, { recursive: true, force: true })
+		// a normal config is not flagged
+		const dir2 = setup()
+		const small = hostNginxDumpWithConfD(undefined, join(dir2, 'etc-nginx'))
+		materialize(small)
+		fakeNginxT(dir2, small)
+		expect((await getNginxRoutes({ id: 's', host: 'h' } as never, [])).tooLarge).toBeUndefined()
+		rmSync(dir2, { recursive: true, force: true })
+	})
+
+	it('no nginx on the host: no host routes, no skip note', async () => {
+		const dir = setup('absent')
+		mkdirSync(join(dir, 'sites-enabled'))
+		writeFileSync(join(dir, 'sites-enabled', 'legacy'), LEGACY_DIRECT_VHOST)
+		const routes = await getNginxRoutes({ id: 's', host: 'h' } as never, [])
+		expect([...routes]).toEqual([])
+		expect(routes.hostSkipped).toBeUndefined()
+		rmSync(dir, { recursive: true, force: true })
+	})
+
+	it('the host part stays read-only and bounded', async () => {
+		const src = readFileSync(join(__dirname, '../ssh/discovery.ts'), 'utf8')
+		expect(src).toContain('runCommand(server, cmd, 10_000)')
+		const dir = setup()
+		ran.cmds.length = 0
+		await getNginxRoutes({ id: 's', host: 'h' } as never, [])
+		const cmd = ran.cmds.join('\n')
+		expect(cmd).toContain("NT='timeout 6'")
+		expect(cmd).toContain('$NT nginx -T 2>/dev/null')
+		// running = the pid file's process is nginx; pgrep would see container nginx too
+		expect(cmd).not.toMatch(/pgrep|systemctl|nginx -s|>\s*\/etc|rm /)
 		rmSync(dir, { recursive: true, force: true })
 	})
 })

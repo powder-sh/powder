@@ -10,11 +10,12 @@ import { Server as ServerIcon } from 'lucide-react'
 import { SkeletonList } from '@/components/ui/skeleton'
 import { useEffect, useState } from 'react'
 import Link from 'next/link'
-import { ExternalLink, GitBranch, Plus, RefreshCw } from 'lucide-react'
+import { GitBranch, Plus, RefreshCw } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { AddServerCard } from '@/components/add-server-card'
+import { ContainerUrls } from '@/components/container-urls'
 import { ServerUnreachable } from '@/components/server-unreachable'
 import { serverStatus } from '@/lib/server-status'
 
@@ -26,6 +27,8 @@ interface Container {
 	ports: string
 	createdAt: string
 	urls: string[]
+	/** where the URLs come from (lib/server-url-gaps.ts) */
+	urlSource?: 'proxy' | 'app-domains' | 'none'
 	repo: { repoUrl: string; branch: string } | null
 	lastDeploy: {
 		id: string
@@ -50,6 +53,11 @@ interface Server {
 	reachable: boolean
 	error?: string
 	containers: Container[]
+	/** the host nginx config was not read: it includes a file from app space, or names
+	 *  a file that could not be checked */
+	hostProxyConfig?: 'app-space' | 'unverifiable' | null
+	/** the proxy config output was cut before parsing: some routes may be missing */
+	proxyConfigTooLarge?: boolean
 }
 
 export default function ServersPage() {
@@ -306,6 +314,15 @@ function ServerCard({ server, onRetry }: { server: Server; onRetry: () => Promis
 				{facts.length > 0 && (
 					<p className="text-xs text-muted-foreground">{facts.join(' · ')}</p>
 				)}
+				{server.hostProxyConfig === 'app-space' && (
+					<p className="text-xs text-warning">host proxy config includes files from app space; routes not read</p>
+				)}
+				{server.hostProxyConfig === 'unverifiable' && (
+					<p className="text-xs text-warning">host proxy config names a file that could not be checked; routes not read</p>
+				)}
+				{server.proxyConfigTooLarge && (
+					<p className="text-xs text-warning">proxy config too large; some routes not read</p>
+				)}
 			</CardHeader>
 			<CardContent>
 				<ServerStatsRow serverId={server.id} reachable={server.reachable} />
@@ -351,27 +368,14 @@ function ServerCard({ server, onRetry }: { server: Server; onRetry: () => Promis
 											{c.image}
 										</div>
 									</Link>
-								</div>
-								<div className="hidden min-w-0 md:col-span-3 md:block">
-									{c.urls.length === 0 ? (
-										<span className="text-xs text-muted-foreground">-</span>
-									) : (
-										<div className="flex flex-col gap-0.5">
-											{c.urls.slice(0, 2).map((u) => (
-												<button
-													key={u}
-													type="button"
-													onClick={(e) => {
-														window.open(u, '_blank', 'noopener')
-													}}
-													className="relative z-10 inline-flex items-center gap-1 truncate text-left text-xs text-foreground hover:underline"
-												>
-													<span className="truncate">{u.replace(/^https?:\/\//, '')}</span>
-													<ExternalLink className="h-3 w-3 shrink-0 opacity-60" />
-												</button>
-											))}
+									{c.urls.length > 0 && (
+										<div className="mt-1 md:hidden">
+											<ContainerUrls urls={c.urls} limit={1} notInProxy={c.urlSource === 'app-domains'} />
 										</div>
 									)}
+								</div>
+								<div className="hidden min-w-0 md:col-span-3 md:block">
+									<ContainerUrls urls={c.urls} limit={2} notInProxy={c.urlSource === 'app-domains'} />
 								</div>
 								<div className="hidden min-w-0 md:col-span-3 md:block">
 									{c.repo ? (

@@ -1,0 +1,148 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`bridge modes without the dns-alias label (regression guard) > enabled but not routed and no host-port label: not-routed skip 1`] = `
+{
+  "changes": [],
+  "out": "[bridge] skipped: no explicit traefik router+service labels (worker / non-http / default-named)
+[bridge] not traefik-routed
+__POWDER_BRIDGE_reg1__ not-routed
+__POWDER_NGINXUP_reg1__ app n/a
+rc=0
+hrc=0
+",
+}
+`;
+
+exports[`bridge modes without the dns-alias label (regression guard) > host-port mode skips on a boot push 1`] = `
+{
+  "changes": [],
+  "out": "[bridge] skipped: boot-time schema push in command (re-running it can revert newer schema changes; set label powder.bridge.boot-push-ok=true to allow)
+[bridge] not traefik-routed
+__POWDER_BRIDGE_reg1__ not-routed
+rc=0
+hrc=0
+",
+}
+`;
+
+exports[`bridge modes without the dns-alias label (regression guard) > host-port mode with extra_hosts 1`] = `
+{
+  "changes": [
+    "create --pull=never --name demo-powder-bridge --restart=no --memory 2g --memory-swap 2g --network shop_default --label powder.bridge=/opt/apps/demo|app --label com.docker.compose.project= --label com.docker.compose.service= --label com.docker.compose.version= --label com.docker.compose.project.config_files= --label com.docker.compose.project.working_dir= --label com.docker.compose.project.environment_file= --label com.docker.compose.oneoff= --label com.docker.compose.container-number= --label com.docker.compose.config-hash= --label com.docker.compose.depends_on= --label com.docker.compose.image= --label com.docker.compose.replace= --cap-drop NET_RAW --security-opt no-new-privileges --health-cmd test -f /tmp/.powder-ready --health-interval 1s --health-retries 1 --health-start-interval 1s --health-start-period 60s --label-file <tmp> --env-file <tmp> -v /opt/apps/demo/data:/data --user node --workdir /app --add-host host.docker.internal:host-gateway --cap-drop ALL --cap-drop NET_RAW --security-opt no-new-privileges:true --pids-limit 512 -p 127.0.0.1:13001:3001 sha256:abc",
+    "start demo-powder-bridge",
+    "exec demo-powder-bridge touch /tmp/.powder-ready",
+    "exec demo-powder-bridge rm -f /tmp/.powder-ready",
+    "stop -t 10 demo-powder-bridge",
+    "rm -f demo-powder-bridge",
+  ],
+  "out": "[nginx] upstreams ok (no single primary without max_fails=0 next to a backup)
+__POWDER_NGINXUP_reg1__ scan 
+[bridge] nginx lists 127.0.0.1:13001 as a backup upstream
+[bridge] demo-powder-bridge answering on 127.0.0.1:13001 (nginx backup upstream) - overlapping old and new during the swap
+__POWDER_BRIDGE_reg1__ bridged
+__POWDER_NGINXUP_reg1__ app ok
+rc=0
+[bridge] new container ready; draining bridge
+[bridge] removed demo-powder-bridge
+hrc=0
+",
+}
+`;
+
+exports[`bridge modes without the dns-alias label (regression guard) > not enabled: traefik-routed, nginx-fronted, plain 1`] = `
+{
+  "changes": [],
+  "out": "[bridge] skipped: not enabled (label powder.bridge.enabled=true)
+[bridge] WARNING: traefik app not bridged: not enabled (label powder.bridge.enabled=true) - expect 502s during the swap (for a missing label or healthcheck: add HEALTHCHECK + LABEL powder.bridge.enabled=true to the Dockerfile; the server compose is not synced from the repo)
+__POWDER_BRIDGE_reg1__ no-label
+__POWDER_NGINXUP_reg1__ app n/a
+rc=0
+hrc=0
+",
+}
+`;
+
+exports[`bridge modes without the dns-alias label (regression guard) > not enabled: traefik-routed, nginx-fronted, plain 2`] = `
+{
+  "changes": [],
+  "out": "[nginx] upstreams ok (no single primary without max_fails=0 next to a backup)
+__POWDER_NGINXUP_reg1__ scan 
+[bridge] skipped: not enabled (label powder.bridge.enabled=true)
+[bridge] WARNING: nginx-fronted app not bridged (host nginx proxies to its 127.0.0.1 port) - expect 502s during the swap; add LABEL powder.bridge.enabled=true and powder.bridge.host-port=<app port + 10000>, and the backup upstream server 127.0.0.1:<that port> backup; in the vhost
+__POWDER_BRIDGE_reg1__ nginx-unbridged
+__POWDER_NGINXUP_reg1__ app n/a
+rc=0
+hrc=0
+",
+}
+`;
+
+exports[`bridge modes without the dns-alias label (regression guard) > not enabled: traefik-routed, nginx-fronted, plain 3`] = `
+{
+  "changes": [],
+  "out": "[bridge] skipped: not enabled (label powder.bridge.enabled=true)
+[bridge] not traefik-routed
+__POWDER_BRIDGE_reg1__ not-routed
+__POWDER_NGINXUP_reg1__ app n/a
+rc=0
+hrc=0
+",
+}
+`;
+
+exports[`bridge modes without the dns-alias label (regression guard) > traefik mode skips (no healthcheck) 1`] = `
+{
+  "changes": [],
+  "out": "[bridge] skipped: current container has no healthcheck (required for opt-in)
+[bridge] WARNING: traefik app not bridged: current container has no healthcheck (required for opt-in) - expect 502s during the swap (for a missing label or healthcheck: add HEALTHCHECK + LABEL powder.bridge.enabled=true to the Dockerfile; the server compose is not synced from the repo)
+__POWDER_BRIDGE_reg1__ no-healthcheck
+__POWDER_NGINXUP_reg1__ app n/a
+rc=0
+hrc=0
+",
+}
+`;
+
+exports[`bridge modes without the dns-alias label (regression guard) > traefik mode with a loopback port 1`] = `
+{
+  "changes": [
+    "create --pull=never --name demo-powder-bridge --restart=no --memory 2g --memory-swap 2g --network shop_default --label powder.bridge=/opt/apps/demo|app --label com.docker.compose.project= --label com.docker.compose.service= --label com.docker.compose.version= --label com.docker.compose.project.config_files= --label com.docker.compose.project.working_dir= --label com.docker.compose.project.environment_file= --label com.docker.compose.oneoff= --label com.docker.compose.container-number= --label com.docker.compose.config-hash= --label com.docker.compose.depends_on= --label com.docker.compose.image= --label com.docker.compose.replace= --cap-drop NET_RAW --security-opt no-new-privileges --health-cmd test -f /tmp/.powder-ready --health-interval 1s --health-retries 1 --health-start-interval 1s --health-start-period 60s --label-file <tmp> --env-file <tmp> -v /opt/apps/demo/data:/data --user node --workdir /app --cap-drop ALL --cap-drop NET_RAW --security-opt no-new-privileges:true --pids-limit 512 sha256:abc",
+    "start demo-powder-bridge",
+    "exec demo-powder-bridge touch /tmp/.powder-ready",
+    "exec demo-powder-bridge rm -f /tmp/.powder-ready",
+    "stop -t 10 demo-powder-bridge",
+    "rm -f demo-powder-bridge",
+  ],
+  "out": "[bridge] loopback-only host ports stay on the old container; the bridge publishes none
+[bridge] demo-powder-bridge answering on :3000 - overlapping old and new during the swap
+__POWDER_BRIDGE_reg1__ bridged
+__POWDER_NGINXUP_reg1__ app n/a
+rc=0
+[bridge] new container ready; draining bridge
+[bridge] removed demo-powder-bridge
+hrc=0
+",
+}
+`;
+
+exports[`bridge modes without the dns-alias label (regression guard) > traefik mode, two networks 1`] = `
+{
+  "changes": [
+    "create --pull=never --name demo-powder-bridge --restart=no --memory 2g --memory-swap 2g --network shop_default --label powder.bridge=/opt/apps/demo|app --label com.docker.compose.project= --label com.docker.compose.service= --label com.docker.compose.version= --label com.docker.compose.project.config_files= --label com.docker.compose.project.working_dir= --label com.docker.compose.project.environment_file= --label com.docker.compose.oneoff= --label com.docker.compose.container-number= --label com.docker.compose.config-hash= --label com.docker.compose.depends_on= --label com.docker.compose.image= --label com.docker.compose.replace= --cap-drop NET_RAW --security-opt no-new-privileges --health-cmd test -f /tmp/.powder-ready --health-interval 1s --health-retries 1 --health-start-interval 1s --health-start-period 60s --label-file <tmp> --env-file <tmp> -v /opt/apps/demo/data:/data --user node --workdir /app --cap-drop ALL --cap-drop NET_RAW --security-opt no-new-privileges:true --pids-limit 512 sha256:abc",
+    "network connect proxy demo-powder-bridge",
+    "start demo-powder-bridge",
+    "exec demo-powder-bridge touch /tmp/.powder-ready",
+    "exec demo-powder-bridge rm -f /tmp/.powder-ready",
+    "stop -t 10 demo-powder-bridge",
+    "rm -f demo-powder-bridge",
+  ],
+  "out": "[bridge] demo-powder-bridge answering on :3000 - overlapping old and new during the swap
+__POWDER_BRIDGE_reg1__ bridged
+__POWDER_NGINXUP_reg1__ app n/a
+rc=0
+[bridge] new container ready; draining bridge
+[bridge] removed demo-powder-bridge
+hrc=0
+",
+}
+`;

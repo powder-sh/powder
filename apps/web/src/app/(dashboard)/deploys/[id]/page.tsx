@@ -8,23 +8,24 @@ import { use, useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import {
 	AlertTriangle,
-	Check,
 	ChevronDown,
 	ChevronRight,
-	Copy,
 	Download,
 	RefreshCw,
 	Undo2,
 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { CopyButton } from '@/components/ui/copy-button'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { useToast } from '@/components/ui/toast'
-import { stripFailMarkers } from '@/lib/deploy-log'
+import { deployLogText, failureTail, tailCuts } from '@/lib/deploy-log'
 import { deployKindLabel, deployStatus, triggeredByLabel } from '@/lib/deploy-status'
 import { useRouter } from 'next/navigation'
 import { AgentHelp } from '@/components/agent-help'
 import { debugDeployPrompt } from '@/lib/agent-help-prompts'
+import { failedDeployCopyBlock } from '@/lib/deploy-copy'
+import { REQUESTED_MARK, deployCommit, formatCommitLabel } from '@/lib/deploy-commit'
 import {
 	REVOKED_MESSAGE,
 	STREAM_EXPIRED,
@@ -35,8 +36,10 @@ import {
 	STREAM_OFFSET,
 	streamOffset,
 } from '@/lib/stream-events'
-import { formatDateTime } from '@/lib/format'
+import { formatDateTime, formatDuration, waitedLabel } from '@/lib/format'
+import { deployListAt } from '@/lib/deploy-order'
 import { cn } from '@/lib/cn'
+import { summaryBeyondStep } from '@/lib/notify-text'
 
 interface Deploy {
 	id: string
@@ -44,12 +47,15 @@ interface Deploy {
 	containerName: string
 	kind: string
 	status: 'queued' | 'running' | 'success' | 'failed'
+	queuedAt?: string | null
 	startedAt: string
 	finishedAt: string | null
 	output: string | null
 	error: string | null
 	triggeredBy: string | null
 	gitSha: string | null
+	builtSha?: string | null
+	requestedSha?: string | null
 	gitBranch: string | null
 	imageTag: string | null
 	rolledBackFromId: string | null
@@ -72,6 +78,7 @@ function DeployDetail({ deployId }: { deployId: string }) {
 		isLatest: false,
 		lastGood: null,
 		activeDeployId: null,
+		rollbackUnchanged: false,
 	})
 	const [error, setError] = useState<string | null>(null)
 	const [liveOutput, setLiveOutput] = useState<string>('')
@@ -105,6 +112,7 @@ function DeployDetail({ deployId }: { deployId: string }) {
 				isLatest: data.isLatest === true,
 				lastGood: data.lastGood ?? null,
 				activeDeployId: data.activeDeployId ?? null,
+				rollbackUnchanged: data.rollbackUnchanged === true,
 			})
 			return data.deploy
 		} catch {
@@ -211,7 +219,12 @@ function DeployDetail({ deployId }: { deployId: string }) {
 	// While in flight show the streamed buffer (it replays from the start), falling back
 	// to the stored partial output; never both, or the log doubles.
 	const body = active ? liveOutput || (deploy.output ?? '') : (deploy.output ?? '')
-	const fullOutput = stripFailMarkers((deploy.error ? `ERROR: ${deploy.error}\n\n` : '') + body)
+	// One copy of the log: the error goes in front only when it says something the output
+	// does not (a step failure's error repeats the log; lib/deploy-log.ts).
+	const fullOutput = deployLogText({ output: body, error: deploy.error })
+	// the commit as every display names it (lib/deploy-commit.ts)
+	const commit = deployCommit(deploy)
+	const shortId = deployId.replace(/^dep_/, '').slice(0, 12)
 	return (
 		<div className="space-y-6">
 			{streamNote && (
@@ -219,7 +232,7 @@ function DeployDetail({ deployId }: { deployId: string }) {
 					{streamNote}
 				</Alert>
 			)}
-			<title>{`deploy ${deploy.gitSha ? deploy.gitSha.slice(0, 7) : deployId.replace(/^dep_/, '').slice(0, 12)} · powder`}</title>
+			<title>{`deploy ${commit ? commit.short : shortId} · powder`}</title>
 			<PageHeader
 				back={{ href: '/deploys', label: 'deploys' }}
 				title={
@@ -227,10 +240,18 @@ function DeployDetail({ deployId }: { deployId: string }) {
 						<span>
 							{deploy.containerName}
 							<span className="ml-2 font-mono text-base font-normal text-muted-foreground">
-								{deploy.gitSha
-									? deploy.gitSha.slice(0, 7)
-									: deployId.replace(/^dep_/, '').slice(0, 12)}
+								{commit ? commit.short : shortId}
 							</span>
+							{commit?.requested && (
+								<span className="ml-1.5 text-xs font-normal text-muted-foreground">{REQUESTED_MARK}</span>
+							)}
+							{commit && (
+								<CopyButton
+									value={commit.short}
+									label="copy the commit"
+									className="ml-0.5 align-middle"
+								/>
+							)}
 						</span>
 						<StatusBadge status={deploy.status} />
 					</>
@@ -258,22 +279,37 @@ function DeployDetail({ deployId }: { deployId: string }) {
 								· <span className="font-mono">{deploy.gitBranch}</span>
 							</>
 						)}
-						{deploy.gitSha && (
+						{commit && (
 							<>
 								{' '}
-								· <span className="font-mono">{deploy.gitSha.slice(0, 7)}</span>
+								· <span className="font-mono">{formatCommitLabel(commit)}</span>
 							</>
 						)}
 						{triggeredByLabel(deploy.triggeredBy) && <> · {triggeredByLabel(deploy.triggeredBy)}</>}
-						<> · started {formatDateTime(deploy.startedAt)}</>
-						{deploy.finishedAt ? (
-							<> · {duration(deploy.startedAt, deploy.finishedAt)}</>
-						) : active ? (
+						{deploy.status === 'queued' ? (
 							<>
 								{' '}
-								· <Elapsed since={deploy.startedAt} />
+								· queued {formatDateTime(deployListAt(deploy))} ·{' '}
+								<Elapsed since={String(deployListAt(deploy))} label="queued for" />
 							</>
-						) : null}
+						) : (
+							<>
+								{' '}
+								· started {formatDateTime(deploy.startedAt)}
+								{/* the wait in the queue, from the push to the claim (lib/format.ts) */}
+								{waitedLabel(deploy.queuedAt, deploy.startedAt) && (
+									<> · {waitedLabel(deploy.queuedAt, deploy.startedAt)}</>
+								)}
+								{deploy.finishedAt ? (
+									<> · {duration(deploy.startedAt, deploy.finishedAt)}</>
+								) : active ? (
+									<>
+										{' '}
+										· <Elapsed since={deploy.startedAt} label="running for" />
+									</>
+								) : null}
+							</>
+						)}
 					</span>
 				}
 			/>
@@ -283,6 +319,21 @@ function DeployDetail({ deployId }: { deployId: string }) {
 					summary={deploy.errorSummary}
 					failedStep={deploy.failedStep}
 					exitCode={deploy.exitCode}
+					copyBlock={() =>
+						failedDeployCopyBlock({
+							app: deploy.containerName,
+							deployId: deploy.id,
+							sha: commit?.sha ?? null,
+							shaRequested: commit?.requested,
+							branch: deploy.gitBranch,
+							failedStep: deploy.failedStep,
+							exitCode: deploy.exitCode,
+							summary: deploy.errorSummary,
+							// the end of the log, where the cause is; the full log is below
+							error: failureTail({ output: deploy.output, error: deploy.error }),
+							logCut: tailCuts(fullOutput),
+						})
+					}
 				/>
 			)}
 
@@ -293,7 +344,8 @@ function DeployDetail({ deployId }: { deployId: string }) {
 					prompt={debugDeployPrompt({
 						app: deploy.containerName,
 						branch: deploy.gitBranch,
-						sha: deploy.gitSha,
+						sha: commit?.sha ?? null,
+						shaRequested: commit?.requested,
 						failedStep: deploy.failedStep,
 						exitCode: deploy.exitCode,
 						summary: deploy.errorSummary,
@@ -324,19 +376,14 @@ function decodeChunk(data: string): string {
 }
 
 function CopyLinkButton() {
-	const [copied, setCopied] = useState(false)
-	function copy() {
-		if (typeof window === 'undefined') return
-		navigator.clipboard.writeText(window.location.href).then(() => {
-			setCopied(true)
-			setTimeout(() => setCopied(false), 1500)
-		})
-	}
 	return (
-		<Button variant="outline" size="sm" onClick={copy}>
-			{copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
-			copy link
-		</Button>
+		<CopyButton
+			value={() => window.location.href}
+			label="copy the link to this deploy"
+			text="copy link"
+			size="sm"
+			variant="outline"
+		/>
 	)
 }
 
@@ -344,11 +391,16 @@ function FailureBanner({
 	summary,
 	failedStep,
 	exitCode,
+	copyBlock,
 }: {
 	summary: string
 	failedStep: string | null
 	exitCode: number | null
+	copyBlock: () => string
 }) {
+	// a summary that already names the step ("failed during: <step>") is not followed by
+	// "failed at: <step>" as well
+	const step = failedStep && summaryBeyondStep(failedStep, summary) === summary.trim() ? failedStep : null
 	return (
 		<div
 			role="alert"
@@ -356,16 +408,22 @@ function FailureBanner({
 		>
 			<div className="flex items-start gap-2.5">
 				<AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
-				<div className="min-w-0 space-y-1">
+				<div className="min-w-0 flex-1 space-y-1">
 					<p className="ph-no-capture break-words text-sm font-medium text-foreground">{summary}</p>
-					{(failedStep || exitCode != null) && (
+					{(step || exitCode != null) && (
 						<p className="font-mono text-2xs text-muted-foreground">
-							{failedStep && <>failed at: {failedStep}</>}
-							{failedStep && exitCode != null && ' · '}
+							{step && <>failed at: {step}</>}
+							{step && exitCode != null && ' · '}
 							{exitCode != null && <>exit code {exitCode}</>}
 						</p>
 					)}
 				</div>
+				<CopyButton
+					value={copyBlock}
+					label="copy error with app, deploy, commit and failed step"
+					text="copy error"
+					className="-my-1"
+				/>
 			</div>
 		</div>
 	)
@@ -395,6 +453,9 @@ interface NextSteps {
 	lastGood: { id: string; gitSha: string | null } | null
 	/** A newer deploy of this app that is still queued or building. */
 	activeDeployId: string | null
+	/** lastGood is the version running now (this deploy stopped before the swap and nothing
+	 *  since changed what runs): a rollback to it would change nothing (lib/deploy-swap.ts) */
+	rollbackUnchanged: boolean
 }
 
 // A failed deploy's way forward: build again, or put the last good image back.
@@ -446,13 +507,21 @@ function NextStepActions({ deploy, next }: { deploy: Deploy; next: NextSteps }) 
 					a deploy is running
 				</Link>
 			)}
+			{good && next.rollbackUnchanged && (
+				<span
+					className="self-center text-xs text-muted-foreground"
+					title="this deploy stopped before the swap, so the version that ran before it still runs; a rollback would change nothing"
+				>
+					the running version was not changed: <span className="font-mono">{goodLabel}</span> still runs
+				</span>
+			)}
 			{next.appId && (
 				<Button size="sm" disabled={running} onClick={() => setConfirm('redeploy')}>
 					<RefreshCw className="h-3.5 w-3.5" />
 					redeploy
 				</Button>
 			)}
-			{good && (
+			{good && !next.rollbackUnchanged && (
 				<Button
 					variant="outline"
 					size="sm"
@@ -548,7 +617,6 @@ function LogViewer({
 	const [picked, setPicked] = useState<string | null | undefined>(undefined)
 	const openSection = picked !== undefined ? picked : failed || live ? lastKey : null
 	const [showRaw, setShowRaw] = useState(false)
-	const [copied, setCopied] = useState(false)
 	const tailRef = useRef<HTMLPreElement | null>(null)
 
 	// Keep the open streaming section scrolled to its newest line.
@@ -556,13 +624,6 @@ function LogViewer({
 	useEffect(() => {
 		if (live && tailRef.current) tailRef.current.scrollTop = tailRef.current.scrollHeight
 	}, [live, raw])
-
-	function copy() {
-		navigator.clipboard.writeText(raw).then(() => {
-			setCopied(true)
-			setTimeout(() => setCopied(false), 1500)
-		})
-	}
 
 	function download() {
 		const blob = new Blob([raw], { type: 'text/plain' })
@@ -590,19 +651,7 @@ function LogViewer({
 					<Button variant="ghost" size="sm" onClick={() => setShowRaw((v) => !v)}>
 						{showRaw ? 'sections' : 'raw'}
 					</Button>
-					<Button variant="ghost" size="sm" onClick={copy} title="copy the full deploy log">
-						{copied ? (
-							<>
-								<Check className="h-3 w-3 text-success" />
-								<span className="hidden sm:inline">copied</span>
-							</>
-						) : (
-							<>
-								<Copy className="h-3 w-3" />
-								<span className="hidden sm:inline">copy</span>
-							</>
-						)}
-					</Button>
+					<CopyButton value={() => raw} label="copy the full deploy log" text="copy" size="sm" />
 					<Button
 						variant="ghost"
 						size="sm"
@@ -662,8 +711,9 @@ function LogViewer({
 	)
 }
 
-// Ticks once a second while a deploy runs: "running for 1m 12s".
-function Elapsed({ since }: { since: string }) {
+// Ticks once a second while a deploy waits or runs: "queued for 3m 05s" from the push,
+// "running for 1m 12s" from the claim (started_at).
+function Elapsed({ since, label }: { since: string; label: string }) {
 	const [now, setNow] = useState(() => Date.now())
 	useEffect(() => {
 		const t = setInterval(() => setNow(Date.now()), 1000)
@@ -671,16 +721,14 @@ function Elapsed({ since }: { since: string }) {
 	}, [])
 	const s = Math.max(0, Math.floor((now - new Date(since).getTime()) / 1000))
 	const text = s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`
-	return <span className="tabular-nums">running for {text}</span>
+	return (
+		<span className="tabular-nums">
+			{label} {text}
+		</span>
+	)
 }
 
+// build time (finished - started), in the one duration format (lib/format.ts)
 function duration(startISO: string, endISO: string): string {
-	try {
-		const ms = new Date(endISO).getTime() - new Date(startISO).getTime()
-		if (ms < 1000) return `${ms}ms`
-		if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`
-		return `${Math.round(ms / 60_000)}m`
-	} catch {
-		return ''
-	}
+	return formatDuration(new Date(endISO).getTime() - new Date(startISO).getTime())
 }

@@ -36,9 +36,20 @@ export interface Deploy {
 	startedAt: string
 	finishedAt: string | null
 	gitSha: string | null
+	/** the commit the deploy built (0070) and the one the push requested; displays read
+	 *  them through lib/deploy-commit.ts */
+	builtSha?: string | null
+	requestedSha?: string | null
 	gitBranch: string | null
 	imageTag: string | null
-	error: string | null
+	/** a failure: its one-line summary, step and exit code, and the end of its log
+	 *  (masked; the full log is on /deploys/<id>) */
+	failedStep?: string | null
+	exitCode?: number | null
+	errorSummary?: string | null
+	logTail?: string | null
+	/** true when logTail leaves earlier lines out */
+	logCut?: boolean
 	outputPreview: string | null
 	/** Set while a queued push is held on the settle window (lib/deploy-settle.ts). */
 	notBefore?: string | null
@@ -87,6 +98,9 @@ export interface ProjectMeta {
 	uptimeEnabled: boolean
 	healthUrl: string | null
 	previewsEnabled: boolean
+	/** Why previews cannot work on this app's server (lib/preview-deploys.ts
+	 *  previewBlockReason); null = they can. */
+	previewBlockReason: string | null
 	/** What previews build and route to (0065); null port: read from the compose. */
 	dockerfilePath: string
 	containerPort: number | null
@@ -141,6 +155,7 @@ export function ProjectProvider({
 			uptimeEnabled: d.uptimeEnabled === true,
 			healthUrl: (d.healthUrl as string) ?? null,
 			previewsEnabled: d.previewsEnabled === true,
+			previewBlockReason: typeof d.previewBlockReason === 'string' ? d.previewBlockReason : null,
 			dockerfilePath: typeof d.dockerfilePath === 'string' && d.dockerfilePath ? d.dockerfilePath : './Dockerfile',
 			containerPort: typeof d.containerPort === 'number' ? d.containerPort : null,
 			autoRollback: d.autoRollback !== false,

@@ -5,42 +5,282 @@ import { runCommand } from './connection'
 import { branchProblem, repoUrlProblem } from '../git-input'
 import { POWDER_GIT_NOREPO, gitCmd, gitHardenShellFunctions } from '../git-harden'
 import { targetLinkGuardShell, targetLinkSourcesShell } from '../target-links'
+import { APP_LOCK_DIR } from '../deploy-supersede'
+import { createHash, randomBytes } from 'node:crypto'
+import { redactSecrets } from '../secret-text'
+import { CLONE_KEY_TMP_PREFIX, cloneKeyTmpPathOk } from '../temp-path'
+import { APPS_ROOT, CLONE_TMP_MARKER, MAX_PURPOSE, cloneMarkerMatchShell, cloneMarkerMatchVarShell, cloneMarkerWriteShell, clonePurposeOk, clonePurposeSlug, cloneTargetOk, cloneTmpMarkerMatchVarShell, cloneTmpMarkerWriteShell } from '../clone-marker'
+import { type AppCheckout, appCheckoutProbeShell, parseCheckoutFacts, resolveAppCheckout } from '../app-checkout'
 
 export { repoSymlinkGuardShell } from '../repo-symlinks'
 
+// ── clone scripts: outcome reporting ───────────────────────────────────────────
+//
+// A clone script reports its outcome through its exit code plus ONE status line it
+// prints itself from its EXIT trap:
+//   __PC_<nonce>__ rc=<n> placed=<0|1> kept=<path|-> reason=<word>
+// Channel: the script moves its own stdout to fd 3 at once and sends everything else
+// (its messages, git, the link guards) to stderr; fd 3 carries only the status line,
+// and every step that runs repo-influenced code (git clone, the link guards, the
+// symlink guard) runs in a subshell that closes fd 3 first (the main shell keeps it,
+// so a TERM trap there still has it), so no child, even one left running in the
+// background, can write to stdout at all. The nonce is random per call and reaches
+// the script on stdin (runCommand's stdin option), never in the command line. The
+// caller accepts stdout only when it is exactly that one line; anything else means
+// "refused, nothing placed". Every decision (did this run place the clone, what was
+// kept) comes from that line.
+
+export function cloneNonce(): string {
+	return randomBytes(16).toString('hex')
+}
+
+export interface CloneStatus {
+	rc: number
+	placed: boolean
+	kept: string | null
+	reason: string
+}
+
+/** The status of a clone script run with `nonce`: its stdout must be exactly the one
+ *  status line (fd 3 carries nothing else), else null. Pure. */
+export function parseCloneStatus(stdout: string, nonce: string): CloneStatus | null {
+	if (!/^[0-9a-f]{32}$/.test(nonce)) return null
+	const only = stdout.replace(/\n$/, '')
+	if (only.includes('\n')) return null
+	const m = only.match(new RegExp(`^__PC_${nonce}__ rc=(\\d{1,3}) placed=([01]) kept=(-|/[A-Za-z0-9_./-]+) reason=([a-z]+)$`))
+	if (!m) return null
+	return { rc: Number(m[1]), placed: m[2] === '1', kept: m[3] === '-' ? null : (m[3] ?? null), reason: m[4] ?? 'failed' }
+}
+
+/** Shell prelude (ends with `; `), first in every clone script: the status variables,
+ *  `__pc_refuse <reason> <message>`, and the EXIT trap that removes this run's own
+ *  temp dir (only when its temp marker names `purpose`: a recursive removal only when
+ *  a clone is inside, else the marker file and the empty dir) and prints the status
+ *  line last. Must come before GITHUB_KNOWN_HOSTS_SETUP, which chains its own EXIT
+ *  cleanup in front of this one. */
+function cloneStatusPrelude(purpose: string, keyToRemove: string | null = null): string {
+	return (
+		// fd 3 = the real stdout, for the status line only; everything else to stderr;
+		// the nonce from stdin (refused before anything else when it is not one), then
+		// stdin is closed for everything after
+		`exec 3>&1 1>&2; ` +
+		nonceReadShell('__PC_NONCE', 'clone') +
+		`__PC_TMP=; __PC_PLACED=0; __PC_KEPT=-; __PC_WHY=failed; ` +
+		`__pc_refuse() { __PC_WHY=$1; shift; echo "clone refused: $*"; exit 1; }; ` +
+		// set +e first and the status fields before any cleanup command, so a failing
+		// cleanup can never lose the status line
+		`__pc_end() { __rc=$?; set +e; trap - EXIT HUP INT TERM; ` +
+		`__pc_st="rc=$__rc placed=$__PC_PLACED kept=$__PC_KEPT reason=$__PC_WHY"; ` +
+		`if [ -n "$__PC_TMP" ] && ${cloneTmpMarkerMatchVarShell('__PC_TMP', purpose)}; then ` +
+		`if [ -e "$__PC_TMP/repo" ] || [ -L "$__PC_TMP/repo" ]; then rm -rf -- "$__PC_TMP"; ` +
+		`else rm -f -- "$__PC_TMP/${CLONE_TMP_MARKER}"; rmdir -- "$__PC_TMP" 2>/dev/null; fi; fi; ` +
+		// the temp deploy key this run was given, also when the caller is gone; only a
+		// path of the temp key's exact shape, checked again here in the script
+		(keyToRemove
+			? `__pk=${shq(keyToRemove)}; case "$__pk" in ${shq(`${CLONE_KEY_TMP_PREFIX}.tmp.`)}????????????????) case "\${__pk##*.}" in *[!0123456789abcdef]*) ;; *) rm -f -- "$__pk" ;; esac ;; esac; `
+			: '') +
+		`printf '__PC_%s__ %s\\n' "$__PC_NONCE" "$__pc_st" >&3; exit "$__rc"; }; ` +
+		`trap __pc_end EXIT; trap '__PC_WHY=killed; exit 143' HUP INT TERM; `
+	)
+}
+
+/** Shell (ends with `; `): read this call's nonce from stdin into `v` (waiting at most
+ *  10 s: bash's `read -t`, or `timeout 10 head -n 1` under another shell), then refuse
+ *  with exit 2 and a line on stderr, before anything else runs, unless it is exactly
+ *  32 lowercase hex characters (stdin at EOF, an empty or short line, other
+ *  characters, or nothing within 10 s). The caller then finds no status line, which
+ *  reads as "refused, nothing placed", and that is true. Closes stdin afterwards. */
+export function nonceReadShell(v: string, who: string): string {
+	if (!/^[A-Z_][A-Z0-9_]*$/.test(v) || !/^[a-z ]+$/.test(who)) throw new Error('bad nonce reader')
+	return (
+		`${v}=; if [ -n "\${BASH_VERSION:-}" ]; then IFS= read -r -t 10 ${v} || ${v}=; ` +
+		`else ${v}=$(timeout 10 head -n 1 2>/dev/null) || ${v}=; fi; ` +
+		`case "$${v}" in *[!0123456789abcdef]*) ${v}= ;; esac; ` +
+		`if [ "\${#${v}}" -ne 32 ]; then echo "${who} refused: no valid call value on stdin, nothing was run" >&2; exit 2; fi; ` +
+		`exec 0</dev/null; `
+	)
+}
+
+/** runCommand options carrying a clone script's nonce on stdin. */
+function nonceStdin(nonce: string): { stdin: string } {
+	return { stdin: `${nonce}\n` }
+}
+
+/** Shell (ends with `; `): remove dead temp clones of `purpose` next to `prefix`
+ *  (exactly `<prefix><digits>`, never this run's own, only with the temp marker naming
+ *  this owner). Runs after every refusal check, under the clone's lock. */
+function sweepDeadTempsShell(prefix: string, purpose: string): string {
+	return (
+		`for __d in ${shq(prefix)}*; do ` +
+		`[ "$__d" = "$__PC_TMP" ] && continue; __r=\${__d##*.}; ` +
+		`case "$__r" in ''|*[!0-9]*) continue ;; esac; [ "$__d" = ${shq(prefix)}"$__r" ] || continue; ` +
+		`if ${cloneTmpMarkerMatchVarShell('__d', purpose)}; then rm -rf -- "$__d"; fi; done; `
+	)
+}
+
+/** Why a clone did not complete, for people. Pure. */
+function cloneReasonText(reason: string, target: string, purpose: string): string {
+	switch (reason) {
+		case 'lock':
+			return `another clone of ${target}, or a deploy, holds the lock (or the lock could not be taken); nothing in the app's directory was changed`
+		case 'exists':
+			return `${target} already exists (a new app is only ever cloned into a path that does not exist); nothing in the app's directory was changed`
+		case 'foreign':
+			return `${target} already exists and powder cannot prove it cloned it for ${purpose} (no matching .git/powder-clone-target marker); nothing in the app's directory was changed`
+		case 'nowd':
+			return `cannot enter ${target}; nothing in the app's directory was changed`
+		case 'checkout':
+			return `${target} already holds a git checkout (src/ or .git); nothing in the app's directory was changed`
+		case 'tmp':
+			return `a temp clone path next to ${target} already exists; nothing in the app's directory was changed`
+		case 'clone':
+			return `the clone from the remote failed; ${target} was not touched and the temp clone was removed`
+		case 'linkguard':
+			return `the repo tracks a symlink that points outside the checkout or over a mount; ${target} was not touched and the temp clone was removed`
+		case 'symlinks':
+			return `the repo tracks hostile symlink(s) (removed from the new clone at ${target})`
+		case 'killed':
+			return `the clone was interrupted`
+		case 'nostatus':
+			return `the clone script reported no outcome (it refused to start, or its answer did not arrive); powder treats it as not placed, check ${target} on the server`
+		default:
+			return 'clone failed'
+	}
+}
+
+/** A clone did not complete. `placed`: this run's new clone is at the target (so the
+ *  caller's cleanup may remove what this run created). `refused`: nothing was placed.
+ *  Both come from the status line only. */
+export class CloneError extends Error {
+	constructor(
+		message: string,
+		readonly refused: boolean,
+		readonly placed: boolean,
+		readonly keptAt: string | null,
+		readonly reason: string = 'failed',
+	) {
+		super(message)
+		this.name = 'CloneError'
+	}
+}
+
+function cloneFailure(stderr: string, st: CloneStatus | null, target: string, purpose: string): CloneError {
+	const reason = st?.reason ?? 'nostatus'
+	let msg = `clone refused: ${cloneReasonText(reason, target, purpose)}`
+	// git's own words, or the script's own refusal line (text only, never a decision)
+	if (reason === 'clone' || reason === 'failed' || !st) {
+		const tail = stderr
+			.split('\n')
+			.filter((l) => l.trim() && !l.startsWith('__PC_') && (!st || !l.startsWith('clone refused:')))
+			.slice(-3)
+			.join(' ')
+		if (tail) msg += `: ${redactSecrets(tail.slice(0, 400))}`
+	}
+	return new CloneError(msg, !st?.placed, !!st?.placed, st?.kept ?? null, reason)
+}
+
+/** Lock file serialising every clone of one target path on a server. */
+export function cloneLockPath(target: string, dir: string = APP_LOCK_DIR): string {
+	return `${dir.replace(/\/+$/, '')}/clone-${createHash('sha256').update(target).digest('hex').slice(0, 16)}.lock`
+}
+
+/** Seconds a clone waits for its lock: well inside the 120 s the call gives the whole
+ *  script, so the clone itself keeps most of the budget. */
+export const CLONE_LOCK_WAIT_SEC = 20
+
+/** The file name limit of the server's file systems (ext4, xfs). */
+const MAX_NAME = 255
+
+/** Shell (ends with `; `): take `lock` on fd `fd` with a short wait, or refuse. */
+function cloneLockShell(lock: string, fd: number, busy: string): string {
+	const d = shq(lock.replace(/\/[^/]*$/, '') || '/')
+	return (
+		`{ [ ! -L ${d} ] && mkdir -p ${d} && chmod 700 ${d}; } || __pc_refuse lock 'the lock dir cannot be used'; ` +
+		`[ ! -L ${shq(lock)} ] || __pc_refuse lock 'the lock path is a symlink'; ` +
+		`__PC_WHY=lock; exec ${fd}>${shq(lock)}; __PC_WHY=failed; ` +
+		`flock -w ${CLONE_LOCK_WAIT_SEC} ${fd} || __pc_refuse lock ${shq(busy)}; `
+	)
+}
+
+/** Clone `repoUrl` into `workingDir` (the workdir layout: /new and previews).
+ *  `purpose` names the owner (`app:<name>`, `preview:<preview row id>`).
+ *  Order, so a refusal never follows a change: the path shape (before any command),
+ *  the target's lock, then every refusal check; only then the temp clone (temp dir
+ *  marked before git runs), the link check of the temp clone, the sweep of this
+ *  owner's dead temps, the move-aside (previews only, marker checked right before),
+ *  the move in place. A link-check refusal or a failed clone removes only this run's
+ *  own marked temp dir.
+ *  - `app:` owners never replace anything: the target must not exist.
+ *  - `preview:` owners move an existing target aside to `<dir>.before-powder.<digits>`
+ *    only when its marker names the same preview row, and keep at most one such copy
+ *    (earlier copies of the same owner, by marker, are removed).
+ *  Throws CloneError (placed / kept / reason from the status line only). */
 export async function gitCloneRepo(
 	server: ServerConfig,
 	workingDir: string,
 	repoUrl: string,
 	branch: string,
 	deployKeyPath: string,
-): Promise<{ output: string }> {
+	purpose: string,
+	opts: { lockDir?: string; appsRoot?: string } = {},
+): Promise<{ output: string; keptAt: string | null }> {
 	const bad = repoUrlProblem(repoUrl) ?? branchProblem(branch)
-	if (bad) throw new Error(bad)
-	// Clone into a temp dir first to avoid trashing existing files until we know the clone worked.
-	// Then move existing dir aside, move clone into place.
-	const tmp = `${workingDir}.clone.${Date.now()}`
+	if (bad) throw new CloneError(bad, true, false, null, 'input')
+	if (!clonePurposeOk(purpose) || purpose.startsWith('src:'))
+		throw new CloneError(`clone refused: the owner ${JSON.stringify(purpose.slice(0, 80))} is not a valid owner (app:<name> or preview:<id>, at most ${MAX_PURPOSE} characters); nothing was run`, true, false, null, 'input')
+	if (!cloneTargetOk(workingDir, opts.appsRoot))
+		throw new CloneError(`clone refused: ${JSON.stringify(workingDir)} is not a directory directly under ${opts.appsRoot ?? APPS_ROOT}; nothing was run`, true, false, null, 'path')
+	const nonce = cloneNonce()
+	const isApp = purpose.startsWith('app:')
+	const slug = clonePurposeSlug(purpose)
+	const tmp = `${workingDir}.clone.${slug}.${Date.now()}`
+	// the longest name this run creates (the temp dir, the kept copy) must fit a file name
+	if ((tmp.split('/').pop() ?? '').length + 4 > MAX_NAME)
+		throw new CloneError(`clone refused: the directory name and owner ${purpose} are too long for the temp clone's file name (at most ${MAX_NAME} bytes); nothing was run`, true, false, null, 'path')
+	const wd = shq(workingDir)
+	const kept = `${workingDir}.before-powder.`
 	const cmd =
 		`set -e; ` +
+		cloneStatusPrelude(purpose) +
+		cloneLockShell(cloneLockPath(workingDir, opts.lockDir), 8, `another clone of ${workingDir} is still running`) +
 		gitHardenShellFunctions() +
 		GITHUB_KNOWN_HOSTS_SETUP +
-		`export GIT_SSH_COMMAND="ssh -i ${shq(deployKeyPath)} ${GIT_SSH_HOSTKEY_OPTS}"; ` +
-		`mkdir -p "$(dirname ${shq(workingDir)})" && ` +
+		`export GIT_TERMINAL_PROMPT=0; ` +
+		`export GIT_SSH_COMMAND="ssh -i ${shq(deployKeyPath)} ${GIT_SSH_HOSTKEY_OPTS} -o BatchMode=yes -o ConnectTimeout=10"; ` +
+		// ── every refusal check, before any change ──
+		(isApp
+			? `if [ -e ${wd} ] || [ -L ${wd} ]; then __pc_refuse exists ${shq(workingDir)}; fi; `
+			: `if { [ -e ${wd} ] || [ -L ${wd} ]; } && ! ${cloneMarkerMatchShell(workingDir, purpose)}; then __pc_refuse foreign ${shq(workingDir)}; fi; `) +
+		`if [ -e ${shq(tmp)} ] || [ -L ${shq(tmp)} ]; then __pc_refuse tmp ${shq(tmp)}; fi; ` +
+		// ── changes ──
+		`mkdir -p "$(dirname ${wd})"; mkdir -- ${shq(tmp)}; __PC_TMP=${shq(tmp)}; ${cloneTmpMarkerWriteShell(tmp, purpose)}; ` +
 		// `--` ends option parsing: nothing positional can be read as a flag.
-		`${POWDER_GIT_NOREPO} clone --branch ${shq(branch)} --depth 1 -- ${shq(repoUrl)} ${shq(tmp)} 2>&1 && ` +
-		// the clone replaces the whole dir; a container binding a path in it
-		// re-resolves that path on its next start. Check the cloned tree (links that
-		// escape, and links over any mount source under the dir) before the move.
-		`( ${targetLinkSourcesShell(null)}${targetLinkGuardShell({ dir: tmp, root: workingDir, target: 'HEAD', binds: true, who: 'clone' })} ) || { rm -rf -- ${shq(tmp)}; exit 1; } && ` +
-		`if [ -d ${shq(workingDir)} ]; then ` +
-		`  mv ${shq(workingDir)} ${shq(workingDir)}.before-powder.$(date +%s); ` +
-		`fi && ` +
-		`mv ${shq(tmp)} ${shq(workingDir)} && ` +
-		`{ ${repoSymlinkGuardShell(workingDir)} || { echo "clone refused: the repo tracks hostile symlink(s) (removed)"; exit 1; }; } && ` +
-		`echo "cloned to "${shq(workingDir)}`
-	const { stdout, code, stderr } = await runCommand(server, cmd, 120_000)
-	if (code !== 0) throw new Error(stderr || stdout || 'clone failed')
-	return { output: stdout }
+		// repo-influenced steps run with fd 3 (the status channel) closed
+		`( exec 3>&-; ${POWDER_GIT_NOREPO} clone --branch ${shq(branch)} --depth 1 -- ${shq(repoUrl)} ${shq(`${tmp}/repo`)} 2>&1 ) || { __PC_WHY=clone; exit 1; }; ` +
+		`${cloneMarkerWriteShell(`${tmp}/repo`, purpose)}; ` +
+		// the clone lands at the target; a container binding a path in it re-resolves
+		// that path on its next start. Check the cloned tree (links that escape, and
+		// links over any mount source under the dir) while it is still the temp clone.
+		`( exec 3>&-; ${targetLinkSourcesShell(null)}${targetLinkGuardShell({ dir: `${tmp}/repo`, root: workingDir, target: 'HEAD', binds: true, who: 'clone' })} ) || { __PC_WHY=linkguard; exit 1; }; ` +
+		sweepDeadTempsShell(`${workingDir}.clone.${slug}.`, purpose) +
+		(isApp
+			? ''
+			: `if [ -e ${wd} ] || [ -L ${wd} ]; then ` +
+				`if ${cloneMarkerMatchShell(workingDir, purpose)}; then __K=${shq(kept)}"$(date +%s)$$"; mv -T -- ${wd} "$__K"; __PC_KEPT=$__K; ` +
+				`else __pc_refuse foreign ${shq(workingDir)}; fi; ` +
+				// at most one kept copy: earlier copies of this same owner (exact name, marker)
+				`for __d in ${shq(kept)}*; do [ "$__d" = "$__PC_KEPT" ] && continue; __r=\${__d##*.}; ` +
+				`case "$__r" in ''|*[!0-9]*) continue ;; esac; [ "$__d" = ${shq(kept)}"$__r" ] || continue; ` +
+				`if ${cloneMarkerMatchVarShell('__d', purpose)}; then rm -rf -- "$__d"; fi; done; ` +
+				`fi; `) +
+		`mv -T -- ${shq(`${tmp}/repo`)} ${wd}; __PC_PLACED=1; ` +
+		`rm -f -- ${shq(`${tmp}/${CLONE_TMP_MARKER}`)}; rmdir -- ${shq(tmp)}; __PC_TMP=; ` +
+		`( exec 3>&-; ${repoSymlinkGuardShell(workingDir)} ) || { __PC_WHY=symlinks; exit 1; }; ` +
+		`__PC_WHY=ok; echo "cloned to "${wd}`
+	const { stdout, code, stderr } = await runCommand(server, cmd, 120_000, undefined, nonceStdin(nonce))
+	const st = parseCloneStatus(stdout, nonce)
+	if (code !== 0 || !st || st.rc !== 0 || !st.placed || st.reason !== 'ok') throw cloneFailure(stderr, st, workingDir, purpose)
+	return { output: stderr, keptAt: st.kept }
 }
 
 export interface GitStatus {
@@ -49,6 +289,14 @@ export interface GitStatus {
 	currentSha: string | null
 	upstreamSha: string | null
 	dirty: boolean
+	/** where the checkout is (lib/app-checkout.ts): src, workdir, none, src-link or unknown */
+	checkout: AppCheckout['kind']
+	/** the checkout read for this status, or null */
+	checkoutDir: string | null
+	/** the standard layout, with an older layout's `.git` also left in the working dir (ignored) */
+	staleWorkdirGit: boolean
+	/** set when the remote could not be checked (upstreamSha is then null): the short reason */
+	upstreamError: string | null
 }
 
 /** A working dir safe to put inside GIT_SSH_COMMAND (git runs it through `sh -c`):
@@ -57,44 +305,176 @@ export function gitStatusDirOk(dir: string): boolean {
 	return /^\/[A-Za-z0-9_./-]+$/.test(dir) && !dir.split('/').includes('..')
 }
 
-export async function getGitStatus(server: ServerConfig, dir: string): Promise<GitStatus> {
-	// `dir` comes from a container label and ends up in GIT_SSH_COMMAND.
-	if (!gitStatusDirOk(dir))
-		return { isRepo: false, branch: null, currentSha: null, upstreamSha: null, dirty: false }
+/** Where the app's checkout is on the server (the one authority, lib/app-checkout.ts).
+ *  Reads only. An unsafe working dir is `unknown` without running anything; an
+ *  unreachable server throws. */
+export async function probeAppCheckout(server: ServerConfig, workingDir: string): Promise<AppCheckout> {
+	if (!gitStatusDirOk(workingDir)) return { kind: 'unknown' }
+	const { stdout } = await runCommand(server, appCheckoutProbeShell(workingDir), 10_000)
+	return resolveAppCheckout(workingDir, parseCheckoutFacts(stdout))
+}
+
+const SHA_LINE = /^[0-9a-f]{40}([0-9a-f]{24})?$/
+const LSREMOTE_ERR = '::lsremote-error::'
+const LSREMOTE_NOBRANCH = '::lsremote-nobranch::'
+
+/** Why the remote could not be checked, from the upstream line of the status
+ *  script; null when it holds the remote's commit. Pure. */
+export function upstreamErrorOf(line: string): string | null {
+	if (SHA_LINE.test(line)) return null
+	if (line === 'NONE' || line === '') return 'the checkout has no upstream branch'
+	if (line === LSREMOTE_NOBRANCH) return 'the branch is not on the remote'
+	if (line.startsWith(LSREMOTE_ERR)) {
+		const why = redactSecrets(line.slice(LSREMOTE_ERR.length).trim())
+		return why ? `the remote could not be read: ${why}` : 'the remote could not be read'
+	}
+	return 'unreadable answer from the server'
+}
+
+/** Shell exports that keep a dashboard read of the checkout from writing or waiting:
+ *  no optional index lock (a deploy's checkout/reset needs index.lock), no prompt. */
+const READ_ONLY_GIT_ENV =
+	'export GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 GIT_HTTP_LOW_SPEED_LIMIT=1 GIT_HTTP_LOW_SPEED_TIME=10; '
+
+/** Branch, commit, the remote's tip of the upstream branch and dirtiness of the
+ *  app's checkout (`src/` first, see lib/app-checkout.ts). `workingDir` is the
+ *  compose working dir. The remote tip comes from `git ls-remote`, which writes
+ *  nothing to the repository (no fetch: a page load never moves refs, FETCH_HEAD or
+ *  the shallow file of a checkout a deploy may be syncing at the same moment). */
+export async function getGitStatus(server: ServerConfig, workingDir: string): Promise<GitStatus> {
+	const empty = { isRepo: false, branch: null, currentSha: null, upstreamSha: null, dirty: false, checkoutDir: null, staleWorkdirGit: false, upstreamError: null }
+	// `workingDir` comes from a container label and ends up in GIT_SSH_COMMAND.
+	if (!gitStatusDirOk(workingDir)) return { ...empty, checkout: 'unknown' }
+	const co = await probeAppCheckout(server, workingDir)
+	if (co.kind !== 'src' && co.kind !== 'workdir') return { ...empty, checkout: co.kind }
+	const staleWorkdirGit = co.kind === 'src' && co.staleWorkdirGit
+	const dir = co.dir
 	// hardened git (repo-local config scrubbed, exec keys pinned).
 	const g = gitCmd(shq(dir), shq(dir))
 	const cmd =
 		gitHardenShellFunctions() +
-		// fetch with the same credentials a deploy uses (the deploy key, the
-		// pinned github.com host keys), so the dashboard's ahead/behind does not depend on
-		// whatever ssh command root's own git config names.
-		`KEY=${shq(dir)}/.deploy-key; ` +
-		`if [ -f "$KEY" ] && [ ! -L "$KEY" ]; then ${GITHUB_KNOWN_HOSTS_SETUP}export GIT_SSH_COMMAND="ssh -i $KEY ${GIT_SSH_HOSTKEY_OPTS} -o IdentitiesOnly=yes"; fi; ` +
+		READ_ONLY_GIT_ENV +
+		// the same credentials a deploy uses (the deploy key in the working dir, the
+		// pinned github.com host keys), never a prompt, a bounded connect.
+		`KEY=${shq(workingDir.replace(/\/+$/, ''))}/.deploy-key; ` +
+		`if [ -f "$KEY" ] && [ ! -L "$KEY" ]; then ${GITHUB_KNOWN_HOSTS_SETUP}export GIT_SSH_COMMAND="ssh -i $KEY ${GIT_SSH_HOSTKEY_OPTS} -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10"; fi; ` +
 		`if [ -d ${shq(dir)}/.git ]; then ` +
 		`echo "::repo::"; ` +
 		`${g} rev-parse --abbrev-ref HEAD; ` +
 		`${g} rev-parse HEAD; ` +
-		`${g} fetch --quiet 2>/dev/null; ` +
-		`${g} rev-parse '@{u}' 2>/dev/null || echo NONE; ` +
-		`${g} status --porcelain | head -1; ` +
+		// the upstream (origin/<branch>, set by every deploy) and the remote's tip of it
+		`UP=$(${g} rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null) || UP=; ` +
+		`R=\${UP%%/*}; B=\${UP#*/}; L=NONE; ` +
+		// a failed ls-remote (no network, auth refused, repository gone) is its own
+		// answer, never "no upstream" (which would read as up to date)
+		`if [ -n "$UP" ] && [ "$R" != "$UP" ] && [ -n "$B" ]; then ` +
+		`if LO=$(${g} ls-remote -- "$R" "refs/heads/$B" 2>&1); then L=$(printf '%s\\n' "$LO" | awk 'NR==1{print $1}'); [ -n "$L" ] || L=${shq(LSREMOTE_NOBRANCH)}; ` +
+		// the line that says why (ssh's "Permission denied", git's "fatal:"), else the last one
+		`else L="${LSREMOTE_ERR} $({ printf '%s\\n' "$LO" | grep -m1 -iE 'denied|fatal|error|timed out|could not|not found' || printf '%s\\n' "$LO" | grep -v '^[[:space:]]*$' | tail -n 1; } | tr -d '\\r' | cut -c1-200)"; fi; fi; ` +
+		`echo "$L"; ` +
+		`${g} status --porcelain 2>/dev/null | head -1; ` +
 		`else echo "::norepo::"; fi`
 	const { stdout } = await runCommand(server, cmd, 20_000)
-	if (!stdout.includes('::repo::')) {
-		return { isRepo: false, branch: null, currentSha: null, upstreamSha: null, dirty: false }
-	}
+	if (!stdout.includes('::repo::')) return { ...empty, checkout: co.kind, checkoutDir: dir, staleWorkdirGit }
 	const lines = stdout.split('\n').map((l) => l.trim())
 	const start = lines.indexOf('::repo::')
-	const branch = lines[start + 1] ?? null
-	const currentSha = lines[start + 2] ?? null
-	const upstream = lines[start + 3] ?? null
+	const branch = lines[start + 1] || null
+	const currentSha = lines[start + 2] || null
+	const upstream = lines[start + 3] ?? ''
 	const dirtyLine = lines[start + 4] ?? ''
 	return {
 		isRepo: true,
 		branch,
 		currentSha,
-		upstreamSha: upstream === 'NONE' ? null : upstream,
+		upstreamSha: SHA_LINE.test(upstream) ? upstream : null,
+		upstreamError: upstreamErrorOf(upstream),
 		dirty: dirtyLine.length > 0,
+		checkout: co.kind,
+		checkoutDir: dir,
+		staleWorkdirGit,
 	}
+}
+
+/** True when `<wd>/.deploy-key` does not exist and `<wd>/src` is a checkout whose
+ *  origin is `repoUrl` (read with hardened git): the state a clone leaves when its
+ *  deploy key could not be written afterwards. Reads only. */
+export async function deployKeyMissingForRepo(server: ServerConfig, wd: string, repoUrl: string): Promise<boolean> {
+	if (!gitStatusDirOk(wd)) return false
+	const src = `${wd}/src`
+	const key = shq(`${wd}/.deploy-key`)
+	const r = await runCommand(
+		server,
+		`${gitHardenShellFunctions()}if [ -e ${key} ] || [ -L ${key} ]; then echo has; ` +
+			`else printf 'missing %s\\n' "$(${gitCmd(shq(src), shq(src))} remote get-url origin 2>/dev/null)"; fi`,
+		10_000,
+	)
+	return r.stdout.trim() === `missing ${repoUrl}`
+}
+
+/** The clone action of a connected app with no checkout: clone the repo into
+ *  `<workingDir>/src` (the standard layout) and touch nothing else. Refuses before
+ *  any change when the working dir cannot be entered, `src` exists in any form, the
+ *  working dir holds a `.git` of any type, or the app's deploy lock is held (a deploy
+ *  runs). Then, under that lock: a temp dir `<wd>/.powder-clone-src.<digits>` marked
+ *  `src:<app dir name>` before git runs, the clone into `<tmp>/repo`, its link check,
+ *  the sweep of dead temps of this owner (exact name, marker), and `mv -T` of the
+ *  clone to `src`. The working dir itself is never moved or replaced. The route
+ *  checks the layout first (probeAppCheckout + cloneRefusal). Throws CloneError. */
+export async function cloneIntoAppSrc(
+	server: ServerConfig,
+	workingDir: string,
+	repoUrl: string,
+	branch: string,
+	deployKeyPath: string,
+	/** the app's deploy lock (appLockPath(workingDir, service)): held for the whole run */
+	lockPath: string,
+	/** removeKey: the key file is a temp copy made for this call; the script removes it
+	 *  when it exits, also if the caller is gone by then */
+	opts: { removeKey?: boolean } = {},
+): Promise<{ output: string }> {
+	const bad = repoUrlProblem(repoUrl) ?? branchProblem(branch)
+	if (bad) throw new CloneError(bad, true, false, null, 'input')
+	// the script removes the key file when it exits: only the clone action's own temp key
+	if (opts.removeKey && !cloneKeyTmpPathOk(deployKeyPath))
+		throw new CloneError(`clone refused: ${JSON.stringify(deployKeyPath.slice(0, 120))} is not a temp key of the clone action (${CLONE_KEY_TMP_PREFIX}.tmp.<16 hex>), so it may not be removed; nothing was run`, true, false, null, 'input')
+	if (!gitStatusDirOk(workingDir)) throw new CloneError('unsafe working dir', true, false, null, 'path')
+	const wd = workingDir.replace(/\/+$/, '')
+	const purpose = `src:${wd.split('/').pop() ?? ''}`
+	if (!clonePurposeOk(purpose)) throw new CloneError('unsafe working dir', true, false, null, 'path')
+	const src = `${wd}/src`
+	const tmp = `${wd}/.powder-clone-src.${Date.now()}`
+	const nonce = cloneNonce()
+	const cmd =
+		`set -e; ` +
+		cloneStatusPrelude(purpose, opts.removeKey ? deployKeyPath : null) +
+		// the deploy's own lock file, short wait: no deploy syncs and no other clone of
+		// this app runs meanwhile
+		cloneLockShell(lockPath, 9, 'a deploy of this app is running; clone again when it has finished') +
+		gitHardenShellFunctions() +
+		GITHUB_KNOWN_HOSTS_SETUP +
+		`export GIT_TERMINAL_PROMPT=0; ` +
+		`export GIT_SSH_COMMAND="ssh -i ${shq(deployKeyPath)} ${GIT_SSH_HOSTKEY_OPTS} -o BatchMode=yes -o ConnectTimeout=10"; ` +
+		// ── every refusal check, before any change ──
+		`cd ${shq(wd)} 2>/dev/null || __pc_refuse nowd ${shq(wd)}; ` +
+		`if [ -e src ] || [ -L src ]; then __pc_refuse checkout ${shq(src)}; fi; ` +
+		`if [ -e .git ] || [ -L .git ]; then __pc_refuse checkout ${shq(`${wd}/.git`)}; fi; ` +
+		`if [ -e ${shq(tmp)} ] || [ -L ${shq(tmp)} ]; then __pc_refuse tmp ${shq(tmp)}; fi; ` +
+		// ── changes ──
+		`mkdir -- ${shq(tmp)}; __PC_TMP=${shq(tmp)}; ${cloneTmpMarkerWriteShell(tmp, purpose)}; ` +
+		// `--` ends option parsing: nothing positional can be read as a flag.
+		`( exec 3>&-; ${POWDER_GIT_NOREPO} clone --branch ${shq(branch)} --depth 1 -- ${shq(repoUrl)} ${shq(`${tmp}/repo`)} 2>&1 ) || { __PC_WHY=clone; exit 1; }; ` +
+		// links that escape, and links over any mount source under src/, before src/ exists
+		`( exec 3>&-; ${targetLinkSourcesShell(null)}${targetLinkGuardShell({ dir: `${tmp}/repo`, root: src, target: 'HEAD', binds: true, who: 'clone' })} ) || { __PC_WHY=linkguard; exit 1; }; ` +
+		sweepDeadTempsShell(`${wd}/.powder-clone-src.`, purpose) +
+		// -T: never into an existing dir (src was checked absent under the lock)
+		`mv -T -- ${shq(`${tmp}/repo`)} ${shq(src)}; __PC_PLACED=1; ` +
+		`rm -f -- ${shq(`${tmp}/${CLONE_TMP_MARKER}`)}; rmdir -- ${shq(tmp)}; __PC_TMP=; ` +
+		`( exec 3>&-; ${repoSymlinkGuardShell(src)} ) || { __PC_WHY=symlinks; exit 1; }; ` +
+		`__PC_WHY=ok; echo "cloned to "${shq(src)}`
+	const { stdout, code, stderr } = await runCommand(server, cmd, 120_000, undefined, nonceStdin(nonce))
+	const st = parseCloneStatus(stdout, nonce)
+	if (code !== 0 || !st || st.rc !== 0 || !st.placed || st.reason !== 'ok') throw cloneFailure(stderr, st, src, purpose)
+	return { output: stderr }
 }
 
 // ── deploy-script building blocks ─────────────────────────────────────────────

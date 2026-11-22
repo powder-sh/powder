@@ -19,13 +19,18 @@ import { UnsafeOverrideError } from './compose-override-io'
 import { isTraefikServer } from './traefik-servers'
 import { and, appRepos, db, deploys, eq, gte, previewDeploys } from './db'
 import type { AppRepo, Deploy } from './db'
+import type { TestGate } from '@powder/db/schema'
 import { chunkPublisher, publishTerminal } from './deploy-bus'
 import { deployDeadlineAt } from './deploy-budget'
-import { deployFailureFromError } from './deploy-failure'
+import { bookkeepingWarning, isPowderDbError, recordAfterSwap } from './deploy-bookkeeping'
+import { deployCommit } from './deploy-commit'
+import { deployFailureFromError, opsEventFailureFields } from './deploy-failure'
+import { errorToStore } from './deploy-log'
+import { HEALTH_CHECK_STEP, IMAGE_READBACK_STEP, POST_SWAP_STEPS } from './deploy-swap'
 import { SUPERSEDED_MARKER, isSupersededBy } from './deploy-supersede'
 import { runOnServer } from './deploy-queue'
 import { autoRollback, finishDeploy, lastSuccessfulComposeHash, lastSuccessfulComposeView, lastSuccessfulGitSha, resolveHealthProbe, rollbackSummary, verifyDeployHealth } from './deploys'
-import { notifyDeploymentFinished } from './github-deployments'
+import { notifyCommitPending, notifyDeploymentFinished } from './github-deployments'
 import { extractBuilderFallback, healthUrlState, portsLeftPublicLines, reportDeployToHq, reportDeployWarningsToHq } from './hq'
 import { notifyDeployFailed, notifyDeploySucceeded } from './notifications'
 import { getServer } from './servers'
@@ -56,10 +61,9 @@ const PARTIAL_FLUSH_MS = 1500
 // guessing from elapsed time, which false-reaped long-but-alive deploys.
 const HEARTBEAT_MS = 30_000
 
-// Remote-script phases that run AFTER the old container may already be gone
-// (the up-retry path removes it). A failure here must roll back, not just be
-// recorded — otherwise the app is left DOWN.
-const POST_SWAP_STEPS = new Set(['docker compose up', 'normalize (enforce restart + mem cap)', 'resolve image'])
+// POST_SWAP_STEPS (lib/deploy-swap.ts): remote-script phases that run AFTER the old
+// container may already be gone (the up-retry path removes it). A failure there must roll
+// back, not just be recorded, otherwise the app is left DOWN.
 
 /** Should a failed deploy trigger an auto-rollback? Pure (exported for tests).
  *  `containerRunning` = the app container is up right now (null = unknown). */
@@ -176,6 +180,25 @@ export async function executeDeploy(deploy: Deploy): Promise<void> {
 	let repo: AppRepo | undefined
 	let sha: string | null = null
 	let br: string | null = null
+	// Set only once the health gate passed AND the image readback matched: the new container
+	// is live and proven. Only then may a powder DB error still be recorded as success.
+	let gatePassed = false
+	// The success notices (HQ deploy + warnings report, GitHub deployment status); set with
+	// gatePassed so the DB-error branch in the catch sends the same ones as a normal success.
+	let sendSuccessNotices: (() => Promise<void>) | null = null
+	// The health probe read before the swap (swap-check plan); undefined = not read.
+	let preSwapProbe: { path: string; host?: string } | null | undefined
+	// Set once powder/deploy `pending` went to the commit: a superseded deploy then
+	// closes it; one superseded before that posts nothing.
+	let commitPending = false
+	// the test gate's outcome once rebuildDeploy returned (deploys.test_gate)
+	let testGate: TestGate | null = null
+	// Warning lines from post-swap writes that gave up (kept in the final output).
+	let bookkeepingNotes = ''
+	const noteBookkeeping = (line: string) => {
+		bookkeepingNotes += line
+		onChunk(line)
+	}
 	// Hoisted so the failure path can roll back with the same compose facts.
 	let server: ServerConfig | null = null
 	let facts: ComposeFacts | null = null
@@ -274,6 +297,7 @@ export async function executeDeploy(deploy: Deploy): Promise<void> {
 			bridgeVerdict,
 			nginxUpstreamVerdict,
 			stability,
+			testGate: builtTestGate,
 		} = await runOnServer(serverId, async () => {
 			// Taken INSIDE the per-server slot: time spent waiting for the slot must
 			// not burn the budget, the ordinal or the watchdog's hard cap. If the row
@@ -285,7 +309,7 @@ export async function executeDeploy(deploy: Deploy): Promise<void> {
 				.returning({ startedAt: deploys.startedAt })
 			if (!claimed) {
 				notRunning = true
-				return { output: '', sha: null, branch: null, image: null, composeHash: null, composeView: null, superseded: false, portsLeftPublic: [], bridgeVerdict: null, nginxUpstreamVerdict: null, stability: null }
+				return { output: '', sha: null, branch: null, image: null, composeHash: null, composeView: null, superseded: false, portsLeftPublic: [], bridgeVerdict: null, nginxUpstreamVerdict: null, stability: null, testGate: null }
 			}
 			const startedAt = claimed.startedAt
 			// DB-side supersede guard: a newer deploy of this app is already running
@@ -305,7 +329,13 @@ export async function executeDeploy(deploy: Deploy): Promise<void> {
 					bridgeVerdict: null,
 					nginxUpstreamVerdict: null,
 					stability: null,
+					testGate: null,
 				}
+			}
+			// The commit gets powder/deploy `pending` (best effort, not awaited).
+			if (repo) {
+				notifyCommitPending(repo, deploy)
+				commitPending = true
 			}
 			// Dedicated-builder opts (servers.build_host): decrypt the app's RO
 			// deploy key so the builder can clone. Registry-mode and repo-less
@@ -329,6 +359,7 @@ export async function executeDeploy(deploy: Deploy): Promise<void> {
 			let swapCheck: ReturnType<typeof resolveSwapCheckPlan> | undefined
 			try {
 				const probe = await resolveHealthProbe(serverId, containerName)
+				preSwapProbe = probe
 				swapCheck = resolveSwapCheckPlan({ appFlag: repo?.swapCheck, env: process.env, probe })
 			} catch (err) {
 				swapCheck = { skip: `plan failed: ${err instanceof Error ? err.message.slice(0, 80) : 'error'}` }
@@ -404,13 +435,34 @@ export async function executeDeploy(deploy: Deploy): Promise<void> {
 				errorSummary: msg,
 			}).catch((e) => console.error(`[deploy-runner ${deploy.id}] finishDeploy(superseded) failed:`, e))
 			publishTerminal(deploy.id, 'end', 'superseded')
-			if (repo) await notifyDeploymentFinished(repo, deploy.id, 'failure', msg)
+			if (repo)
+				await notifyDeploymentFinished(
+					repo,
+					deploy.id,
+					'failure',
+					msg,
+					commitPending
+						? { kind: deploy.kind, requestedSha: deploy.requestedSha, sha: null, failedStep: 'superseded', errorSummary: msg, testGate: null }
+						: undefined,
+				)
 			return
 		}
+		// ── post-swap: rebuildDeploy returned, the new container is live ──
 		sha = builtSha
 		br = builtBranch
+		testGate = builtTestGate ?? null
+		// The swap is done (rebuildDeploy returned): from here on a write to powder's own DB
+		// records what happened and never decides it (lib/deploy-bookkeeping.ts). Recorded
+		// as early as possible; finishDeploy re-states sha/branch in case this one is lost.
+		// One try, no retry: this sits before the health gate, and finishDeploy re-states it.
 		if (sha || br) {
-			await db.update(deploys).set({ gitSha: sha, gitBranch: br }).where(eq(deploys.id, deploy.id))
+			const r = await recordAfterSwap(
+				deploy.id,
+				'git sha/branch',
+				() => db.update(deploys).set({ gitSha: sha, gitBranch: br }).where(eq(deploys.id, deploy.id)),
+				{ delaysMs: [] },
+			)
+			if (!r.ok) noteBookkeeping(bookkeepingWarning('the commit sha/branch'))
 		}
 
 		// Domain/powder.json sync. It may recreate the container (only when the
@@ -441,6 +493,7 @@ export async function executeDeploy(deploy: Deploy): Promise<void> {
 			workingDir: f.workingDir,
 			currentDeployId: deploy.id,
 			onChunk,
+			preSwapProbe,
 		})
 		const fullOutput = `${envWarningBanner}${output}\n${health.output}`
 
@@ -450,8 +503,9 @@ export async function executeDeploy(deploy: Deploy): Promise<void> {
 			await failDeploy(deploy, repo, sha, br, {
 				output: fullOutput,
 				error: errorMessage,
-				failedStep: 'health check',
+				failedStep: HEALTH_CHECK_STEP,
 				errorSummary: errorMessage,
+				testGate,
 			})
 			return
 		}
@@ -468,10 +522,52 @@ export async function executeDeploy(deploy: Deploy): Promise<void> {
 			await failDeploy(deploy, repo, sha, br, {
 				output: `${fullOutput}\n── image readback ──\n${readback.detail}\n`,
 				error: errorMessage,
-				failedStep: 'image readback',
+				failedStep: IMAGE_READBACK_STEP,
 				errorSummary: errorMessage,
+				testGate,
 			})
 			return
+		}
+
+		gatePassed = true
+		sendSuccessNotices = async () => {
+			void reportDeployToHq({
+				app: containerName,
+				server: serverId,
+				status: 'success',
+				sha,
+				shaSource: sha ? 'built' : null,
+				branch: br,
+				durationMs: deploy.startedAt ? Date.now() - new Date(deploy.startedAt).getTime() : null,
+				deployId: deploy.id,
+				deployKind: deploy.kind,
+			})
+			void reportDeployWarningsToHq({
+				app: containerName,
+				server: serverId,
+				envRefusedKeys,
+				builderFallback: extractBuilderFallback(fullOutput),
+				portsLeftPublic: portsLeftPublicLines(portsLeftPublic),
+				bridge: bridgeVerdict ?? null,
+				nginxUpstream: nginxUpstreamVerdict ?? null,
+				serverProxy: server?.proxy ?? null,
+				composeDrift: stability?.composeDrift ?? null,
+				migratePath: stability?.migratePath ?? null,
+				// no health_url: the gate accepted any 1xx-4xx from `/` (health.ts); only
+				// when it judged HTTP at all (a worker's liveness fallback is n/a).
+				healthUrl: healthUrlState(repo, health.healthy),
+				testGate: stability?.testGate ?? null,
+				stopDrain: stability?.stopDrain ?? null,
+			})
+			if (repo) {
+				await notifyDeploymentFinished(
+					repo,
+					deploy.id,
+					'success',
+					redactSecrets(sha ? `deployed ${sha.slice(0, 7)}` : 'deployed'),
+					{ kind: deploy.kind, requestedSha: deploy.requestedSha, sha, failedStep: null, testGate },
+				).catch((e) => console.error(`[deploy-runner ${deploy.id}] notifyDeploymentFinished(success) failed:`, e))
+			}
 		}
 
 		// A bridge that outlived its deploy (SIGKILL path) would keep serving the
@@ -484,12 +580,18 @@ export async function executeDeploy(deploy: Deploy): Promise<void> {
 		// the last good image. Env snapshot likewise: a rollback to THIS deploy
 		// restores the env it actually ran with.
 		let tagOutput = ''
+		let provenImageTag: string | null = null
 		if (image) {
 			const tagged = await tagDeployImage(srv, image, deploy.id, await loadDeployPushDecision(containerName, image))
 			tagOutput = `\n── tagging image ──\n${tagged.output}`
 			onChunk(tagOutput)
 			if (tagged.imageTag) {
-				await db.update(deploys).set({ imageTag: tagged.imageTag }).where(eq(deploys.id, deploy.id))
+				const imageTag = tagged.imageTag
+				provenImageTag = imageTag
+				const r = await recordAfterSwap(deploy.id, 'image tag', () =>
+					db.update(deploys).set({ imageTag }).where(eq(deploys.id, deploy.id)),
+				)
+				if (!r.ok) noteBookkeeping(bookkeepingWarning(`the image tag ${imageTag} (a rollback to this deploy may not find it)`))
 			}
 		}
 		if (renderedEnvPath) {
@@ -499,47 +601,28 @@ export async function executeDeploy(deploy: Deploy): Promise<void> {
 		}
 
 		drain()
-		await finishDeploy(deploy.id, {
-			status: 'success',
+		const successResult = {
+			status: 'success' as const,
 			composeConfigHash: composeHash,
 			composeConfigView: composeView ?? null,
-			output: `${fullOutput}\n── image readback ──\n${readback.detail}\n${tagOutput}${domainPreNote}${domainNote}`,
-		})
+			gitSha: sha,
+			builtSha: sha,
+			gitBranch: br,
+			imageTag: provenImageTag,
+			testGate,
+			finishedAt: new Date(),
+			output: `${fullOutput}\n── image readback ──\n${readback.detail}\n${tagOutput}${domainPreNote}${domainNote}${bookkeepingNotes}`,
+		}
+		const finished = await recordAfterSwap(deploy.id, 'the success result', () => finishDeploy(deploy.id, successResult))
+		// Still not written: try again later in the background. If the watchdog reaps the row
+		// meanwhile, finishDeploy's late-result path flips it back to success.
+		if (!finished.ok) lateSuccessRetry(deploy.id, () => finishDeploy(deploy.id, successResult))
 		publishTerminal(deploy.id, 'end', 'success')
-		void reportDeployToHq({
-			app: containerName,
-			server: serverId,
-			status: 'success',
-			sha,
-			branch: br,
-			durationMs: deploy.startedAt ? Date.now() - new Date(deploy.startedAt).getTime() : null,
-			deployId: deploy.id,
-			deployKind: deploy.kind,
-		})
-		void reportDeployWarningsToHq({
-			app: containerName,
-			server: serverId,
-			envRefusedKeys,
-			builderFallback: extractBuilderFallback(fullOutput),
-			portsLeftPublic: portsLeftPublicLines(portsLeftPublic),
-			bridge: bridgeVerdict ?? null,
-			nginxUpstream: nginxUpstreamVerdict ?? null,
-			composeDrift: stability?.composeDrift ?? null,
-			migratePath: stability?.migratePath ?? null,
-			// no health_url: the gate accepted any 1xx-4xx from `/` (health.ts); only
-			// when it judged HTTP at all (a worker's liveness fallback is n/a).
-			healthUrl: healthUrlState(repo, health.healthy),
-			testGate: stability?.testGate ?? null,
-		})
+		// HQ deploy + warnings report, GitHub deployment status (never throws)
+		await sendSuccessNotices()
 
 		// ── best-effort tail (never fails the deploy) ──
 		if (repo) {
-			await notifyDeploymentFinished(
-				repo,
-				deploy.id,
-				'success',
-				redactSecrets(sha ? `deployed ${sha.slice(0, 7)}` : 'deployed'),
-			)
 			syncDeploymentMd(repo, sha)
 				.then((res) => {
 					if (!res.ok) {
@@ -577,7 +660,30 @@ export async function executeDeploy(deploy: Deploy): Promise<void> {
 			}
 		})()
 	} catch (err) {
+		// After the health gate passed and the image readback matched, powder's own DB failing
+		// (past every bounded retry) does not make the update a failure: the new container is
+		// live and proven. Record success with a warning instead of a failed row and a "deploy
+		// failed" card. Before that verdict (swapped but not yet judged), or with an app that is
+		// not running or whose state cannot be read, it goes the normal failure way, with the
+		// plain POWDER_DB_SLOW_SUMMARY (deployFailureFromError), never the query text.
+		if (gatePassed && server && isPowderDbError(err) && (await isRunning(server, containerName)) === true) {
+			const warn = `\n[powder] warning: powder's own database was slow after the swap (${redactSecrets(err instanceof Error ? err.message.split('\nparams:')[0] ?? '' : String(err)).slice(0, 300)}); the new container is running, the remaining post-deploy checks were not completed\n`
+			accPush(warn)
+			drain()
+			const finished = await recordAfterSwap(deploy.id, 'the success result (after a DB error)', () =>
+				finishDeploy(deploy.id, { status: 'success', output: acc.toString(), gitSha: sha, builtSha: sha, gitBranch: br, testGate, finishedAt: new Date() }),
+			)
+			if (!finished.ok) {
+				const out = acc.toString()
+				lateSuccessRetry(deploy.id, () => finishDeploy(deploy.id, { status: 'success', output: out, gitSha: sha, builtSha: sha, gitBranch: br, testGate }))
+			}
+			publishTerminal(deploy.id, 'end', 'success')
+			if (sendSuccessNotices) await sendSuccessNotices()
+			return
+		}
 		const fail = deployFailureFromError(err)
+		// thrown after rebuildDeploy returned: the gate's outcome is already known
+		fail.testGate = fail.testGate ?? testGate
 		// Failed BEFORE the swap: the old container still serves, so the env file
 		// goes back to what it runs with (the render already replaced it).
 		if (server && envBackup.path && shouldRestoreEnv(fail.failedStep)) {
@@ -593,12 +699,7 @@ export async function executeDeploy(deploy: Deploy): Promise<void> {
 		// attempt). Roll back to the last good image exactly like a failed health
 		// gate would, instead of only recording the failure.
 		if (server && facts) {
-			let running: boolean | null = null
-			try {
-				running = (await inspectContainer(server, containerName)).state === 'running'
-			} catch (e) {
-				running = /no such (object|container)/i.test(e instanceof Error ? e.message : String(e)) ? false : null
-			}
+			const running = await isRunning(server, containerName)
 			// No step marker + the app still runs: the script's EXIT trap may not have
 			// run, so the shared tag could still point at the rejected build.
 			if (!fail.failedStep && running !== false) {
@@ -619,6 +720,7 @@ export async function executeDeploy(deploy: Deploy): Promise<void> {
 					composeFiles: facts.composeFiles,
 					workingDir: facts.workingDir,
 					currentDeployId: deploy.id,
+					preSwapProbe,
 					reason: `deploy failed during ${fail.failedStep ?? 'an unknown step'}`,
 					onChunk,
 				}).catch((e) => ({
@@ -638,6 +740,26 @@ export async function executeDeploy(deploy: Deploy): Promise<void> {
 		// The pre-render copy has done its job on every path (restore removes it itself).
 		if (server && envBackup.path) await dropEnvPreRender(server, envBackup.path, deploy.id).catch(() => {})
 	}
+}
+
+/** Is the app container running? null = could not tell. */
+async function isRunning(server: ServerConfig, containerName: string): Promise<boolean | null> {
+	try {
+		return (await inspectContainer(server, containerName)).state === 'running'
+	} catch (e) {
+		return /no such (object|container)/i.test(e instanceof Error ? e.message : String(e)) ? false : null
+	}
+}
+
+const LATE_SUCCESS_RETRY_MS = 60_000
+
+// Last chance for a success row the in-line retries could not write: once more a minute
+// later, then give up with a log line.
+function lateSuccessRetry(deployId: string, write: () => Promise<unknown>): void {
+	const t = setTimeout(() => {
+		void recordAfterSwap(deployId, 'the success result (late retry)', write, { delaysMs: [60_000, 120_000] })
+	}, LATE_SUCCESS_RETRY_MS)
+	t.unref?.()
 }
 
 /** True when `containerName` is a preview container (preview_deploys) of an app on the server. */
@@ -731,24 +853,58 @@ async function failDeploy(
 	repo: AppRepo | undefined,
 	sha: string | null,
 	br: string | null,
-	fail: { output: string; error: SafeText; failedStep: string | null; exitCode?: number | null; errorSummary: SafeText },
+	failIn: {
+		output: string
+		error: SafeText
+		failedStep: string | null
+		exitCode?: number | null
+		errorSummary: SafeText
+		testGate?: TestGate | null
+		/** the commit a failed run synced or built (DeployStepError.builtSha) */
+		builtSha?: string | null
+	},
 ): Promise<void> {
-	await finishDeploy(deploy.id, { status: 'failed', ...fail }).catch((e) =>
-		console.error(`[deploy-runner ${deploy.id}] finishDeploy(failed) failed:`, e),
+	const { builtSha, ...fail } = failIn
+	// The failure's commit status goes on the commit the run actually built, which is not
+	// the requested one when that was no longer the branch tip.
+	const commitSha = builtSha ?? sha
+	// Same retry as the success write (never throws, logs once when it gives up). The built
+	// commit goes into built_sha; git_sha stays the commit that went live (set after a swap).
+	// A step failure's error is the step's whole log, which the output holds too: store
+	// only its tail then (lib/deploy-log.ts errorToStore), so the log is kept once. An
+	// error that says anything the output does not is kept whole.
+	const error = errorToStore(fail.error, redactSecrets(fail.output))
+	const written = await recordAfterSwap(deploy.id, 'the failed result', () =>
+		finishDeploy(deploy.id, { status: 'failed', ...fail, error, builtSha: commitSha }),
 	)
 	publishTerminal(deploy.id, 'error', fail.errorSummary)
-	void reportDeployToHq({
+	// the commit as every display names it (lib/deploy-commit.ts): built, else requested
+	const commit = deployCommit({ builtSha: commitSha, requestedSha: deploy.requestedSha })
+	// One failure event per deploy, sent by whoever records the failure. This runner sends it
+	// when the row holds its result: written now, or 'already-recorded' (its own earlier
+	// write landed and only the reply was lost). A row the watchdog failed ('reaped') got its
+	// event from the reap; a write that gave up leaves the row running, and the watchdog's
+	// reap of it sends the event then.
+	if (written.ok && written.value !== 'reaped') void reportDeployToHq({
 		app: deploy.containerName,
 		server: deploy.serverId,
 		status: 'failure',
-		sha,
+		sha: commit?.sha ?? null,
+		shaSource: commit ? (commit.requested ? 'requested' : 'built') : null,
 		branch: br,
-		error: fail.errorSummary,
+		...opsEventFailureFields(fail.failedStep, fail.exitCode, fail.errorSummary),
 		deployId: deploy.id,
 		deployKind: deploy.kind,
 	})
 	if (repo) {
-		await notifyDeploymentFinished(repo, deploy.id, 'failure', fail.errorSummary)
+		await notifyDeploymentFinished(repo, deploy.id, 'failure', fail.errorSummary, {
+			kind: deploy.kind,
+			requestedSha: deploy.requestedSha,
+			sha: commitSha,
+			failedStep: fail.failedStep,
+			errorSummary: fail.errorSummary,
+			testGate: fail.testGate ?? null,
+		})
 		notifyDeployFailed(repo, {
 			deployId: deploy.id,
 			errorMessage: fail.errorSummary,

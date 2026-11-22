@@ -48,7 +48,7 @@ describe('batched link target read', () => {
 		expect(r.ok).toBe(true)
 		// one git process for the targets: the per-link loop took minutes on 3000 links
 		expect(Date.now() - t0).toBeLessThan(20_000)
-	}, 60_000)
+	})
 	it('keeps every link in step: control characters and empty-looking targets around ordinary ones', () => {
 		const dir = repoWith({
 			'a1': 'a.txt',

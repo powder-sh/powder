@@ -279,7 +279,7 @@ if [ -n "$out" ]; then cat ${JSON.stringify(obj)} > "$out"; else cat ${JSON.stri
 		})
 		const r = spawnSync('bash', ['-c', script], {
 			encoding: 'utf8',
-			timeout: 20_000,
+			timeout: 120_000,
 			env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, ...env },
 		})
 		const calls = existsSync(log) ? readFileSync(log, 'utf8') : ''

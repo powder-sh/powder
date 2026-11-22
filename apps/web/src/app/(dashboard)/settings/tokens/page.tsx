@@ -1,6 +1,7 @@
 'use client'
 
 import { Alert } from '@/components/ui/alert'
+import { CopyButton } from '@/components/ui/copy-button'
 import { EmptyState } from '@/components/ui/empty-state'
 import { PageHeader } from '@/components/ui/page-header'
 import { TableFrame } from '@/components/ui/table'
@@ -146,9 +147,22 @@ export default function TokensPage() {
 						</Button>
 					}
 				>
-					<code className="ph-no-capture mt-1 block select-all break-all rounded-md border border-border bg-background px-2 py-1.5 font-mono text-xs text-foreground">
-						{fresh}
-					</code>
+					<div className="mt-1 flex items-center gap-1.5">
+						<code
+							id="fresh-token"
+							className="ph-no-capture block min-w-0 flex-1 select-all break-all rounded-md border border-border bg-background px-2 py-1.5 font-mono text-xs text-foreground"
+						>
+							{fresh}
+						</code>
+						<CopyButton
+							value={fresh}
+							label="copy the token"
+							text="copy"
+							targetId="fresh-token"
+							size="sm"
+							variant="outline"
+						/>
+					</div>
 				</Alert>
 			)}
 

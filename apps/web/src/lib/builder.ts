@@ -22,10 +22,13 @@
 // warning; a builder outage degrades to today's behavior, never blocks
 // deploys.
 
+import type { TestGate } from '@powder/db/schema'
+import { builtShaMarkerFor, parseStabilityMarkers, stabilityMarkShell, stabilityMarkerFilter, testGateResultMark } from './deploy/stability'
 import { POWDER_GIT_NOREPO, gitCmd, gitHardenShellFunctions } from './git-harden'
 import { protectExistingIgnoreShell, writeDockerignoreShell } from './app-runtime-files'
 import { TEST_GATE_TESTS_FAILED_EXIT, childTimeoutPrefix, composeFileArgs, fontFetchRetryShellFunctions, readComposeConfig, testGateMemOverride, testGateShell, testGateStopShell } from './deploy/fragments'
 import { BuilderTestGateFailedError } from './deploy-failure'
+import { BuilderAppBuildFailedError, builderAppVerdictEnabled, classifyBuilderFailure } from './builder-failure'
 import { composeGuardEnforced } from './deploy/compose-check'
 import {
 	DEPLOY_BUDGET_SEC,
@@ -44,11 +47,11 @@ import type { ServerConfig } from './servers'
 import { repoSymlinkGuardShell } from './repo-symlinks'
 import { targetLinkGuardShell } from './target-links'
 import { randomTempPath } from './temp-path'
-import { cacheAppSlug, dockerfileAuthorityShell, dockerfileRewriteFunctions, ephemeralCacheNamespace } from './build-cache'
+import { cacheAppSlug, dockerfileAuthorityShell, dockerfileRewriteFunctions, ephemeralCacheNamespace, withOsPatchWeek } from './build-cache'
 import type { DockerfileImageAuthority } from './compose-safety'
 import { shq } from './shell'
 import { sshCommand } from './docker-env'
-import { BUILDER_PRUNE_RUN_TIMEOUT_SEC, builderCapPruneShell, builderPruneLogLine, builderPruneVerdict, parseBuilderPruneResult } from './builder-prune'
+import { BUILDER_PRUNE_RUN_TIMEOUT_SEC, builderCapPruneShell, builderPruneLogLine, builderPruneVerdict, builderPullGuardFunctions, parseBuilderPruneResult } from './builder-prune'
 import { reportBuildHostDiskToHq } from './hq'
 
 interface BuilderOpts {
@@ -149,10 +152,9 @@ TL_EOF
 }
 
 /** the builder's built-sha marker carries the phase's random nonce (like the
- *  deploy's synced-sha marker), so build or test-gate output cannot print it. */
-export function builtShaMarkerFor(nonce: string): string {
-	return `__POWDER_BUILT_SHA_${nonce.replace(/[^A-Za-z0-9]/g, '')}__`
-}
+ *  deploy's synced-sha marker), so build or test-gate output cannot print it.
+ *  Defined with the other run markers (deploy/stability.ts), which strip it from the log. */
+export { builtShaMarkerFor }
 
 /** the built commit from the LAST whole line `<marker> <sha>`; anything else in
  *  stdout (an unnonced `[builder] built-sha` line included) is ignored. */
@@ -434,6 +436,8 @@ export function buildBuilderScript(p: {
 	return (
 		`set -e; DFR_DIR=""; ` +
 		plockFn(builderBuildSlots()) +
+		// image pulls of this script never overlap the build host's cap prune.
+		builderPullGuardFunctions() +
 		// one retry of a build that failed on a next/font Google Fonts fetch (shared with
 		// the target's local build), only while 15 min of the builder budget are left.
 		// DEADLINE = end of the builder budget: each build attempt's timeout is taken
@@ -476,8 +480,8 @@ export function buildBuilderScript(p: {
 		`{ if [ -L ${shq(`${p.df}.dockerignore`)} ]; then echo "[builder] refusing: ${p.df.replace(/[^A-Za-z0-9._/-]/g, '_')}.dockerignore is a symlink"; exit 1; fi; if [ -e ${shq(`${p.df}.dockerignore`)} ]; then cp ${shq(`${p.df}.dockerignore`)} "$DFR_DIR/Dockerfile.dockerignore" && ( ${protectExistingIgnoreShell('$DFR_DIR/Dockerfile.dockerignore').replace(/'\$DFR_DIR\/Dockerfile\.dockerignore'/g, '"$DFR_DIR/Dockerfile.dockerignore"')} ); fi; } && ` +
 		`font_retry plock 2400 ${childTimeoutPrefix(1800, 60)} docker build ${pull ? '--pull ' : ''}-t ${shq(p.uniq)} -f "$DFR_DIR/Dockerfile" ${p.buildArgs} ${shq(ctx)} 2>&1 && ` +
 		`if [ -f ${shq(`${ctx}/.powder/test.sh`)} ]; then echo '── test gate ──'; ` +
-		testGateShell({ dir: shq(ctx), label: `builder|${dir}`, run: 'plock 2400 timeout 900', tag: '[builder test-gate]', testsFailedExit: TEST_GATE_TESTS_FAILED_EXIT, mem: testGateMemOverride(), enforce: composeGuardEnforced(), app: dir.split('/').pop(), loginSelf: p.dockerfileAuthority?.self || app, loginHosts: p.dockerfileAuthority?.loginHosts ?? [] }) +
-		`else echo "[builder test-gate] no .powder/test.sh - skipped"; fi`
+		testGateShell({ dir: shq(ctx), label: `builder|${dir}`, run: 'plock 2400 timeout 900', tag: '[builder test-gate]', testsFailedExit: TEST_GATE_TESTS_FAILED_EXIT, mem: testGateMemOverride(), enforce: composeGuardEnforced(), app: dir.split('/').pop(), loginSelf: p.dockerfileAuthority?.self || app, loginHosts: p.dockerfileAuthority?.loginHosts ?? [], resultMark: p.shaNonce ? testGateResultMark(p.shaNonce) : undefined }) +
+		`else echo "[builder test-gate] no .powder/test.sh - skipped"; ${p.shaNonce ? stabilityMarkShell(p.shaNonce, 'test-gate-result', 'none') : ''}fi`
 	)
 }
 
@@ -510,7 +514,7 @@ async function runBuilderPhaseOnce(
 	onChunk?: (s: string) => void,
 	/** Seconds this phase may take (remaining deploy budget minus the script reserve). */
 	budgetSec: number = DEPLOY_BUDGET_SEC,
-): Promise<{ sha: string | null; stageImage: string }> {
+): Promise<{ sha: string | null; stageImage: string; testGate: TestGate | null }> {
 	const phaseStart = Date.now()
 	const builder = builderConfig(server, builderOpts.host)
 	// Map the target's absolute context to a path inside the builder clone:
@@ -535,7 +539,10 @@ async function runBuilderPhaseOnce(
 	// Dockerfile directive is allow-listed (build-cache.ts), so the build arg is refused.
 	if (Object.keys(facts.args).some((k) => k.toUpperCase() === 'BUILDKIT_SYNTAX'))
 		throw new Error('build arg BUILDKIT_SYNTAX is not allowed (it selects a custom BuildKit frontend); use # syntax=docker/dockerfile:<version>')
-	const buildArgs = Object.entries(facts.args)
+	// OS_PATCH_WEEK (build-cache.ts): a Dockerfile that declares it refreshes its
+	// OS upgrade layer weekly.
+	const args = withOsPatchWeek(facts.args)
+	const buildArgs = Object.entries(args)
 		.map(([k, v]) => `--build-arg ${shq(`${k}=${v}`)}`)
 		.join(' ')
 
@@ -557,7 +564,7 @@ async function runBuilderPhaseOnce(
 		ctx,
 		df,
 		buildArgs,
-		args: facts.args,
+		args,
 		cacheNamespace: ref.cacheNamespace,
 		app: ref.app,
 		dockerfileAuthority: ref.dockerfileAuthority ?? null,
@@ -576,20 +583,37 @@ async function runBuilderPhaseOnce(
 		await writeFileViaSftp(builder, scriptPath, script, 0o700, 30_000, true, true)
 		// `timeout -k`: the builder script (and the docker build under it) dies at
 		// the deadline instead of running on orphaned while holding a slot lock.
-		res = await runCommand(
-			builder,
-			`timeout -k ${TIMEOUT_KILL_SEC} ${outerTimeoutSec(budgetSec)} bash ${shq(scriptPath)}; rc=$?; rm -f ${shq(scriptPath)}; exit $rc`,
-			sshWallMs(budgetSec),
-			onChunk,
-		)
+		// the live log (and the failed deploy's stored error built from it) never shows
+		// this phase's marker lines: parsed from res.stdout below, stripped from the log.
+		const live = stabilityMarkerFilter(shaNonce, onChunk)
+		try {
+			res = await runCommand(
+				builder,
+				`timeout -k ${TIMEOUT_KILL_SEC} ${outerTimeoutSec(budgetSec)} bash ${shq(scriptPath)}; rc=$?; rm -f ${shq(scriptPath)}; exit $rc`,
+				sshWallMs(budgetSec),
+				live.push,
+			)
+		} finally {
+			live.flush()
+		}
 	} finally {
 		await runCommand(builder, `rm -f ${shq(keyPath)} ${shq(scriptPath)}`, 10_000).catch(() => {})
 	}
-	if (res.code === TEST_GATE_TESTS_FAILED_EXIT) throw new BuilderTestGateFailedError()
+	// the commit this run checked out (nonced marker), also on a failure: the failure's
+	// commit status goes on it, which is not the requested one when that was not the tip
+	const ranSha = parseBuiltSha(res.stdout, shaNonce)
+	if (res.code === TEST_GATE_TESTS_FAILED_EXIT) throw new BuilderTestGateFailedError(ranSha)
 	if (res.code !== 0) {
+		// the commit's own failure (builder-failure.ts) fails the deploy; anything else falls back,
+		// and so does a build of another commit than the one asked for (the fallback builds that one).
+		const verdict = classifyBuilderFailure(res.stdout, res.code, { requestedSha: sha, builtSha: ranSha })
+		if (verdict.kind === 'app' && builderAppVerdictEnabled()) throw new BuilderAppBuildFailedError(verdict.reason, ranSha)
+		if (verdict.kind === 'app') onChunk?.(`[builder] POWDER_BUILDER_APP_VERDICT=off: falling back although this looks like the commit's own failure (${verdict.reason.slice(0, 300)})\n`)
 		throw new Error(`builder phase failed (exit ${res.code})`)
 	}
-	const builtSha = parseBuiltSha(res.stdout, shaNonce)
+	const builtSha = ranSha
+	// the gate's outcome from this run's nonced mark (passed or none on a successful phase)
+	const testGate = parseStabilityMarkers(res.stdout, shaNonce).testGateResult
 	onChunk?.(`── builder → target image stream ──\n`)
 	try {
 		// Land the image on a unique per-deploy tag, NOT facts.image: the shared tag
@@ -600,5 +624,5 @@ async function runBuilderPhaseOnce(
 		await runCommand(builder, `docker rmi ${shq(uniq)} >/dev/null 2>&1 || true`, 10_000).catch(() => {})
 	}
 	onChunk?.(`[builder] image ${stageImage} loaded on ${server.host}\n`)
-	return { sha: builtSha, stageImage }
+	return { sha: builtSha, stageImage, testGate }
 }

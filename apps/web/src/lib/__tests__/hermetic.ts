@@ -17,6 +17,14 @@
 //   stand-in, as tests stub ssh2's connect; os.tmpdir() is private, so listing
 //   it never sees another process's files)
 // - git: GIT_CONFIG_NOSYSTEM=1 and GIT_CONFIG_GLOBAL is an empty file
+// - git run from a hook: git exports GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE and the
+//   rest of `git rev-parse --local-env-vars` to hooks, so a suite started from a
+//   hook (pre-commit, `git rebase --exec`, an editor hook) would run every temp-repo
+//   `git init/commit/push` against the REAL repository (a fixture's
+//   push can replace the real branch's whole tree). The GIT_* strip removes them
+//   all; GIT_CEILING_DIRECTORIES is the hermetic root, so a temp dir that is not a
+//   repo never finds one above it. git-hook-env.test.ts starts vitest with a
+//   sentinel repo in those vars and checks it stays untouched.
 // - no LC_*/LANG: the POSIX locale (byte order for sort/ls/find)
 // - TMPDIR is short (/tmp/pv-XXXXXX/f-XXXXXX/t, never the long macOS
 //   /var/folders/... dir): the .db tests put a postgres unix socket under it and
@@ -27,10 +35,24 @@
 //   through to the host CLI ($POWDER_TEST_HOST_DOCKER, with the host's docker
 //   config dir for the compose plugin), so the real-compose tests still run where
 //   compose is installed. A test that needs docker ABSENT uses pathWithout(['docker']).
+// - host config files the generated bridge / swap-check scripts read (/opt/apps/.mem-cap)
+//   come from an empty <root>/host-opt-apps (POWDER_TEST_HOST_APPS_DIR, honoured only
+//   under vitest by deploy/fragments.ts hostAppsDir)
 // - `mktemp` and `mktemp -d` without a template land in $TMPDIR: the guard dir
 //   wraps the host mktemp, as the BSD one on newer macOS ignores TMPDIR and would
 //   put a script's temp files in the shared per-user temp dir
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	realpathSync,
+	rmSync,
+	statSync,
+	symlinkSync,
+	writeFileSync,
+} from 'node:fs'
 import { join } from 'node:path'
 
 /** Env var names a spawned script must never inherit from the host. */
@@ -119,9 +141,17 @@ export function installHermeticEnv(): string {
 	process.env.TMPDIR = tmp
 	process.env.GIT_CONFIG_NOSYSTEM = '1'
 	process.env.GIT_CONFIG_GLOBAL = join(home, '.gitconfig')
+	// git compares real paths here (macOS /tmp is a symlink)
+	process.env.GIT_CEILING_DIRECTORIES = realpathSync(root)
 	process.env.POWDER_TEST_HOST_DOCKER = hostDocker
 	process.env.POWDER_TEST_HOST_DOCKER_CONFIG = hostDockerConfig
 	process.env.PATH = `${guard}:${process.env.PATH ?? SYSTEM_DIRS.join(':')}`
+	// generated bridge / swap-check scripts read host config files (/opt/apps/.mem-cap)
+	// from here instead of the real host (deploy/fragments.ts hostAppsDir): empty, so the
+	// scripts take their no-file defaults.
+	const hostApps = join(root, 'host-opt-apps')
+	mkdirSync(hostApps)
+	process.env.POWDER_TEST_HOST_APPS_DIR = hostApps
 	process.env[ROOT_VAR] = root
 	return root
 }

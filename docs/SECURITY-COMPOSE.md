@@ -414,9 +414,11 @@ refusal.
 
 A preview (opt-in per app on its Settings tab, `app_repos.previews_enabled`) builds and runs any pushed
 branch on the app's server: the compose powder generates for it (`renderPreviewCompose`
-in `lib/preview-deploys.ts`) joins the shared `web` network and reads only
+in `lib/preview-deploys.ts`) joins the network the server's Traefik routes over
+(`web` unless it routes over another, `lib/traefik-network.ts`; never `internal`:
+the render refuses it) and reads only
 `/opt/apps/<app>.preview.env`, never `/opt/apps/<app>.env`. Anyone who can push a
-branch can read every value in that preview env file and reach what the `web` network
+branch can read every value in that preview env file and reach what that network
 reaches. So with previews on, the preview env must hold no production secret (no
 production `DATABASE_URL`, no live keys); a preview pointed at the production database
 can read and write production data. A preview render of the env (scope `preview`) holds
@@ -564,6 +566,13 @@ through `powder_git` / `powder_git_norepo`, defined by `gitHardenShellFunctions(
   another app's port while it is recreated). In host-port mode `extra_hosts` are
   copied and each entry must be `name:ip` or `name:host-gateway` (strict charset),
   else the bridge is skipped; traefik mode still skips on any `extra_hosts`.
+  In DNS-alias mode (label `powder.bridge.dns-alias=true`, for a proxy container that
+  resolves apps by docker DNS name) it publishes no port and joins only the networks
+  the running container is on, carrying that container's own name (from `docker
+  inspect`, never from a label or compose value) as a network alias, plus the compose
+  service name on a network where the running container already has it as an alias. It
+  copies no other alias, so an app cannot make its bridge answer under another app's
+  name; `extra_hosts` are copied with the host-port rules.
 - powder's override failing to MERGE with the app's compose (the app's compose parses
   on its own, the merged config does not) refuses the deploy. Other override failures
   (server I/O) go on as before with a `[compose-guard] WARN <app> override_failed` line.
@@ -616,7 +625,7 @@ A service key that is not on the list is refused (`unknown_key`). Refused, by co
 | traefik_url | a Traefik service `loadbalancer` URL or address label (`traefik.http.services.<n>.loadbalancer.server.url`, the tcp/udp `address` forms): it sends the route to any host, not this container; any `traefik.http.middlewares.<n>.forwardauth.*` label (Traefik calls that address with every request's headers) |
 | traefik_name | (any server) a Traefik router, service, middleware or serversTransport (`traefik.(http\|tcp\|udp).<kind>.<n>`) whose `<n>` is not the app name or `<app>-...` (a longer registered app name that also prefixes it wins); a router `middlewares=`, chain `middlewares=` or any key ending in `.service` / `.services` (any case: a router's `service=`, a middleware's `errors.service`) value naming another app's object, or a provider other than @docker/@file (Traefik merges same-named objects across containers, so another app's name rewrites its route) |
 | compose_label, powder_label | `com.docker.compose.*`, powder runtime markers (powder.bridge, powder.release, powder.candidate, powder.testgate) |
-| network | networks other than the app's own and the shared ones: web, internal, infra, plus any named in `POWDER_SHARED_NETWORKS` (powder.env, comma-separated) |
+| network | networks other than the app's own and the shared ones: web, internal, infra, plus any named in `POWDER_SHARED_NETWORKS` (powder.env, comma-separated), plus, for the apps of one server only, the network that server's Traefik is declared to route over (`servers.traefik_network` with source `flag` or `config`, resolved from the running Traefik; the compose powder renders for a new app there joins it). A network Traefik is only attached to never counts |
 | include, top_key | unresolved include, unknown top-level keys (any include or extends is also refused before this, see above) |
 | env_loopback | (deploy and recreate, only when the compose differs from the last successful deploy or the repo changed its structure) a service that is not on host networking whose env (env_file contents as compose inlines them, and `environment:`) tells it to connect to `127.0.0.1` (any 127.x), `localhost` or `[::1]` (or `0.0.0.0` in a URL) on a port it does not listen on itself. Only connection targets count: a URL with a backend scheme (postgres, postgresql, mysql, mariadb, redis, rediss, amqp, amqps, mongodb, nats, kafka, clickhouse, memcached) in any variable; an http(s) URL only in a variable named `*_URL`, `*_URI`, `*_HOST`, `*_ADDR`, `*_ADDRESS` or `*_ENDPOINT`; a bare `host:port` (also in a comma list) only in `*_HOST(S)`, `*_ADDR`, `*_ADDRESS`. Names with a whole `_`-separated word part ORIGIN(S), CORS, CSP, ALLOWED, TRUSTED, PUBLIC, REDIRECT(S), CALLBACK(S) or SITE(S), or ending in BASE_URL, NEXTAUTH_URL or AUTH_URL (so `DATABASE_URL` is not `BASE_URL`), or holding LISTEN / BIND never count for http or bare values. A backend scheme with a driver suffix counts too (`postgresql+asyncpg`, `mysql+pymysql`, `redis+sentinel`; also sqlserver, mssql, cockroachdb). Not judged: a split host and port pair (`DB_HOST=127.0.0.1` with `DB_PORT=5433`), since neither value alone names a host:port; a URL without an explicit port. Its own ports: `PORT`, `ports` targets, `expose`, the EXPOSE ports of the image its existing container runs (the probe's image config), a `traefik...loadbalancer.server.port` label, a loopback port its healthcheck probes. Skipped: `network_mode: host`, `container:` mode, and every service of a `network_mode: service:<x>` group of two or more (a sidecar answers on loopback there). A userinfo with `@` in the password does not hide the host. Inside a bridge container loopback is the container itself, so such a value reaches nothing (an app switched from host to bridge networking with its database on `127.0.0.1:<db port on the server>`). The finding names the variable and the host:port, never the value. Value-scoped exemption by variable name: `{"env_loopback":["DATABASE_URL"]}` |
 

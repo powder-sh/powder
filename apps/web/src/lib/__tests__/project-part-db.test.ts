@@ -8,6 +8,8 @@ const { inspect, chain } = vi.hoisted(() => {
 	chain.then = (r: (v: unknown[]) => unknown) => r([])
 	return { inspect: vi.fn(async () => ({ status: 'running' })), chain }
 })
+// the recent-deploys query has its own test (project-deploys-query.test.ts)
+vi.mock('@/lib/project-deploys-db', () => ({ recentDeploysQuery: async () => [] }))
 vi.mock('@/lib/db', () => ({
 	db: chain,
 	appRepos: {},

@@ -31,11 +31,12 @@ describe('self-deploy config preflight (in-app)', () => {
 		expect(r.stdout).toContain('BETTER_AUTH_SECRET is only 8 characters')
 		expect(r.stdout).not.toContain('RECREATE_REACHED')
 	})
-	it('passes a good config; a probe that cannot run only warns', () => {
+	it('passes a good config; a probe that cannot run refuses too (the gate is never skipped)', () => {
 		expect(preflight('[config-check] powder.env passes').stdout).toContain('RECREATE_REACHED')
-		const broken = preflight('no such service', 1)
-		expect(broken.stdout).toContain('[config-check] WARN')
-		expect(broken.stdout).toContain('RECREATE_REACHED')
+		const broken = preflight('exec: "pnpm": executable file not found in $PATH', 1)
+		expect(broken.status).toBe(1)
+		expect(broken.stdout).toContain('could not run the config check')
+		expect(broken.stdout).not.toContain('RECREATE_REACHED')
 		expect(preflight('', 0, 'powder').stdout).toContain('skipped')
 	})
 })
@@ -47,6 +48,15 @@ describe('src/check-config.ts', () => {
 			env: { NODE_ENV: 'test', PATH: process.env.PATH ?? '', ...env },
 			encoding: 'utf8',
 		})
+	it('runs the way the worker image runs it: node --import tsx (no package manager)', () => {
+		const r = spawnSync(process.execPath, ['--import', 'tsx', 'src/check-config.ts'], {
+			cwd: WEB,
+			env: { NODE_ENV: 'test', PATH: process.env.PATH ?? '', BETTER_AUTH_SECRET: 'short' },
+			encoding: 'utf8',
+		})
+		expect(r.status).toBe(1)
+		expect(r.stderr).toContain('__POWDER_CONFIG_BAD__')
+	})
 	it('exits 1 with the marker on a weak secret, 0 on a good config', () => {
 		const key = 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9f'
 		const bad = runCheck({ BETTER_AUTH_SECRET: 'short', POWDER_ENCRYPTION_KEY: key })

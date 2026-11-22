@@ -101,7 +101,7 @@ DNS already points at the server, and a GitHub OAuth app (callback
 `https://<host>/api/auth/callback/github`):
 
 ```bash
-sudo git clone --branch v0.10.0 https://github.com/powder-sh/powder /opt/apps/powder/src
+sudo git clone --branch v0.11.0 https://github.com/powder-sh/powder /opt/apps/powder/src
 cd /opt/apps/powder/src
 sudo bin/install.sh
 ```

@@ -6,9 +6,10 @@
 // requireContainerAccess check and masks every line (lib/log-line-redact.ts).
 
 import { Circle, Eraser, Pause, Play } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { CopyButton } from '@/components/ui/copy-button'
 import { REVOKED_MESSAGE, STREAM_EXPIRED, STREAM_REVOKED, dedupeResumedLines } from '@/lib/stream-events'
 
 export function LiveLogsCard({
@@ -28,6 +29,7 @@ export function LiveLogsCard({
 }) {
 	const [logLines, setLogLines] = useState<string[]>([])
 	const [streaming, setStreaming] = useState(false)
+	const logsId = useId()
 	const [logError, setLogError] = useState<string | null>(null)
 	const [paused, setPaused] = useState(false)
 	const eventSourceRef = useRef<EventSource | null>(null)
@@ -155,6 +157,14 @@ export function LiveLogsCard({
 							</Button>
 						)}
 						{logLines.length > 0 && (
+							<CopyButton
+								value={() => logLines.join('\n')}
+								label="copy the log lines shown"
+								targetId={logsId}
+								size="sm"
+							/>
+						)}
+						{logLines.length > 0 && (
 							<Button variant="ghost" size="sm" onClick={() => setLogLines([])} title="clear" aria-label="clear">
 								<Eraser className="h-3 w-3" />
 							</Button>
@@ -174,6 +184,7 @@ export function LiveLogsCard({
 				) : (
 					<pre
 						ref={preRef}
+						id={logsId}
 						onScroll={(e) => {
 							const el = e.currentTarget
 							stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40

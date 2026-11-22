@@ -13,6 +13,7 @@ const STEP_IDS: readonly StepId[] = [
 	'install-docker',
 	'network-web',
 	'network-internal',
+	'network-traefik',
 	'mkdir-apps',
 	'mkdir-dynamic',
 	'start-traefik',

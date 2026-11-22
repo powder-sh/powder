@@ -85,6 +85,8 @@ describe('no fixed-name lock or state file under /tmp', () => {
 			'/var/lib/powder/builder-prune.attempt',
 			'$HOME/.powder-builder-prune.stuck',
 			'$HOME/.powder-builder-prune.after',
+			'/var/lib/powder/builder-prune.root',
+			'$HOME/.powder-builder-prune.root',
 		])
 			expect(prune).toContain(p)
 	})

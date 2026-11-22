@@ -256,13 +256,13 @@ compose_setup() {
   # compose lets the shell environment win over --env-file, so a value left in
   # the shell (sudo SSH_KEY_PATH=... bin/install.sh) would mount another key than
   # the env file names. Every variable the compose files read is dropped from
-  # compose's environment, except POWDER_ENV_FILE (set below) and
-  # POWDER_BUILD_CACHE_ID (exported by this script).
+  # compose's environment, except POWDER_ENV_FILE (set below),
+  # POWDER_BUILD_CACHE_ID and OS_PATCH_WEEK (both exported by this script).
   COMPOSE_VARS=()
   for f in "${files[@]}"; do
     [ -f "$f" ] || continue
     for v in $(grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*' "$f" | cut -c3- | sort -u); do
-      case "$v" in POWDER_ENV_FILE|POWDER_BUILD_CACHE_ID) continue ;; esac
+      case "$v" in POWDER_ENV_FILE|POWDER_BUILD_CACHE_ID|OS_PATCH_WEEK) continue ;; esac
       case " ${COMPOSE_VARS[*]-} " in *" $v "*) continue ;; esac
       COMPOSE_VARS+=("$v")
     done
@@ -705,6 +705,11 @@ else
   case "$BCID" in *[!0-9a-f]*) BCID= ;; esac
 fi
 export POWDER_BUILD_CACHE_ID="$BCID"
+# The ISO week docker/web.Dockerfile keys its OS upgrade layers on (one refresh a
+# week). Same snippet as OS_PATCH_WEEK_SH in apps/web/src/lib/build-cache.ts.
+OS_PATCH_WEEK_SH='OS_PATCH_WEEK=$(date -u +%G-W%V 2>/dev/null || true); case "$OS_PATCH_WEEK" in [0-9][0-9][0-9][0-9]-W[0-9][0-9]) ;; *) OS_PATCH_WEEK= ;; esac'
+eval "$OS_PATCH_WEEK_SH"
+export OS_PATCH_WEEK
 # The server build lock (BUILD_LOCK in apps/web/src/lib/build-lock.ts). The script also
 # waits on the lock at the older path (OLDER_BUILD_LOCK below) when it is a regular
 # root-owned file (only root can create or remove it in sticky /tmp), so an upgrade
@@ -724,12 +729,12 @@ run ${LOCK[@]+"${LOCK[@]}"} "${DC[@]}" build worker
 say "config check (new image)"
 if [ "$DRY" = 1 ]; then echo "would run: src/check-config.ts in the worker image"
 else
-  CFG_OUT=$("${DC[@]}" run --rm --no-deps -T --entrypoint pnpm worker -F @powder/web exec tsx src/check-config.ts 2>&1 || true)
+  CFG_OUT=$("${DC[@]}" run --rm --no-deps -T --entrypoint node worker --import tsx src/check-config.ts 2>&1 || true)
   if printf '%s' "$CFG_OUT" | grep -q '__POWDER_CONFIG_BAD__'; then
     printf '%s\n' "$CFG_OUT" | grep -v '^$' >&2
     die "fix $ENVF, then re-run"
   elif printf '%s' "$CFG_OUT" | grep -q '\[config-check\]'; then echo "  ok"
-  else echo "⚠ could not run the config check, continuing" >&2; fi
+  else printf '%s\n' "$CFG_OUT" | tail -5 >&2; die "could not run the config check in the new worker image (output above)"; fi
 fi
 
 # Start order. powder first: its entrypoint applies the schema before the server

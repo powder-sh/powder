@@ -299,7 +299,7 @@ describe.skipIf(!hasPg)('powder-migrate lock_timeout on a real postgres', () => 
 		expect(r.stdout).toContain('[migrate] FAILED on 0001_add_x.sql')
 		expect(Date.now() - t).toBeLessThan(15_000)
 		expect(recorded('0001_add_x.sql')).toBe('0')
-	}, 60_000)
+	})
 
 	it('a file that sets its own lock_timeout keeps control: it waits for the lock and applies', async () => {
 		const holder = await holdLock(2)
@@ -319,7 +319,7 @@ describe.skipIf(!hasPg)('powder-migrate lock_timeout on a real postgres', () => 
 		expect(psql(`select count(*) from _powder_migrations where filename = '0002_add_y.sql'`)).toBe(
 			'1',
 		)
-	}, 60_000)
+	})
 
 	it('a CONCURRENTLY file waits for an older transaction past the timeout and succeeds: index valid, recorded', async () => {
 		const holder = await hold('select count(*) from other', 3)
@@ -342,7 +342,7 @@ describe.skipIf(!hasPg)('powder-migrate lock_timeout on a real postgres', () => 
 			't',
 		)
 		expect(recorded('0003_idx.sql')).toBe('1')
-	}, 60_000)
+	})
 
 	const valid = (idx: string) =>
 		psql(`select indisvalid from pg_index where indexrelid = '${idx}'::regclass`)
@@ -391,7 +391,7 @@ describe.skipIf(!hasPg)('powder-migrate lock_timeout on a real postgres', () => 
 		expect(r3.status).toBe(0)
 		expect(valid('dup_v_key')).toBe('t')
 		expect(recorded('0004_uniq.sql')).toBe('1')
-	}, 60_000)
+	})
 
 	it('a non-transactional file that exits 0 but leaves a new INVALID index fails and is not recorded', () => {
 		const r = migrate(
@@ -404,7 +404,7 @@ describe.skipIf(!hasPg)('powder-migrate lock_timeout on a real postgres', () => 
 		)
 		expect(r.stdout).not.toContain('dup_v_key')
 		expect(recorded('0005_left.sql')).toBe('0')
-	}, 60_000)
+	})
 
 	it('an unrelated INVALID index that existed before (another name) does not fail a file', () => {
 		expect(valid('t_id2_idx')).toBe('f')
@@ -414,7 +414,7 @@ describe.skipIf(!hasPg)('powder-migrate lock_timeout on a real postgres', () => 
 		)
 		expect(r.status).toBe(0)
 		expect(recorded('0006_ok.sql')).toBe('1')
-	}, 60_000)
+	})
 
 	it('a file that names an index that is valid passes', () => {
 		expect(valid('t_id3_idx')).toBe('t')
@@ -424,7 +424,7 @@ describe.skipIf(!hasPg)('powder-migrate lock_timeout on a real postgres', () => 
 		)
 		expect(r.status).toBe(0)
 		expect(recorded('0007_again.sql')).toBe('1')
-	}, 60_000)
+	})
 
 	it('identifiers: a quoted name and a schema-qualified name match; a name inside a longer word does not', () => {
 		// quoted, mixed case, invalid before the file: only the name rule can catch it
@@ -456,7 +456,7 @@ describe.skipIf(!hasPg)('powder-migrate lock_timeout on a real postgres', () => 
 		)
 		expect(sub.status).toBe(0)
 		expect(recorded('0010_sub.sql')).toBe('1')
-	}, 60_000)
+	})
 	it('an invalid index named only in a comment does not fail a file', () => {
 		makeInvalid('cm_idx', 'other(id)')
 		const r = migrate(
@@ -465,7 +465,7 @@ describe.skipIf(!hasPg)('powder-migrate lock_timeout on a real postgres', () => 
 		)
 		expect(r.status).toBe(0)
 		expect(recorded('0011_comment.sql')).toBe('1')
-	}, 60_000)
+	})
 
 	it("another session's concurrent build that is still running when a file ends does not fail it", async () => {
 		psql(`create type mood as enum ('a')`)
@@ -498,5 +498,5 @@ describe.skipIf(!hasPg)('powder-migrate lock_timeout on a real postgres', () => 
 		expect(r.status).toBe(0)
 		expect(recorded('0012_enum.sql')).toBe('1')
 		expect(valid('t_bg_idx')).toBe('t')
-	}, 60_000)
+	})
 })

@@ -8,7 +8,7 @@ import { FX } from './fixtures/secret-corpus'
 describe('patterns see the raw log, output is masked', () => {
 	it('registry auth failure keeps its summary', () => {
 		const log =
-			'── pull ──\nError response from daemon: unauthorized: authentication required\n__POWDER_FAIL__ step=pull code=1\n'
+			'── docker compose pull (registry mode) ──\nError response from daemon: unauthorized: authentication required\n__POWDER_FAIL__ step=docker compose pull (registry mode) code=1\n'
 		expect(parseDeployFailure(log).errorSummary).toContain('registry auth denied')
 		expect(new DeployStepError(log).errorSummary).toContain('registry auth denied')
 	})

@@ -8,6 +8,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { parseDeployFailure } from '../deploy-failure'
 import { buildDeployScript, composeFileArgs, rebuildDeploy } from '../ssh'
 import { parseStabilityMarkers } from '../deploy/stability'
+import { type ComposeRange, composeDriftVerdict } from '../deploy/compose-drift-inventory'
 
 // The script writes github.com's known_hosts to /opt/apps (falling back to a
 // mktemp file in $TMPDIR when that is not writable, which the leftover-temp
@@ -36,7 +37,9 @@ vi.mock('../ssh/files', async (importOriginal) => {
 //
 // FAIL is a comma list of stub failures: gitfetch, catfile, fetchsha, checkout,
 // reset, declared (docker compose config --services), composediff (git diff of
-// the tracked compose reports a change). The stub git overwrites
+// the tracked compose reports a change), composerange (git diff <base> HEAD of
+// docker-compose.yml reports a change in the deploy's commit range), catfileonce (only
+// the first cat-file fails: a commit missing from the clone that a fetch brings in). The stub git overwrites
 // docker-compose.yml on checkout/reset (like a tracked compose would be; not with
 // nocompose), and
 // fails any bare `git rev-parse` (no `-c safe.directory`) with rc=128, like git
@@ -83,7 +86,8 @@ case "$*" in
   *rev-parse*) [[ "$*" == *safe.directory* ]] || { echo "fatal: detected dubious ownership in repository" >&2; exit 128; };;
   *"fetch origin "[0-9a-f]*) f fetchsha && exit 1; exit 0;;
   *fetch*) f gitfetch && exit 1; exit 0;;
-  *cat-file*) f catfile && exit 1; exit 0;;
+  *cat-file*) f catfile && exit 1; if f catfileonce && [ ! -e "$CALLS.cf" ]; then : > "$CALLS.cf"; exit 1; fi; exit 0;;
+  *"--quiet "[0-9a-f]*" HEAD -- docker-compose.yml"*) f composerange && exit 1; exit 0;;
   *"diff --no-ext-diff"*) f composediff && exit 1; exit 0;;
   *"checkout -f"*) f nocompose || echo "repo: compose" > docker-compose.yml; f checkout && exit 1; exit 0;;
   *"reset --hard"*) f nocompose || echo "repo: compose" > docker-compose.yml; f reset && exit 1; exit 0;;
@@ -121,6 +125,8 @@ type Opts = {
 	release?: string
 	/** a preview deploy (skipMigrate, as preview-deploys.ts passes it). */
 	preview?: boolean
+	/** the last successfully deployed commit (DB git_sha). */
+	baseSha?: string | null
 }
 
 function makeBin(d: string) {
@@ -133,7 +139,7 @@ function makeBin(d: string) {
 	return bin
 }
 
-function run({ layout, cfg, prebuilt, fail = '', sha = null, strict = false, rmWd = false, ctx, files = [], khUnwritable = false, deployKey = false, release = '', preview = false }: Opts) {
+function run({ layout, cfg, prebuilt, fail = '', sha = null, strict = false, rmWd = false, ctx, files = [], khUnwritable = false, deployKey = false, release = '', preview = false, baseSha = null }: Opts) {
 	const d = mkdtempSync(join(tmpdir(), 'powder-run-'))
 	const wd = join(d, 'app')
 	const tmp = join(d, 'tmp')
@@ -164,6 +170,7 @@ function run({ layout, cfg, prebuilt, fail = '', sha = null, strict = false, rmW
 		wantBranch: 'main',
 		wantSha: sha,
 		shaIsStrict: strict,
+		baseSha,
 		swapOrdinal: undefined,
 		stageId: 'dep_t',
 		migrateApp: 'shop',
@@ -458,6 +465,79 @@ describe('deploy-setup markers in the generated script', () => {
 		expect(markers(ok).composeDrift).toBe('ok')
 	})
 
+	// Only a compose change in this deploy's commit range (last deployed sha .. HEAD) is drift.
+	const BASE = 'd'.repeat(40)
+	it.each(['src', 'wd'] as const)('%s layout: compose changed in range + differs is drift', (layout) => {
+		const r = run({ layout, cfg: 'image', prebuilt: false, baseSha: BASE, fail: layout === 'src' ? 'nocompose,composerange' : 'composediff,composerange', files: layout === 'src' ? ['src/docker-compose.yml'] : [] })
+		expect(r.rc).toBe(0)
+		expect(r.out).toContain('[compose-drift] WARNING')
+		expect(r.log).toContain(`--quiet ${BASE} HEAD -- docker-compose.yml`)
+		expect(markers(r).composeDrift).toBe('drift')
+	})
+
+	it.each(['src', 'wd'] as const)('%s layout: compose unchanged in range + differs is standing (info line, no WARNING)', (layout) => {
+		const r = run({ layout, cfg: 'image', prebuilt: false, baseSha: BASE, fail: layout === 'src' ? 'nocompose' : 'composediff', files: layout === 'src' ? ['src/docker-compose.yml'] : [] })
+		expect(r.rc).toBe(0)
+		expect(r.out).not.toContain('[compose-drift] WARNING')
+		expect(r.out).toContain('[compose-drift] info:')
+		expect(markers(r).composeDrift).toBe('standing')
+	})
+
+	it.each(['src', 'wd'] as const)('%s layout: base sha not in the clone and not fetchable falls back to drift', (layout) => {
+		const r = run({ layout, cfg: 'image', prebuilt: false, baseSha: BASE, fail: layout === 'src' ? 'nocompose,catfile,fetchsha' : 'composediff,catfile,fetchsha', files: layout === 'src' ? ['src/docker-compose.yml'] : [] })
+		expect(r.rc).toBe(0)
+		expect(r.out).toContain('[compose-drift] WARNING')
+		expect(r.log).toContain(`fetch origin ${BASE}`)
+		expect(markers(r).composeDrift).toBe('drift')
+	})
+
+	// A fresh or shallow clone lacks the last deployed commit: one fetch, then the range
+	// decides. Without it a standing difference would raise the card after every re-clone.
+	it.each(['src', 'wd'] as const)('%s layout: base missing from the clone is fetched, then a standing difference stays quiet', (layout) => {
+		const r = run({ layout, cfg: 'image', prebuilt: false, baseSha: BASE, fail: layout === 'src' ? 'nocompose,catfileonce' : 'composediff,catfileonce', files: layout === 'src' ? ['src/docker-compose.yml'] : [] })
+		expect(r.rc).toBe(0)
+		expect(r.log).toContain(`fetch origin ${BASE}`)
+		expect(r.out).not.toContain('[compose-drift] WARNING')
+		expect(markers(r).composeDrift).toBe('standing')
+	})
+
+	// The shell and composeDriftVerdict (the rule the replay guard runs real history
+	// through) give the same marker for every input, in both layouts.
+	const CASES: Array<{ differs: boolean; range: ComposeRange }> = [
+		{ differs: false, range: 'changed' },
+		{ differs: false, range: 'unchanged' },
+		{ differs: false, range: 'none' },
+		{ differs: true, range: 'changed' },
+		{ differs: true, range: 'unchanged' },
+		{ differs: true, range: 'none' },
+	]
+	// One script run per test: all cases in one test ran the script once per case under
+	// a single test timeout, which a loaded server overran.
+	describe.each(['src', 'wd'] as const)('%s layout: the script marker equals composeDriftVerdict', (layout) => {
+		it.each(CASES)('differs=$differs range=$range', ({ differs, range }) => {
+			const fail = [
+				layout === 'src' ? 'nocompose' : differs ? 'composediff' : '',
+				range === 'changed' ? 'composerange' : '',
+			]
+				.filter(Boolean)
+				.join(',')
+			const r = run({ layout, cfg: 'image', prebuilt: false, baseSha: range === 'none' ? null : BASE, fail, files: layout === 'src' && differs ? ['src/docker-compose.yml'] : [] })
+			expect(r.rc, `${layout} ${differs} ${range}`).toBe(0)
+			expect(markers(r).composeDrift, `${layout} differs=${differs} range=${range}`).toBe(composeDriftVerdict(differs, range))
+			expect(r.out.includes('[compose-drift] WARNING'), `${layout} ${differs} ${range} warning`).toBe(composeDriftVerdict(differs, range) === 'drift')
+		})
+	})
+
+	it.each(['src', 'wd'] as const)('%s layout: no previous sha falls back to drift, a malformed one too', (layout) => {
+		for (const baseSha of [null, 'not-a-sha; rm -rf /']) {
+			const r = run({ layout, cfg: 'image', prebuilt: false, baseSha, fail: layout === 'src' ? 'nocompose' : 'composediff', files: layout === 'src' ? ['src/docker-compose.yml'] : [] })
+			expect(r.rc).toBe(0)
+			expect(r.out).toContain('[compose-drift] WARNING')
+			expect(r.log).not.toMatch(/--quiet \S+ HEAD -- docker-compose.yml/)
+			expect(markers(r).composeDrift).toBe('drift')
+		}
+	})
+
 	it('migrate-path: stray *.sql outside the powder-migrate folders, before powder-migrate; preview skips it', () => {
 		const stray = run({ layout: 'src', cfg: 'image', prebuilt: false, files: ['src/sql/0001_init.sql'] })
 		expect(stray.rc).toBe(0)
@@ -498,9 +578,13 @@ describe('deploy-setup markers in the generated script', () => {
 		const local = run({ layout: 'src', cfg: 'image', prebuilt: false })
 		expect(local.rc).toBe(0)
 		expect(markers(local).testGate).toBe('absent')
+		// no .powder/test.sh: the run itself records none (the stored deploys.test_gate)
+		expect(markers(local).testGateResult).toBe('none')
 		const preAbsent = run({ layout: 'src', cfg: 'image', prebuilt: true })
 		expect(preAbsent.rc).toBe(0)
 		expect(markers(preAbsent).testGate).toBe('absent')
+		// prebuilt: the builder's result counts, the target prints none of its own
+		expect(markers(preAbsent).testGateResult).toBeNull()
 		const prePresent = run({ layout: 'src', cfg: 'image', prebuilt: true, files: ['src/.powder/test.sh'] })
 		expect(prePresent.rc).toBe(0)
 		expect(markers(prePresent).testGate).toBe('present')
@@ -521,7 +605,7 @@ describe('deploy-setup markers in the generated script', () => {
 			shaNonce: 'testnonce123',
 		})
 		expect(s).toContain(`if [ -f "$TG_DIR/.powder/test.sh" ]; then echo '__POWDER_STAB_testnonce123__ test-gate present'; `)
-		expect(s).toContain(`skipped (opt-in test/typecheck gate; see /docs/deploys#steps-in-order)"; echo '__POWDER_STAB_testnonce123__ test-gate absent'; fi && `)
+		expect(s).toContain(`skipped (opt-in test/typecheck gate; see /docs/deploys#steps-in-order)"; echo '__POWDER_STAB_testnonce123__ test-gate absent'; echo '__POWDER_STAB_testnonce123__ test-gate-result none'; fi && `)
 		// no nonce: the script is exactly the one without the deploy-setup checks
 		const plain = buildDeployScript({
 			workingDir: '/opt/apps/shop',

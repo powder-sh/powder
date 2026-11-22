@@ -32,7 +32,7 @@ function runWithMktemp(script: string, failAt: number) {
 	chmodSync(join(dir, 'flock'), 0o755)
 	const r = spawnSync('bash', ['-c', script], {
 		encoding: 'utf8',
-		timeout: 20_000,
+		timeout: 120_000,
 		env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
 	})
 	const list = existsSync(made) ? readFileSync(made, 'utf8').split('\n').filter(Boolean) : []

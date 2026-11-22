@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
 import {
+	BUILDER_PRUNE_PATHS,
 	BUILD_CACHE_TOTAL_MB_SHELL,
 	builderCacheCapGb,
 	builderCapPruneShell,
@@ -11,7 +12,7 @@ import {
 	parseBuilderPruneResult,
 } from '../builder-prune'
 import { buildBuilderScript, builderDirCleanupShell } from '../builder'
-import { buildLockShell } from '../build-lock'
+import { buildLockShell, rootOrHomePathShell } from '../build-lock'
 import { needTool } from './need-tool'
 
 // `--max-used-space` counts private bytes only, so with shared records the `docker buildx du`
@@ -178,8 +179,37 @@ describe('build host cap prune', () => {
 	})
 	it('the prune holds every build slot, each waited for a share of busyWaitSec', () => {
 		const s = builderCapPruneShell({ busyWaitSec: 600, slots: 2 })
-		expect(s).toContain(`flock -o -w 300 -E 213 ${buildLockShell('.0')} flock -o -w 300 -E 213 ${buildLockShell('.1')} timeout -k 10 900 sh -c`)
-		expect(builderCapPruneShell({ slots: 3, busyWaitSec: 0 })).toContain(`flock -o -w 1 -E 213 ${buildLockShell('.2')} timeout -k 10 900 sh -c`)
+		const pull = `flock -o -x -w 60 -E 215 ${rootOrHomePathShell(BUILDER_PRUNE_PATHS.pull.root, BUILDER_PRUNE_PATHS.pull.user, 'builder-prune')}`
+		expect(s).toContain(`flock -o -w 300 -E 213 ${buildLockShell('.0')} flock -o -w 300 -E 213 ${buildLockShell('.1')} ${pull} timeout -k 10 900 sh -c`)
+		expect(builderCapPruneShell({ slots: 3, busyWaitSec: 0 })).toContain(`flock -o -w 1 -E 213 ${buildLockShell('.2')} ${pull} timeout -k 10 900 sh -c`)
+	})
+	// A prune that overlaps a builder script's image pull fails the pull inside dockerd
+	// ("failed to lease content: NotFound: lease ... not found"): the test gate then
+	// refuses and the deploy falls back to a local build.
+	it.skipIf(!HAS_TIMEOUT || spawnSync('flock', ['--version']).status !== 0)('no prune while a builder script pull holds the pull lock; it runs once the pull ends', async () => {
+		const s = stub('pull', '50GB', { '24h': '20GB' })
+		const sh = builderCapPruneShell({ capGb: 30, buildsRoot, busyWaitSec: 1, pullWaitSec: 0, pullLockWaitSec: 1, lockPath: join(s.dir, 'prune.lock'), slotLockPrefix: join(s.dir, 'slot.'), stateFile: join(s.dir, 'state', 'last') })
+		const go = () => {
+			writeFileSync(s.log, '')
+			const r = spawnSync('bash', ['-c', sh], { encoding: 'utf8', env: { ...process.env, PATH: `${s.bin}:${process.env.PATH}` } })
+			return { out: r.stdout, calls: readFileSync(s.log, 'utf8') }
+		}
+		// what builderPullGuardFunctions does around `docker pull` (-o: killing flock frees the lock)
+		const hold = spawn('flock', ['-s', '-o', join(s.dir, 'prune.lock.pull'), 'sleep', '10'], { stdio: 'ignore' })
+		try {
+			spawnSync('bash', ['-c', `for i in $(seq 50); do flock -n ${JSON.stringify(join(s.dir, 'prune.lock.pull'))} true || exit 0; sleep 0.1; done`])
+			const r = go()
+			expect(r.out).toContain('pruned=0 skip=busy')
+			expect(r.calls).not.toMatch(/image prune|builder prune/)
+		} finally {
+			hold.kill()
+		}
+		await new Promise((res) => hold.once('exit', res))
+		// the busy skip held the slots, so the 1h gate is on: clear it for the second run.
+		rmSync(join(s.dir, 'state', 'builder-prune.attempt'), { force: true })
+		const r2 = go()
+		expect(r2.calls).toMatch(/image prune -f/)
+		expect(r2.out).toContain('pruned=1')
 	})
 	it('sweeps clones older than a week under the builds root only', () => {
 		const old = join(buildsRoot, 'aaaa-old')

@@ -1,0 +1,13 @@
+-- idempotent
+-- deploys.test_gate: the test gate's result as the deploy recorded it, from the deploy
+--   script's nonced mark (apps/web/src/lib/deploy/stability.ts, kind test-gate-result),
+--   never from a log search, so an app's build output cannot set it:
+--   'passed' = .powder/test.sh ran and exited 0, 'failed' = the deploy failed at the test
+--   gate, 'none' = the build context has no .powder/test.sh. NULL = not recorded (the
+--   deploy died before the gate, or a row from before this migration). Written by the deploy
+--   runner when a deploy ends, for history and for readers added later; nothing reads it yet (the
+--   GitHub statuses use the running deploy's own value, not this column).
+-- Nullable text with no default: a catalog-only change, no table rewrite, and the previous
+-- release (which never names the column) keeps working. The history backfill is a
+-- separate post-deploy file (0067), so this one never waits on a scan.
+ALTER TABLE "deploys" ADD COLUMN IF NOT EXISTS "test_gate" text;

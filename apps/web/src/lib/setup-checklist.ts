@@ -2,6 +2,7 @@
 // servers rows, cached SSH/DNS results). No SSH or DNS here; the route only
 // runs those when the operator asks (POST ?action=run).
 
+import { type DeployFailureRoute, describeDeployFailureRoutes } from './deploy-failure-route-words'
 import { RECREATE_COMMAND } from './recreate-hint'
 
 type ChecklistState = 'done' | 'missing' | 'unknown'
@@ -28,6 +29,9 @@ export interface ChecklistServer {
 	baseDomain: string | null
 	// null = never checked (or only under another proxy). Persisted across restarts.
 	checkGreen: boolean | null
+	/** The required pieces the last check found missing (server-bootstrap.ts
+	 *  checkItems 'missing' items); [] or absent when green or unknown. */
+	checkMissing?: Array<{ id: string; label: string; detail: string }>
 	dnsState: string | null
 	/** Something on this server would use a default `<app>.<base_domain>` host:
 	 *  an app with no custom domain, an app with branch previews on, or no apps
@@ -39,7 +43,8 @@ export interface ChecklistInput {
 	githubOAuth: boolean
 	servers: ChecklistServer[]
 	backups: boolean
-	notifyWebhook: boolean
+	/** deployFailureRoutes(): where failed deploys go; [] = nowhere but the dashboard. */
+	deployFailureRoutes: DeployFailureRoute[]
 	adminPersisted: boolean
 }
 
@@ -62,6 +67,58 @@ function serverHref(s: ChecklistServer | undefined): string {
 
 function names(list: ChecklistServer[]): string {
 	return list.map((s) => s.name).join(', ')
+}
+
+// The server check items that mean Docker or the proxy itself is missing.
+const DOCKER_OR_PROXY = new Set(['docker', 'compose', 'traefik'])
+
+// Checklist words for a check item id; anything else keeps the check's label.
+const PIECE_NAMES: Record<string, string> = {
+	docker: 'Docker',
+	compose: 'the docker compose plugin',
+	traefik: 'the Traefik container',
+	'traefik-file-provider': 'the Traefik file provider',
+	'dynamic-dir': 'the Traefik file provider folder',
+	'network-web': 'network web',
+	tools: 'git or flock',
+}
+
+function pieceName(m: { id: string; label: string }): string {
+	return PIECE_NAMES[m.id] ?? m.label
+}
+
+function someNames(list: string[], max = 3): string {
+	return list.length <= max
+		? list.join(', ')
+		: `${list.slice(0, max).join(', ')} and ${list.length - max} more`
+}
+
+function fixFirst(failing: ChecklistServer[]): ChecklistServer | undefined {
+	return failing.find((s) => s.checkMissing?.length) ?? failing[0]
+}
+
+/** "network web missing on a, b, c and 3 more; ... first: network web on a: <why>".
+ *  The first named piece is the one the row's action opens (fixFirst). */
+function failingDetail(failing: ChecklistServer[]): string {
+	const byPiece = new Map<string, string[]>()
+	for (const s of failing) {
+		for (const m of s.checkMissing ?? []) {
+			const k = pieceName(m)
+			byPiece.set(k, [...(byPiece.get(k) ?? []), s.name])
+		}
+	}
+	const unnamed = failing.filter((s) => !s.checkMissing?.length)
+	const parts = [...byPiece].map(([piece, on]) => `${piece} missing on ${someNames(on)}`)
+	if (unnamed.length)
+		parts.push(`the server check failed on ${someNames(unnamed.map((s) => s.name))}`)
+	const summary = parts.join('; ')
+	const firstServer = fixFirst(failing)
+	const first = firstServer?.checkMissing?.[0]
+	if (!firstServer || !first) return summary
+	const why = first.detail.replace(/^missing: /, '')
+	const total = failing.reduce((n, s) => n + (s.checkMissing?.length ?? 0), 0) + unnamed.length
+	if (total === 1) return `${summary}: ${why}`
+	return `${summary}. first: ${pieceName(first)} on ${firstServer.name}: ${why}`
 }
 
 export function buildChecklist(input: ChecklistInput): ChecklistItem[] {
@@ -96,11 +153,14 @@ export function buildChecklist(input: ChecklistInput): ChecklistItem[] {
 					}
 				: failing[0]
 					? {
-							label: 'install Docker and the proxy',
+							label: failing.some((s) => s.checkMissing?.some((m) => DOCKER_OR_PROXY.has(m.id)))
+								? 'install Docker and the proxy'
+								: 'add the missing server pieces',
 							state: 'missing',
-							detail: `Docker or proxy pieces missing on ${names(failing)}`,
-							href: serverHref(failing[0]),
-							action: `open ${failing[0].name}`,
+							detail: failingDetail(failing),
+							// the server page's check card: "check server", then "fix missing pieces"
+							href: `${serverHref(fixFirst(failing))}#server-check`,
+							action: `fix ${fixFirst(failing)?.name ?? failing[0].name}`,
 						}
 					: unchecked.length > 0
 						? {
@@ -186,10 +246,11 @@ export function buildChecklist(input: ChecklistInput): ChecklistItem[] {
 	items.push({
 		id: 'notify-webhook',
 		label: 'get told when a deploy fails',
-		state: input.notifyWebhook ? 'done' : 'missing',
-		detail: input.notifyWebhook
-			? 'failed deploys are sent to a notification target'
-			: 'add a Slack, Discord or email target for failed deploys',
+		state: input.deployFailureRoutes.length > 0 ? 'done' : 'missing',
+		detail:
+			input.deployFailureRoutes.length > 0
+				? describeDeployFailureRoutes(input.deployFailureRoutes)
+				: 'add a Slack, Discord or email target for failed deploys',
 		href: '/settings/notifications',
 		required: false,
 		action: 'add a target',

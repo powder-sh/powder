@@ -158,3 +158,12 @@ export function fleetHeartbeat(apps: readonly AppRow[], now = Date.now()): Heart
 	}
 	return h
 }
+
+// The redeploy button's explanation (apps list and app page). An app the shared
+// health reads as never deployed has no running version to keep serving.
+export function redeployHint(branch: string | null | undefined, neverDeployed: boolean): string {
+	const b = branch || 'its branch'
+	return neverDeployed
+		? `pull the latest commit of ${b}, build and start it.`
+		: `pull the latest commit of ${b}, rebuild and swap. if the build or a check before the swap fails, the running version keeps serving.`
+}

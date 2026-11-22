@@ -52,6 +52,14 @@ interface RepoState {
 	webhookSecret?: string | null
 	autoInstalled?: boolean
 	isCheckout?: boolean
+	// where the checkout is on the server (lib/app-checkout.ts)
+	checkout?: { kind: 'src' | 'workdir' | 'none' | 'src-link' | 'unknown' }
+	// one line saying where the checkout is, or why there is none (lib/app-checkout.ts checkoutNote)
+	checkoutNote?: string
+	// the clone action (into <working dir>/src) is allowed for this layout
+	cloneAllowed?: boolean
+	// src/ is a checkout of this repo but <wd>/.deploy-key is missing
+	keyMissing?: boolean
 	// Present only in the response right after an adopt: the per-step result of
 	// the auto-setup so the user sees a punch list instead of a silent gap.
 	steps?: ConnectStep[]
@@ -216,9 +224,17 @@ export function RepoCard({ serverId, containerName }: { serverId: string; contai
 						/>
 					)}
 
-					{state.isCheckout === false && (
+					{state.cloneAllowed ? (
 						<NeedsCloneCTA serverId={serverId} containerName={containerName} onCloned={load} />
-					)}
+					) : state.keyMissing ? (
+						<NeedsCloneCTA serverId={serverId} containerName={containerName} onCloned={load} keyOnly />
+					) : state.checkoutNote && state.isCheckout ? (
+						<p className="text-2xs text-muted-foreground">{state.checkoutNote}</p>
+					) : state.checkoutNote ? (
+						<p className="rounded-md border border-warning/40 bg-warning/10 p-3 text-2xs text-muted-foreground">
+							{state.checkoutNote}
+						</p>
+					) : null}
 
 					{state.steps && state.steps.length > 0 && <ConnectChecklist steps={state.steps} />}
 
@@ -338,16 +354,19 @@ function SetupOnce({
 	)
 }
 
-// Shown when the app's working dir on the server isn't a git checkout yet.
-// Without this, webhook deploys can't run `git pull`: first-time clone is required.
+// Shown when the app has no git checkout (no src/ and the working dir is not one).
+// The clone goes into <working dir>/src; nothing else in the working dir changes.
 function NeedsCloneCTA({
 	serverId,
 	containerName,
 	onCloned,
+	keyOnly = false,
 }: {
 	serverId: string
 	containerName: string
 	onCloned: () => void
+	/** the clone is in place and only the deploy key is missing: the action writes it */
+	keyOnly?: boolean
 }) {
 	const [confirm, setConfirm] = useState(false)
 	const [busy, setBusy] = useState(false)
@@ -378,21 +397,27 @@ function NeedsCloneCTA({
 		<>
 			<div className="flex items-start justify-between gap-3 rounded-md border border-warning/40 bg-warning/10 p-3">
 				<div>
-					<p className="text-xs font-medium">working dir isn't a git checkout yet</p>
+					<p className="text-xs font-medium">{keyOnly ? 'deploy key missing' : 'no git checkout yet'}</p>
 					<p className="mt-0.5 text-2xs text-muted-foreground">
-						clone the repo into the app's working dir to enable auto-deploy on push.
+						{keyOnly
+							? "the repo is cloned into src/, but the deploy key in the app's working dir is missing; deploys need it."
+							: "clone the repo into src/ in the app's working dir to enable auto-deploy on push."}
 					</p>
 					{error && <p className="mt-1 text-2xs text-destructive">{error}</p>}
 				</div>
 				<Button size="sm" variant="outline" onClick={() => setConfirm(true)} disabled={busy}>
-					{busy ? 'cloning…' : 'clone'}
+					{busy ? (keyOnly ? 'writing…' : 'cloning…') : keyOnly ? 'write key' : 'clone'}
 				</Button>
 			</div>
 			<ConfirmDialog
 				open={confirm}
-				title="clone repo into working dir?"
-				description="the existing dir contents are renamed to .before-powder.<timestamp> as a backup, then the github clone is moved into place. nothing is deleted."
-				confirmLabel="clone"
+				title={keyOnly ? 'write the deploy key?' : 'clone repo into src/?'}
+				description={
+					keyOnly
+						? "powder writes the app's deploy key from its database to .deploy-key in the app's working dir. nothing else changes."
+						: "powder clones the repo into a new src/ folder in the app's working dir. nothing in the working dir is moved, renamed or deleted. if the compose builds on the server, its build context must be ./src: a deploy refuses the app dir as the context and says so."
+				}
+				confirmLabel={keyOnly ? "write key" : "clone"}
 				danger
 				loading={busy}
 				onConfirm={go}

@@ -3,6 +3,7 @@
 import { uiErrorCopy } from '@/lib/ui-error-copy'
 import { RECREATE_COMMAND } from '@/lib/recreate-hint'
 import { Alert } from '@/components/ui/alert'
+import { CopyButton } from '@/components/ui/copy-button'
 import { buttonVariants } from '@/components/ui/button-variants'
 import { PageHeader } from '@/components/ui/page-header'
 import Link from 'next/link'
@@ -945,7 +946,8 @@ function GettingStarted({
 						<code className="font-mono text-foreground">GITHUB_CLIENT_ID</code> and{' '}
 						<code className="font-mono text-foreground">GITHUB_CLIENT_SECRET</code> in{' '}
 						<code className="font-mono text-foreground">powder.env</code>, then in the powder source
-						dir run <code className="font-mono text-foreground break-all">{RECREATE_COMMAND}</code>{' '}
+						dir run <code className="font-mono text-foreground break-all">{RECREATE_COMMAND}</code>
+						<CopyButton value={RECREATE_COMMAND} label="copy the command" size="inline" className="mx-0.5" />{' '}
 						(a restart does not re-read the file). or paste a personal access token on the{' '}
 						<Link href="/integrations" className="text-foreground underline underline-offset-2">
 							integrations

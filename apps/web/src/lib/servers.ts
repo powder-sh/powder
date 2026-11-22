@@ -1,5 +1,6 @@
 import { resolveBaseDomain } from './app-hosts'
-import { appRepos, createId, db, eq, prefixes, servers } from './db'
+import { appRepos, createId, db, domainRedirects, eq, prefixes, servers } from './db'
+import { redirectRowInUse } from './traefik-network'
 
 export interface ServerConfig {
 	id: string
@@ -18,6 +19,11 @@ export interface ServerConfig {
 	baseDomain?: string | null
 	/** Public IPv4 for custom-domain DNS verification (servers.ingress_ip). */
 	ingressIp?: string | null
+	/** The network the server's Traefik routes over, as last resolved (0069,
+	 *  servers.traefik_network; traefik-network-run.ts). null = not resolved yet. */
+	traefikNetwork?: string | null
+	/** Where traefikNetwork came from (0069): flag | config | attached | default. */
+	traefikNetworkSource?: 'flag' | 'config' | 'attached' | 'default' | null
 }
 
 export interface ServerRecord extends ServerConfig {
@@ -27,7 +33,22 @@ export interface ServerRecord extends ServerConfig {
 	createdAt: Date
 	ownerUserId: string | null
 	/** Last persisted server check (0060), null = never checked. */
-	lastCheck: { green: boolean; proxy: 'nginx' | 'nginx-container' | 'traefik'; at: Date } | null
+	lastCheck: StoredServerCheck | null
+}
+
+/** A required piece the server check found missing (server-bootstrap.ts checkItems). */
+export interface MissingPiece {
+	id: string
+	label: string
+	detail: string
+}
+
+export interface StoredServerCheck {
+	green: boolean
+	proxy: 'nginx' | 'nginx-container' | 'traefik'
+	at: Date
+	/** The missing required pieces (0068); null = saved before 0068. */
+	missing: MissingPiece[] | null
 }
 
 function rowToConfig(row: typeof servers.$inferSelect): ServerConfig {
@@ -43,6 +64,8 @@ function rowToConfig(row: typeof servers.$inferSelect): ServerConfig {
 		tlsMode: row.tlsMode,
 		baseDomain: resolveBaseDomain(row.id, row.baseDomain),
 		ingressIp: row.ingressIp ?? null,
+		traefikNetwork: row.traefikNetwork ?? null,
+		traefikNetworkSource: row.traefikNetworkSource ?? null,
 	}
 }
 
@@ -56,7 +79,12 @@ function rowToRecord(row: typeof servers.$inferSelect): ServerRecord {
 		ownerUserId: row.ownerUserId,
 		lastCheck:
 			row.checkGreen !== null && row.checkProxy && row.checkedAt
-				? { green: row.checkGreen, proxy: row.checkProxy, at: row.checkedAt }
+				? {
+						green: row.checkGreen,
+						proxy: row.checkProxy,
+						at: row.checkedAt,
+						missing: Array.isArray(row.checkMissing) ? row.checkMissing : null,
+					}
 				: null,
 	}
 }
@@ -64,12 +92,36 @@ function rowToRecord(row: typeof servers.$inferSelect): ServerRecord {
 /** Persist a server check result so it survives a powder restart. */
 export async function saveServerCheck(
 	id: string,
-	result: { green: boolean; proxy: 'nginx' | 'nginx-container' | 'traefik'; at: Date },
+	result: StoredServerCheck & { missing: MissingPiece[] },
 ): Promise<void> {
 	await db
 		.update(servers)
-		.set({ checkGreen: result.green, checkProxy: result.proxy, checkedAt: result.at })
+		.set({
+			checkGreen: result.green,
+			checkProxy: result.proxy,
+			checkedAt: result.at,
+			checkMissing: result.missing,
+		})
 		.where(eq(servers.id, id))
+}
+
+/** Is a domain redirect set up for an app on this server (redirectRowInUse)? Then
+ *  its Traefik needs the file provider (the server check). */
+export async function serverRedirectsInUse(id: string): Promise<boolean> {
+	const rows = await db
+		.select({ wwwMode: domainRedirects.wwwMode, customRedirectsJson: domainRedirects.customRedirectsJson })
+		.from(domainRedirects)
+		.where(eq(domainRedirects.serverId, id))
+	return rows.some(redirectRowInUse)
+}
+
+/** Store the network the server's Traefik routes over (traefik-network-run.ts). */
+export async function saveTraefikNetwork(
+	id: string,
+	network: string,
+	source: 'flag' | 'config' | 'attached' | 'default',
+): Promise<void> {
+	await db.update(servers).set({ traefikNetwork: network, traefikNetworkSource: source }).where(eq(servers.id, id))
 }
 
 // Admin-only: lists every server regardless of owner. For internal scans.

@@ -1,13 +1,14 @@
 'use client'
 
 import { SkeletonList } from '@/components/ui/skeleton'
-// Cross-fleet deploy stream, Vercel-style. Newest first. Filterable by author,
+// Cross-fleet deploy stream, Vercel-style. Newest push first (queued_at, lib/deploy-order.ts). Filterable by author,
 // repo, branch, status. Each row → link to /deploys/[id] for the full output.
 
 import { Alert } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { buttonVariants } from '@/components/ui/button-variants'
+import { CopyButton } from '@/components/ui/copy-button'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Input, Select } from '@/components/ui/input'
 import { PageHeader } from '@/components/ui/page-header'
@@ -17,13 +18,28 @@ import { ExternalLink, GitBranch, RefreshCw, Rocket, Search } from 'lucide-react
 import Link from 'next/link'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { Suspense, useCallback, useEffect, useMemo, useState } from 'react'
-import { timeAgo } from '@/lib/format'
-import { DEPLOY_STATUS, deployKindBadge, deployStatus, triggeredByLabel } from '@/lib/deploy-status'
+import { formatDuration, timeAgo, waitedLabel } from '@/lib/format'
+import { deployListAt } from '@/lib/deploy-order'
+import { REQUESTED_MARK } from '@/lib/deploy-commit'
+import {
+	DEPLOY_STATUS,
+	deployKindBadge,
+	deployStatus,
+	normalizeAuthorFilter,
+	triggeredByLabel,
+} from '@/lib/deploy-status'
+
+interface AuthorOption {
+	value: string
+	label: string
+}
 
 interface DeployRow {
 	id: string
 	sha: string | null
 	shortSha: string | null
+	/** true when `sha` is only the commit the push requested (lib/deploy-commit.ts) */
+	shaRequested?: boolean
 	branch: string | null
 	status: string
 	queuedAt: string
@@ -44,16 +60,6 @@ interface DeployRow {
 	errorSummary: string | null
 	/** Set while a queued push is held on the settle window (lib/deploy-settle.ts). */
 	waiting?: string | null
-}
-
-function fmtDuration(ms: number | null): string {
-	if (ms === null) return '-'
-	if (ms < 1000) return `${ms}ms`
-	const s = Math.floor(ms / 1000)
-	if (s < 60) return `${s}s`
-	const m = Math.floor(s / 60)
-	const rs = s % 60
-	return `${m}m ${rs}s`
 }
 
 function StatusPill({ status }: { status: string }) {
@@ -133,9 +139,10 @@ function DeploysView() {
 					setBusy(false)
 					return
 				}
-				const data = (await res.json()) as { deploys: DeployRow[]; nextCursor: string | null }
+				const data = (await res.json()) as { deploys: DeployRow[]; nextCursor: string | null; authors?: AuthorOption[] }
 				setRows(data.deploys)
 				setNextCursor(data.nextCursor)
+				if (data.authors) setAuthors(data.authors)
 			} catch (e) {
 				setErr(e instanceof Error ? e.message : 'load failed')
 			}
@@ -163,31 +170,25 @@ function DeploysView() {
 	}, [load])
 
 	// Dropdown options accumulate across loads so picking one filter doesn't
-	// shrink the others (rows are already filtered server-side).
-	const [seen, setSeen] = useState<{ authors: string[]; repos: string[]; branches: string[] }>({
-		authors: [],
+	// shrink the others (rows are already filtered server-side). Authors come from the
+	// server: every person in the stored triggers, read by the same parser as the filter
+	// (lib/deploy-status.ts parseTrigger), never from commit authors that cannot match.
+	const [authors, setAuthors] = useState<AuthorOption[]>([])
+	const [seen, setSeen] = useState<{ repos: string[]; branches: string[] }>({
 		repos: [],
 		branches: [],
 	})
 	useEffect(() => {
 		if (!rows) return
 		setSeen((prev) => {
-			const authors = new Set(prev.authors)
 			const repos = new Set(prev.repos)
 			const branches = new Set(prev.branches)
 			for (const r of rows) {
-				if (r.authorAvatarLogin) authors.add(r.authorAvatarLogin)
 				if (r.containerName) repos.add(r.containerName)
 				if (r.branch) branches.add(r.branch)
 			}
-			if (
-				authors.size === prev.authors.length &&
-				repos.size === prev.repos.length &&
-				branches.size === prev.branches.length
-			)
-				return prev
+			if (repos.size === prev.repos.length && branches.size === prev.branches.length) return prev
 			return {
-				authors: [...authors].sort(),
 				repos: [...repos].sort(),
 				branches: [...branches].sort(),
 			}
@@ -196,12 +197,17 @@ function DeploysView() {
 	const filterOptions = useMemo(() => {
 		const withSel = (list: string[], sel: string) =>
 			sel && !list.includes(sel) ? [...list, sel].sort() : list
+		const normalized = normalizeAuthorFilter(author)
+		const authorList =
+			normalized && !authors.some((a) => a.value === normalized)
+				? [...authors, { value: normalized, label: author }]
+				: authors
 		return {
-			authors: withSel(seen.authors, author),
+			authors: authorList,
 			repos: withSel(seen.repos, repo),
 			branches: withSel(seen.branches, branch),
 		}
-	}, [seen, author, repo, branch])
+	}, [seen, authors, author, repo, branch])
 
 	const visibleRows = useMemo(() => {
 		const needle = q.trim().toLowerCase()
@@ -235,13 +241,13 @@ function DeploysView() {
 					selectSize="sm"
 					className="max-w-[12rem]"
 					aria-label="filter by author"
-					value={author}
+					value={normalizeAuthorFilter(author) ?? ''}
 					onChange={(e) => setAuthor(e.target.value)}
 				>
 					<option value="">all authors</option>
 					{filterOptions.authors.map((a) => (
-						<option key={a} value={a}>
-							{a}
+						<option key={a.value} value={a.value}>
+							{a.label}
 						</option>
 					))}
 				</Select>
@@ -371,7 +377,7 @@ function DeploysView() {
 								const kind = deployKindBadge(r.kind)
 								const by = triggeredByLabel(r.triggeredBy)
 								return (
-									<li key={r.id} className="relative transition-colors hover:bg-accent/40">
+									<li key={r.id} className="group relative transition-colors hover:bg-accent/40">
 										<Link
 											href={`/deploys/${r.id}`}
 											aria-label={`open deploy ${r.shortSha ?? r.id} of ${r.containerName}`}
@@ -381,8 +387,13 @@ function DeploysView() {
 											<div className="w-20 shrink-0 pt-0.5 sm:w-24 sm:pt-0">
 												<StatusPill status={r.status} />
 												<div className="mt-0.5 pl-3.5 text-2xs tabular-nums text-muted-foreground">
-													{fmtDuration(r.durationMs)}
+													{formatDuration(r.durationMs)}
 												</div>
+												{r.status !== 'queued' && waitedLabel(r.queuedAt, r.startedAt) && (
+													<div className="pl-3.5 text-2xs tabular-nums text-muted-foreground">
+														{waitedLabel(r.queuedAt, r.startedAt)}
+													</div>
+												)}
 											</div>
 											<div className="min-w-0 flex-1">
 												<div className="flex min-w-0 items-center gap-2">
@@ -406,6 +417,7 @@ function DeploysView() {
 													) : (
 														r.shortSha && <span className="font-mono">{r.shortSha}</span>
 													)}
+													{r.shaRequested && r.shortSha && <span>{REQUESTED_MARK}</span>}
 													{r.branch && (
 														<span className="inline-flex items-center gap-1">
 															<GitBranch className="h-3 w-3" />
@@ -417,20 +429,28 @@ function DeploysView() {
 												</div>
 												{r.waiting && <div className="mt-1.5 text-xs text-muted-foreground">{r.waiting}</div>}
 												{r.status === 'failed' && r.errorSummary && (
-													<div
-														className="ph-no-capture mt-1.5 line-clamp-2 text-xs text-destructive"
-														title={r.errorSummary}
-													>
-														{r.errorSummary}
+													<div className="mt-1.5 flex items-start gap-1">
+														<div
+															className="ph-no-capture line-clamp-2 min-w-0 text-xs text-destructive"
+															title={r.errorSummary}
+														>
+															{r.errorSummary}
+														</div>
+														<CopyButton
+															value={`${r.containerName}${r.shortSha ? ` ${r.shortSha}` : ''}: ${r.errorSummary}`}
+															label="copy the error summary"
+															reveal
+															className="pointer-events-auto relative -my-2 sm:-my-1"
+														/>
 													</div>
 												)}
 											</div>
 											<div className="hidden shrink-0 text-right text-xs text-muted-foreground sm:block">
-												<div>{timeAgo(r.startedAt)}</div>
+												<div>{timeAgo(deployListAt(r))}</div>
 												{by && <div className="mt-0.5 max-w-48 truncate">{by}</div>}
 											</div>
 											<div className="shrink-0 text-xs text-muted-foreground sm:hidden">
-												{timeAgo(r.startedAt)}
+												{timeAgo(deployListAt(r))}
 											</div>
 										</div>
 									</li>

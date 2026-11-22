@@ -52,6 +52,9 @@ export async function runCommand(
 	timeoutMs = 10_000,
 	/** Gets every chunk as it arrives, with the stream it came from. */
 	onChunk?: (chunk: string, stream: 'stdout' | 'stderr') => void,
+	/** stdin: written to the command, then closed (only when given; otherwise stdin is
+	 *  left as before). For values a script must not carry in its command line. */
+	opts?: { stdin?: string },
 ): Promise<{ stdout: string; stderr: string; code: number }> {
 	return new Promise((resolve, reject) => {
 		const conn = withConnection(server, {
@@ -97,6 +100,7 @@ export async function runCommand(
 						err2.push(s)
 						onChunk?.(s, 'stderr')
 					})
+					if (opts?.stdin !== undefined) stream.end(opts.stdin)
 				})
 			},
 			onError: (err) => {

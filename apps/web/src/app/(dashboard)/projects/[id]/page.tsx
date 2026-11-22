@@ -16,6 +16,8 @@ import { cronRunLabel, cronRunTone } from '@/lib/cron-status'
 import { deployKindBadge, deployStatus } from '@/lib/deploy-status'
 import { DeployStrip, StripLegend, stripSummary } from '@/components/deploy-strip'
 import { timeAgo, useProject } from './_lib/project-context'
+import { deployCommitLabel } from '@/lib/deploy-commit'
+import { deployListAt } from '@/lib/deploy-order'
 
 export default function OverviewPage() {
 	const { id, project, deploys, crons, deployDays, reload } = useProject()
@@ -191,12 +193,12 @@ export default function OverviewPage() {
 									>
 										{deployStatus(d.status).label}
 									</StatusLabel>
-									<span className="font-mono text-xs">{d.gitSha ? d.gitSha.slice(0, 7) : '-'}</span>
+									<span className="font-mono text-xs">{deployCommitLabel(d) ?? '-'}</span>
 									{deployKindBadge(d.kind) && (
 										<Badge variant="outline">{deployKindBadge(d.kind)}</Badge>
 									)}
 									<span className="ml-auto shrink-0 text-xs text-muted-foreground">
-										{timeAgo(d.startedAt)}
+										{timeAgo(String(deployListAt(d)))}
 									</span>
 									<ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
 								</Link>

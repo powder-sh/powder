@@ -164,6 +164,31 @@ describe('migrate-path scan', () => {
 			expect(r.out).not.toContain('WARNING')
 		}
 	})
+	it('a ledgered migrator in powder.release.cmd owns the app SQL: stray *.sql files are no stray-sql', () => {
+		// common shapes: a node script, prisma in a workspace package, a tsx script, knex
+		for (const [release, f] of [
+			['node scripts/migrate.mjs', 'supabase/migrations/086_x.sql'],
+			['cd packages/db && pnpm exec prisma migrate deploy', 'packages/db/prisma/migrations/20260620160000_x/migration.sql'],
+			['npx tsx src/scripts/migrate.ts', 'src/db/migrations-x/0001_x.sql'],
+			['npx knex migrate:latest', 'sql/0001_init.sql'],
+		] as const) {
+			const r = scan({ release, files: { [f]: 'x' } })
+			expect(r.m, release).toEqual([])
+			expect(r.out).toContain(`${M} migrate-path ok`)
+			expect(r.out).not.toContain('WARNING')
+		}
+	})
+	it('stray *.sql still warns when the release label is a push, no migrator, absent or unreadable', () => {
+		const files = { 'sql/0001_init.sql': 'x' }
+		for (const release of ['npx drizzle-kit push --force', 'npx prisma db push', 'npm run db:push'])
+			expect(scan({ release, files }).m, release).toEqual(['stray-sql', 'release-cmd'])
+		for (const release of ['node scripts/warm-cache.js', '<no value>', ''])
+			expect(scan({ release, files }).m, release).toEqual(['stray-sql'])
+		// a migrator at boot instead of in the label does not own the SQL either
+		expect(scan({ cmd: '["sh","-c","node scripts/migrate.mjs && node server.js"] null', files }).m).toEqual(['stray-sql', 'boot-cmd'])
+		expect(scan({ cmd: null, files }).m).toEqual(['stray-sql'])
+		expect(scan({ img: null, files }).m).toEqual(['stray-sql'])
+	})
 	it('the same migrator at container start still warns (boot-cmd, start-script)', () => {
 		expect(scan({ cmd: '["sh","-c","npx knex migrate:latest && node server.js"] null' }).m).toEqual(['boot-cmd'])
 		const pkg = '{"scripts":{"start":"tsx src/scripts/migrate.ts && next start"}}'
@@ -215,7 +240,7 @@ describe('migrate-path scan', () => {
 		expect(r.m).toBeNull()
 		expect(r.rc).toBe(0)
 		expect(Date.now() - t).toBeLessThan(15_000)
-	}, 30_000)
+	})
 	it('a failing or hanging docker image inspect: unknown, rc=0', () => {
 		expect(scan({ inspectHook: 'echo boom >&2; exit 1' }).m).toBeNull()
 		const t = Date.now()
@@ -223,12 +248,12 @@ describe('migrate-path scan', () => {
 		expect(r.m).toBeNull()
 		expect(r.rc).toBe(0)
 		expect(Date.now() - t).toBeLessThan(15_000)
-	}, 30_000)
+	})
 	it('200k lines of find output: handled, one finding, rc=0', () => {
 		const r = scan({ find: 'for i in $(seq 1 200000); do echo "/x/y/file$i.sql"; done; echo "$3/sql/0001_x.sql"; exit 0' })
 		expect(r.rc).toBe(0)
 		expect(r.m).toEqual(['stray-sql'])
-	}, 60_000)
+	})
 	it('a path with shell syntax is data: nothing runs, the logged path is sanitised', () => {
 		const r = scan({ files: { 'we ird$(touch PWNED)/0001_x.sql': 'x' } })
 		expect(r.m).toEqual(['stray-sql'])

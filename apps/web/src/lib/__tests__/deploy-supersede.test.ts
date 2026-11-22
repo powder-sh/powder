@@ -60,7 +60,7 @@ function srv() {
 	return { gate, stamp }
 }
 
-describe('swap gate (race reproduction)', { timeout: 30_000 }, () => {
+describe('swap gate (race reproduction)', () => {
 	it('older deploy A finishing after newer B must not retag :latest or swap', () => {
 		const { gate, stamp } = srv()
 		const b = gate(2000, 'B') // B (newer) finishes first
@@ -136,7 +136,7 @@ describe('buildDeployScript ordering + staging', () => {
 // Failure propagation: the ordinal script must still abort (rc != 0, FAIL trailer,
 // no migrate/up) when a pull / build / git step fails. A helper that puts a
 // top-level `;` into the && chain would let set -e stop protecting it.
-describe('ordinal script keeps failing deploys failed', { timeout: 30_000 }, () => {
+describe('ordinal script keeps failing deploys failed', () => {
 	function run(opts: { cfg: 'build-image' | 'build-noimage' | 'registry'; fail: 'pull' | 'build' | 'git' | 'none'; prebuilt?: boolean }) {
 		const D = mkdtempSync(join(tmpdir(), 'powder-fail-'))
 		const bin = join(D, 'bin')

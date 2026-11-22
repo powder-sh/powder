@@ -117,16 +117,26 @@ export function summarizeDays(days: readonly DeployDay[]): {
 	return { ok, failed, activeDays }
 }
 
-/** "Nov 3: 2 ok, 1 failed" (UTC day). */
-export function dayLabel(d: DeployDay): string {
-	const date = new Date(`${d.day}T00:00:00Z`).toLocaleDateString('en-US', {
-		month: 'short',
-		day: 'numeric',
-		timeZone: 'UTC',
-	})
-	if (d.ok === 0 && d.failed === 0) return `${date}: no deploys`
+const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'] as const
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'] as const
+
+/** Weekday, day, short month, year, then "(UTC)": the strip's days are UTC calendar days. */
+export function dayTitle(d: Pick<DeployDay, 'day'>): string {
+	const t = new Date(`${d.day}T00:00:00Z`)
+	if (Number.isNaN(t.getTime())) return `${d.day} (UTC)`
+	return `${WEEKDAYS[t.getUTCDay()]} ${t.getUTCDate()} ${MONTHS[t.getUTCMonth()]} ${t.getUTCFullYear()} (UTC)`
+}
+
+/** "2 ok, 1 failed", or "no deploys". */
+export function dayCounts(d: Pick<DeployDay, 'ok' | 'failed'>): string {
+	if (d.ok === 0 && d.failed === 0) return 'no deploys'
 	const parts: string[] = []
 	if (d.ok) parts.push(`${d.ok} ok`)
 	if (d.failed) parts.push(`${d.failed} failed`)
-	return `${date}: ${parts.join(', ')}`
+	return parts.join(', ')
+}
+
+/** dayTitle, a colon, then dayCounts: one line for assistive tech. */
+export function dayLabel(d: DeployDay): string {
+	return `${dayTitle(d)}: ${dayCounts(d)}`
 }

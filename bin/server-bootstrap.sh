@@ -11,17 +11,38 @@
 #   sudo bin/server-bootstrap.sh --apply --proxy nginx --yes
 #   sudo bin/server-bootstrap.sh --apply --proxy traefik --replace-helpers
 #   sudo bin/server-bootstrap.sh --apply --proxy nginx --docker-script
+#   sudo bin/server-bootstrap.sh --proxy traefik --redirects no
 #
 # --proxy is the server's servers.proxy and is REQUIRED with --apply.
+# --redirects yes|no: is a domain redirect set up for an app on this server (the
+# dashboard knows: its server check passes the same fact)? Only redirects use
+# Traefik's file provider and the dynamic dir, so with no they are info lines.
+# Default yes, the cautious side: both required on traefik servers.
 #
-# apply only adds what is missing: the docker networks web + internal,
-# /opt/apps, the Traefik dynamic dir (traefik servers), Docker ONLY when docker
+# The check fails (exit 1) only on required pieces: Docker, the compose plugin,
+# /opt/apps, git and flock, and on traefik servers the network Traefik routes over,
+# Traefik attached to it, and (with --redirects yes) its file provider and the
+# dynamic dir. The network powder routes over: Traefik's --providers.docker.network
+# flag, else providers.docker.network in a mounted traefik.yml/.yaml/.toml when it
+# is written in a plain form (anything else: the run says only the dashboard reads
+# that config and gives no network advice), else web. A network Traefik is merely
+# attached to is reported, never used. "Handled elsewhere" for the prune cron and the Traefik log rotation
+# counts only files cron and logrotate load (cron.d names of [A-Za-z0-9_-] only;
+# logrotate.d names without a default taboo extension; no commented-out line). A missing web is an info line
+# where Traefik routes over another network, and on nginx servers (the dashboard's
+# new-app flow creates it); internal is optional everywhere.
+#
+# apply only adds what is missing: the routing network (Traefik's, else web) and
+# internal, /opt/apps, the Traefik dynamic dir (traefik servers, --redirects yes),
+# Docker ONLY when docker
 # is absent, and a pinned Traefik with the file provider + `le` ACME resolver
 # ONLY when --proxy is traefik, there is no container named traefik, nginx is
 # not installed or enabled, nothing listens on 80/443 and no container (running
 # or stopped) binds them. On traefik servers it also writes
 # /etc/logrotate.d/powder-traefik (daily, 7 kept, 100 MB cap, copytruncate) when
-# absent; an existing file is never changed.
+# absent and no other file under /etc/logrotate.d names /var/log/traefik; an
+# existing file is never changed. An existing Traefik not attached to its network
+# is reported, never changed: connect it by hand.
 # Docker comes from Docker's apt repository (Debian and Ubuntu only; other
 # distros are refused: install Docker yourself first): the repository key is
 # trusted only when its fingerprint is 9DC858229FC7DD38854AE2D88D81803C0EBFCD88,
@@ -32,7 +53,8 @@
 # It also installs powder-migrate and powder-image-prune from this checkout's
 # infra/ into /usr/local/bin (root, 0755) when absent, and writes
 # /etc/cron.d/powder-image-prune (root, 0644, the hourly line from the script's
-# header) when that file is absent; an existing cron file is never changed. An
+# header) when that file is absent and neither /etc/crontab nor another
+# /etc/cron.d file runs powder-image-prune; an existing cron file is never changed. An
 # installed helper that differs from this checkout's copy is reported as
 # outdated and only replaced with --replace-helpers. powder-resource-guard is
 # optional: reported, never installed or compared.
@@ -51,6 +73,7 @@ YES=0
 REPLACE=0
 DOCKER_SCRIPT=0
 PROXY=
+REDIRECTS=yes
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--apply) MODE=apply ;;
@@ -63,6 +86,11 @@ while [ $# -gt 0 ]; do
 		shift
 		;;
 	--proxy=*) PROXY="${1#--proxy=}" ;;
+	--redirects)
+		REDIRECTS="${2:-}"
+		shift
+		;;
+	--redirects=*) REDIRECTS="${1#--redirects=}" ;;
 	-h | --help)
 		sed -n '2,/^set -uo pipefail$/p' "$0" | sed '$d'
 		exit 0
@@ -89,6 +117,13 @@ traefik | nginx | nginx-container) ;;
 	exit 2
 	;;
 esac
+case "$REDIRECTS" in
+yes | no) ;;
+*)
+	echo "--redirects must be yes or no" >&2
+	exit 2
+	;;
+esac
 
 DYN="${POWDER_TRAEFIK_DYNAMIC_DIR:-/opt/infra/traefik/dynamic}"
 DYN="${DYN%/}"
@@ -106,6 +141,9 @@ powder_check() (
 	if docker compose version >/dev/null 2>&1; then echo compose=present; else echo compose=absent; fi
 	for n in web internal; do if docker network inspect "$n" >/dev/null 2>&1; then echo "net_$n=present"; else echo "net_$n=absent"; fi; done
 	case "$(docker inspect --type container -f '{{.State.Running}}' traefik 2>/dev/null)" in true) echo traefik=running ;; false) echo traefik=stopped ;; *) echo traefik=absent ;; esac
+	echo "docker_networks=$(docker network ls --format '{{.Name}}:{{.Internal}}:{{.Label "com.docker.compose.project"}}' 2>/dev/null | tr '\n' ' ')"
+	echo "traefik_project=$(docker inspect --type container -f '{{index .Config.Labels "com.docker.compose.project"}}' traefik 2>/dev/null)"
+	echo "traefik_networks=$(docker inspect --type container -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' traefik 2>/dev/null)"
 	if [ -d '/opt/apps' ]; then echo apps_dir=present; else echo apps_dir=absent; fi
 	if [ -d "$DYN" ]; then echo dynamic_dir=present; else echo dynamic_dir=absent; fi
 	if have ufw; then case "$(ufw status 2>/dev/null | head -n1)" in *inactive*) echo ufw=inactive ;; *active*) echo ufw=active ;; *) echo ufw=unknown ;; esac; else echo ufw=absent; fi
@@ -118,8 +156,10 @@ powder_check() (
 	awk '/^MemTotal:/ {print "mem_total_kb=" $2} /^MemAvailable:/ {print "mem_avail_kb=" $2}' /proc/meminfo 2>/dev/null
 	for h in migrate image-prune resource-guard; do k=$(printf '%s' "$h" | tr - _); if [ -x "/usr/local/bin/powder-$h" ]; then echo "helper_$k=present"; else echo "helper_$k=absent"; fi; echo "helper_${k}_sha=$(sha256sum "/usr/local/bin/powder-$h" 2>/dev/null | cut -c1-64)"; done
 	for c in git flock; do if have "$c"; then echo "cmd_$c=present"; else echo "cmd_$c=absent"; fi; done
+	o=; for f in /etc/crontab /etc/cron.d/*; do [ "$f" = '/etc/cron.d/powder-image-prune' ] && continue; case "$f" in /etc/cron.d/*) case "${f##*/}" in *[!A-Za-z0-9_-]*) continue ;; esac ;; esac; if [ -f "$f" ] && grep -Eqs '^[^#]*powder-image-prune' "$f"; then o=${f#/etc/}; break; fi; done; echo "prune_cron_other=$o"
 	if [ ! -d /etc/cron.d ]; then echo prune_cron=no-crond; elif [ ! -e '/etc/cron.d/powder-image-prune' ] && [ ! -L '/etc/cron.d/powder-image-prune' ]; then echo prune_cron=absent; elif [ "$(cat '/etc/cron.d/powder-image-prune' 2>/dev/null)" = '17 * * * * root /usr/local/bin/powder-image-prune >> /var/log/powder-image-prune.log 2>&1' ]; then echo prune_cron=current; else echo prune_cron=different; fi
 	if [ ! -d /etc/logrotate.d ]; then echo traefik_logrotate=no-logrotate; elif [ ! -e '/etc/logrotate.d/powder-traefik' ] && [ ! -L '/etc/logrotate.d/powder-traefik' ]; then echo traefik_logrotate=absent; elif [ "$(cat '/etc/logrotate.d/powder-traefik' 2>/dev/null)" = "$(printf '%s\n' '/var/log/traefik/*.log {' '  daily' '  maxsize 100M' '  rotate 7' '  missingok' '  notifempty' '  compress' '  delaycompress' '  copytruncate' '}')" ]; then echo traefik_logrotate=current; else echo traefik_logrotate=different; fi
+	o=; if [ -d /etc/logrotate.d ]; then for f in /etc/logrotate.d/* /etc/logrotate.d/.[!.]* /etc/logrotate.d/..?*; do [ "$f" = '/etc/logrotate.d/powder-traefik' ] && continue; case "${f##*/}" in *,v | *.cfsaved | *.disabled | *.dpkg-bak | *.dpkg-del | *.dpkg-dist | *.dpkg-new | *.dpkg-old | *.dpkg-tmp | *.rhn-cfg-tmp-* | *.rpmnew | *.rpmorig | *.rpmsave | *.swp | *.ucf-dist | *.ucf-new | *.ucf-old | *~) continue ;; esac; if [ -f "$f" ] && grep -Eqs '^[^#]*/var/log/traefik' "$f"; then o=${f##*/}; break; fi; done; fi; echo "traefik_logrotate_other=$o"
 	echo '===TRAEFIK_INSPECT==='
 	docker inspect --type container traefik 2>/dev/null || true
 	# END CHECK
@@ -193,6 +233,7 @@ step_replace_powder_image_prune() (
 step_install_image_prune_cron() (
 	if [ ! -d /etc/cron.d ]; then echo 'no /etc/cron.d on this server; add this line to /etc/crontab by hand: 17 * * * * root /usr/local/bin/powder-image-prune >> /var/log/powder-image-prune.log 2>&1'; exit 1; fi
 	if [ -e '/etc/cron.d/powder-image-prune' ] || [ -L '/etc/cron.d/powder-image-prune' ]; then echo '/etc/cron.d/powder-image-prune exists, left as is'; exit 0; fi
+	for f in /etc/crontab /etc/cron.d/*; do case "$f" in /etc/cron.d/*) case "${f##*/}" in *[!A-Za-z0-9_-]*) continue ;; esac ;; esac; if [ -f "$f" ] && grep -Eqs '^[^#]*powder-image-prune' "$f"; then echo "$f already runs powder-image-prune, no second line written"; exit 0; fi; done
 	if [ ! -x '/usr/local/bin/powder-image-prune' ]; then echo '/usr/local/bin/powder-image-prune is not installed, no cron written'; exit 1; fi
 	C=$(mktemp /etc/cron.d/.powder-image-prune.XXXXXX) || { echo 'could not create a temp file in /etc/cron.d'; exit 1; }
 	printf '%s\n' '17 * * * * root /usr/local/bin/powder-image-prune >> /var/log/powder-image-prune.log 2>&1' > "$C" && chown root:root "$C" && chmod 0644 "$C" && mv -f "$C" '/etc/cron.d/powder-image-prune' || { rm -f "$C"; echo 'install failed'; exit 1; }
@@ -202,6 +243,7 @@ step_install_image_prune_cron() (
 step_install_traefik_logrotate() (
 	if [ ! -d /etc/logrotate.d ]; then echo 'no /etc/logrotate.d on this server (install logrotate); /var/log/traefik/access.log is not rotated'; exit 1; fi
 	if [ -e '/etc/logrotate.d/powder-traefik' ] || [ -L '/etc/logrotate.d/powder-traefik' ]; then echo '/etc/logrotate.d/powder-traefik exists, left as is'; exit 0; fi
+	for f in /etc/logrotate.d/* /etc/logrotate.d/.[!.]* /etc/logrotate.d/..?*; do case "${f##*/}" in *,v | *.cfsaved | *.disabled | *.dpkg-bak | *.dpkg-del | *.dpkg-dist | *.dpkg-new | *.dpkg-old | *.dpkg-tmp | *.rhn-cfg-tmp-* | *.rpmnew | *.rpmorig | *.rpmsave | *.swp | *.ucf-dist | *.ucf-new | *.ucf-old | *~) continue ;; esac; if [ -f "$f" ] && grep -Eqs '^[^#]*/var/log/traefik' "$f"; then echo "$f already rotates /var/log/traefik, no second file written"; exit 0; fi; done
 	C=$(mktemp /etc/.powder-traefik-logrotate.XXXXXX) || { echo 'could not create a temp file in /etc'; exit 1; }
 	printf '%s\n' '/var/log/traefik/*.log {' '  daily' '  maxsize 100M' '  rotate 7' '  missingok' '  notifempty' '  compress' '  delaycompress' '  copytruncate' '}' > "$C" && chown root:root "$C" && chmod 0644 "$C" && mv -f "$C" '/etc/logrotate.d/powder-traefik' || { rm -f "$C"; echo 'install failed'; exit 1; }
 	echo 'installed /etc/logrotate.d/powder-traefik'
@@ -211,6 +253,10 @@ step_network_web() (
 )
 step_network_internal() (
 	docker network inspect internal >/dev/null 2>&1 || docker network create internal
+)
+# The network Traefik routes over when it is not web or internal ($TNET, validated).
+step_network_traefik() (
+	docker network inspect "$TNET" >/dev/null 2>&1 || docker network create "$TNET"
 )
 step_mkdir_apps() (
 	mkdir -p '/opt/apps'
@@ -228,7 +274,7 @@ step_start_traefik() (
 	ids=$(docker ps -aq) || { echo 'docker ps failed'; exit 1; }
 	if [ -n "$ids" ]; then ins=$(docker inspect --format '{{json .HostConfig.PortBindings}}' $ids) || { echo 'docker inspect failed'; exit 1; }; if printf '%s\n' "$ins" | grep -Eq '"HostPort":"(80|443)"'; then echo 'a container binds 80/443 (running or stopped), not starting traefik'; exit 1; fi; fi
 	mkdir -p "$DYN" /opt/infra/traefik/acme; install -d -m 0750 /var/log/traefik
-	docker run -d --name traefik --restart unless-stopped --network web --cap-drop NET_RAW --security-opt no-new-privileges -p 80:80 -p 443:443 -v /var/run/docker.sock:/var/run/docker.sock:ro -v "$DYN":/etc/traefik/dynamic:ro -v /opt/infra/traefik/acme:/acme -v /var/log/traefik:/var/log/traefik traefik:v3.6@sha256:31267173a15b4944e797a76ffd9c419707c8d8b32fe5b610f80cd0cfa05f372d --entrypoints.web.address=:80 --entrypoints.websecure.address=:443 --entrypoints.web.http.redirections.entrypoint.to=websecure --entrypoints.web.http.redirections.entrypoint.scheme=https --providers.docker=true --providers.docker.exposedbydefault=false --providers.docker.network=web --providers.file.directory=/etc/traefik/dynamic --providers.file.watch=true --certificatesresolvers.le.acme.httpchallenge=true --certificatesresolvers.le.acme.httpchallenge.entrypoint=web --certificatesresolvers.le.acme.storage=/acme/acme.json --accesslog=true --accesslog.format=json --accesslog.filepath=/var/log/traefik/access.log
+	docker run -d --name traefik --restart unless-stopped --network web --cap-drop NET_RAW --security-opt no-new-privileges -p 80:80 -p 443:443 -v /var/run/docker.sock:/var/run/docker.sock:ro -v "$DYN":/etc/traefik/dynamic:ro -v /opt/infra/traefik/acme:/acme -v /var/log/traefik:/var/log/traefik traefik:v3.6@sha256:31267173a15b4944e797a76ffd9c419707c8d8b32fe5b610f80cd0cfa05f372d --entrypoints.web.address=:80 --entrypoints.websecure.address=:443 --entrypoints.web.http.redirections.entrypoint.to=websecure --entrypoints.web.http.redirections.entrypoint.scheme=https --providers.docker=true --providers.docker.exposedbydefault=false --providers.docker.network=web --serverstransport.maxidleconnsperhost=-1 --providers.file.directory=/etc/traefik/dynamic --providers.file.watch=true --certificatesresolvers.le.acme.httpchallenge=true --certificatesresolvers.le.acme.httpchallenge.entrypoint=web --certificatesresolvers.le.acme.storage=/acme/acme.json --accesslog=true --accesslog.format=json --accesslog.filepath=/var/log/traefik/access.log
 )
 
 OUT="$(powder_check)"
@@ -247,6 +293,186 @@ treq() {
 	if [ "$PROXY" = traefik ] || [ "$1" = ok ]; then req "$@"; else line info "$2" "$3 (not used with $PROXY)"; fi
 }
 
+# The network powder routes over (same rule as traefik-network.ts routingNetwork):
+# the --providers.docker.network flag (from the inspect JSON, either form), the
+# operator's declaration; else web. A setting in a mounted traefik.yml is only read
+# by the dashboard. A network Traefik is merely attached to is reported (TATT_PICK:
+# web when it is one of them, else the first by name, leaving out bridge/host/none,
+# internal networks and networks of another compose project), never used.
+valid_net() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]]; }
+net_exists() { # name
+	case "$1" in
+	web | internal) [ "$(get "net_$1")" = present ] ;;
+	*) case " $(get docker_networks) " in *" $1:"*) return 0 ;; *) return 1 ;; esac ;;
+	esac
+}
+TRAEFIK="$(get traefik)"
+TATT="$(get traefik_networks)"
+net_field() { # name field (2 internal, 3 compose project) from docker_networks
+	for _t in $(get docker_networks); do case "$_t" in "$1":*) printf '%s' "$_t" | cut -d: -f"$2"; return ;; esac; done
+}
+# The static config file the traefik container mounts, found the way the dashboard
+# finds it (traefikConfigHostPath): the --configFile argument, else a mount at exactly
+# /etc/traefik/traefik.yml, .yaml or .toml, else a mounted /etc/traefik folder
+# (traefik.yml in it). Mount objects are read from the inspect JSON (flat objects
+# with a Destination); the host path is the longest mount covering the file.
+_flat=$(printf '%s' "$INSPECT" | tr -d '\n')
+cfg_mounts() {
+	printf '%s' "$_flat" | grep -oE '\{[^{}]*"Destination": *"[^"]*"[^{}]*\}' | while IFS= read -r _m; do
+		_s=$(printf '%s' "$_m" | sed -n 's/.*"Source": *"\([^"]*\)".*/\1/p')
+		_d=$(printf '%s' "$_m" | sed -n 's/.*"Destination": *"\([^"]*\)".*/\1/p')
+		[ -n "$_s" ] && [ -n "$_d" ] && printf '%s\t%s\n' "${_d%/}" "${_s%/}"
+	done
+}
+cfg_host_of() { # container path -> host path, or nothing
+	_best=; _bsrc=
+	while IFS="$(printf '\t')" read -r _d _s; do
+		[ -n "$_d" ] || continue
+		case "$1" in "$_d" | "$_d"/*) [ "${#_d}" -gt "${#_best}" ] && { _best=$_d; _bsrc=$_s; } ;; esac
+	done <<EOF
+$(cfg_mounts)
+EOF
+	[ -n "$_best" ] && printf '%s%s' "$_bsrc" "${1#"$_best"}"
+}
+cfg_exact_mount() { # container path mounted at exactly that path -> host path
+	while IFS="$(printf '\t')" read -r _d _s; do [ "$_d" = "$1" ] && { printf '%s' "$_s"; return; }; done <<EOF
+$(cfg_mounts)
+EOF
+}
+# providers.docker.network from that file, read only in a form that leaves no doubt.
+# Prints net=<name>, none (the file never says "network") or unsure (anything else:
+# anchors, aliases, merge keys, tags, tab indentation, nested flow mappings, a
+# repeated key, a quoted key, a value it cannot read). Keys case-insensitive, like
+# the dashboard. The dashboard's YAML/TOML parser stays the authority.
+cfg_docker_network() { # file
+	case "$1" in
+	*.toml | *.TOML) awk '
+		{ l = $0; sub(/\r$/, "", l); if (tolower(l) ~ /network/) hasnet = 1 }
+		l ~ /^[ ]*(#|$)/ { next }
+		{ if (l ~ /[ ]#/) { if (l ~ /#[^"'\'']*["'\'']/) bad = 1; else sub(/[ ]+#.*$/, "", l) }; sub(/^[ ]+/, "", l); sub(/[ ]+$/, "", l) }
+		l ~ /^\[\[/ { tbl = "#array"; next }
+		l ~ /^\[/ { if (l ~ /^\[[ ]*[A-Za-z0-9_.-]+[ ]*\]$/) { t = l; gsub(/[][ ]/, "", t); tbl = tolower(t); if (tbl == "providers.docker") nd++ } else tbl = "?"; next }
+		tbl == "providers.docker" && tolower(l) ~ /^network[ ]*=/ {
+			v = l; sub(/^[^=]*=[ ]*/, "", v)
+			if (v ~ /^"[A-Za-z0-9][A-Za-z0-9_.-]*"$/ || v ~ /^'\''[A-Za-z0-9][A-Za-z0-9_.-]*'\''$/) { n++; found = substr(v, 2, length(v) - 2) } else bad = 1
+		}
+		END { if (bad || n > 1 || nd > 1) print "unsure"; else if (n == 1) print "net=" found; else if (hasnet) print "unsure"; else print "none" }
+	' "$1" ;;
+	*) awk '
+		function ind(s) { match(s, /^ */); return RLENGTH }
+		function setnet(v) { sub(/^[ ]+/, "", v); sub(/[ ]+$/, "", v); if (v ~ /^"[A-Za-z0-9][A-Za-z0-9_.-]*"$/ || v ~ /^'\''[A-Za-z0-9][A-Za-z0-9_.-]*'\''$/) v = substr(v, 2, length(v) - 2); if (v ~ /^[A-Za-z0-9][A-Za-z0-9_.-]*$/) { n++; found = v } else bad = 1 }
+		{ l = $0; sub(/\r$/, "", l); if (tolower(l) ~ /network/) hasnet = 1 }
+		l ~ /^[ ]*(#|$)/ { next }
+		l ~ /^(---|\.\.\.)/ { if (docs++) bad = 1; next }
+		l ~ /^[ ]*\t/ || l ~ /<<[ ]*:/ || l ~ /(^|[ :,[{-])[&*!][A-Za-z0-9_!<-]/ { bad = 1 }
+		{ if (l ~ /[ ]#/) { if (l ~ /["'\'']/) bad = 1; else sub(/[ ]+#.*$/, "", l) } }
+		{ i = ind(l); t = substr(l, i + 1); sub(/[ ]+$/, "", t) }
+		!match(t, /^[A-Za-z0-9_.-]+[ ]*:([ ]|$)/) { if (t ~ /^["'\'']/) bad = 1; next }
+		{ k = tolower(substr(t, 1, RLENGTH)); sub(/[ ]*:[ ]*$/, "", k); v = substr(t, RLENGTH + 1); sub(/^[ ]+/, "", v) }
+		i == 0 { st = 0; if (k == "providers") { np++; if (v == "") { st = 1; ci = -1 } else if (tolower(v) ~ /network/) bad = 1 }; next }
+		st == 0 { next }
+		ci < 0 { ci = i }
+		i < ci { bad = 1; next }
+		i == ci {
+			st = 1
+			if (k != "docker") next
+			nd++
+			if (v == "") { st = 2; gi = -1; next }
+			if (v ~ /^\{.*\}$/) {
+				in_ = substr(v, 2, length(v) - 2)
+				if (in_ ~ /[][{}]/) { bad = 1; next }
+				c = split(in_, kv, ",")
+				for (j = 1; j <= c; j++) { p = kv[j]; sub(/^[ ]+/, "", p); if (tolower(p) ~ /^network[ ]*:/) { sub(/^[^:]*:/, "", p); setnet(p) } }
+				next
+			}
+			if (v ~ /^[{[]/ || tolower(v) ~ /network/) bad = 1
+			next
+		}
+		st == 2 {
+			if (gi < 0) gi = i
+			if (i < gi) { bad = 1; next }
+			if (i == gi && k == "network") setnet(v)
+		}
+		END { if (bad || np > 1 || nd > 1 || n > 1) print "unsure"; else if (n == 1) print "net=" found; else if (hasnet) print "unsure"; else print "none" }
+	' "$1" ;;
+	esac
+}
+TNET=web
+TNET_WHY=
+TATT_PICK=
+# a mounted config the script could not read with certainty: the network items are
+# informational for this run and no attach or create advice is given (CFG_UNSURE)
+CFG_FILE=
+CFG_UNSURE=
+TPROJ="$(get traefik_project)"
+if [ "$TRAEFIK" != absent ]; then
+	_flag=$(printf '%s\n' "$INSPECT" | awk '
+		take { if (match($0, /"[^"]*"/)) { v = substr($0, RSTART + 1, RLENGTH - 2); if (v !~ /^-/) { print v; exit } } take = 0; next }
+		match($0, /"--?providers\.docker\.network=[^"]*"/) { v = substr($0, RSTART + 1, RLENGTH - 2); sub(/^--?providers\.docker\.network=/, "", v); print v; exit }
+		/"--?providers\.docker\.network"/ { take = 1 }
+	')
+	_cfgnet=
+	if ! valid_net "$_flag"; then
+		_cf=$(printf '%s\n' "$INSPECT" | awk '
+			take { if (match($0, /"[^"]*"/)) { v = substr($0, RSTART + 1, RLENGTH - 2); if (v !~ /^-/) { print v; exit } } take = 0; next }
+			match($0, /"--?config[Ff]ile=[^"]*"/) { v = substr($0, RSTART + 1, RLENGTH - 2); sub(/^--?config[Ff]ile=/, "", v); print v; exit }
+			/"--?config[Ff]ile"/ { take = 1 }
+		')
+		if [ -n "$_cf" ]; then
+			CFG_FILE=$(cfg_host_of "$_cf")
+			[ -n "$CFG_FILE" ] || { CFG_FILE="$_cf (inside the container)"; CFG_UNSURE=1; }
+		else
+			for _e in yml yaml toml; do
+				CFG_FILE=$(cfg_exact_mount "/etc/traefik/traefik.$_e")
+				[ -n "$CFG_FILE" ] && break
+			done
+			if [ -z "$CFG_FILE" ]; then
+				# a mounted /etc/traefik folder: traefik.yml in it, as the dashboard reads
+				_dir=$(cfg_host_of /etc/traefik/traefik.yml)
+				if [ -n "$_dir" ]; then
+					if [ -e "$_dir" ]; then CFG_FILE=$_dir
+					else for _e in yaml toml; do [ -e "${_dir%.yml}.$_e" ] && { CFG_FILE="${_dir%.yml}.$_e"; CFG_UNSURE=1; }; done; fi
+				fi
+			fi
+		fi
+		if [ -n "$CFG_FILE" ] && [ -z "$CFG_UNSURE" ]; then
+			if [ -r "$CFG_FILE" ] && [ -f "$CFG_FILE" ]; then
+				case "$(cfg_docker_network "$CFG_FILE" 2>/dev/null)" in
+				net=*) _cfgnet=$(cfg_docker_network "$CFG_FILE" 2>/dev/null); _cfgnet=${_cfgnet#net=}; valid_net "$_cfgnet" || { _cfgnet=; CFG_UNSURE=1; } ;;
+				none) ;;
+				*) CFG_UNSURE=1 ;;
+				esac
+			else
+				CFG_UNSURE=1
+			fi
+		fi
+	fi
+	if valid_net "$_flag"; then
+		TNET=$_flag
+		TNET_WHY="its --providers.docker.network=$_flag flag"
+	elif [ -n "$_cfgnet" ]; then
+		TNET=$_cfgnet
+		TNET_WHY="providers.docker.network in $CFG_FILE"
+	elif [ -n "$CFG_UNSURE" ]; then
+		:
+	else
+		_cands=
+		for n in $TATT; do
+			valid_net "$n" || continue
+			case "$n" in bridge | host | none) continue ;; esac
+			[ "$(net_field "$n" 2)" = true ] && continue
+			_np="$(net_field "$n" 3)"
+			[ -n "$_np" ] && [ "$_np" != "$TPROJ" ] && continue
+			_cands="$_cands $n"
+		done
+		case " $_cands " in
+		*" web "*) _pick=web ;;
+		*) _pick=$(printf '%s\n' $_cands | LC_ALL=C sort | head -n1) ;;
+		esac
+		TATT_PICK=$_pick
+	fi
+fi
+
 echo "server check ($(hostname 2>/dev/null || echo '?'), proxy $PROXY)"
 case "$(get docker)" in
 present) req ok 'Docker engine' "version $(get docker_version)" ;;
@@ -254,15 +480,45 @@ unreachable) req missing 'Docker engine' 'installed, daemon not reachable for th
 *) req missing 'Docker engine' 'not installed' ;;
 esac
 [ "$(get compose)" = present ] && req ok 'docker compose plugin' installed || req missing 'docker compose plugin' 'not installed'
-for n in web internal; do
-	[ "$(get "net_$n")" = present ] && req ok "network $n" exists || req missing "network $n" missing
-done
-TRAEFIK="$(get traefik)"
+# The Traefik network: required on traefik servers (Traefik routes over it); web is
+# then an info line when it is another network. Elsewhere web is an info line, the
+# new-app flow creates it. internal: optional, an info line. Same rule and text as checkItems().
+if [ "$PROXY" = traefik ] && [ -n "$CFG_UNSURE" ]; then
+	line info 'traefik config' "a static config file is mounted ($CFG_FILE) that only the dashboard reads fully: its check names the network powder routes over here; this run gives no network advice"
+	line info 'network web' "$( [ "$(get net_web)" = present ] && echo exists || echo 'not created' ); not judged here (see traefik config)"
+elif [ "$PROXY" = traefik ]; then
+	if net_exists "$TNET"; then
+		if [ -n "$TNET_WHY" ]; then req ok "network $TNET" "exists; Traefik routes over it ($TNET_WHY)"; else req ok "network $TNET" exists; fi
+	elif [ "$TNET" = web ]; then req missing 'network web' 'missing: Traefik and the apps, previews and snapshots it routes run on it'
+	else req missing "network $TNET" "missing: Traefik routes over $TNET, and the apps, previews and snapshots powder starts here join it"; fi
+	if [ "$TNET" != web ]; then
+		if [ "$(get net_web)" = present ]; then line info 'network web' "exists; not used for routing here: Traefik routes over $TNET"
+		else line info 'network web' "not needed: Traefik here routes over $TNET, and the apps, previews and snapshots powder starts here join $TNET"; fi
+	fi
+	if [ -n "$TATT_PICK" ] && [ "$TATT_PICK" != web ] && [ "$TNET" = web ]; then
+		line info 'traefik networks' "traefik is attached to $TATT_PICK; set providers.docker.network to let powder route apps over it (until then powder uses web)"
+	fi
+elif [ "$(get net_web)" = present ]; then req ok 'network web' exists
+else line info 'network web' 'not created: powder creates it when the first app is created here at /new'; fi
+[ "$(get net_internal)" = present ] && req ok 'network internal' exists || line info 'network internal' 'not created: optional, only apps created with "join the shared internal network" use it, and powder creates it for the first one'
 case "$TRAEFIK" in
 running) treq ok 'traefik container' running ;;
 stopped) treq missing 'traefik container' 'exists but is stopped (not started or changed here)' ;;
 *) treq missing 'traefik container' 'no container named traefik' ;;
 esac
+# File provider pieces: required on traefik servers only with --redirects yes.
+rreq() {
+	if [ "$PROXY" != traefik ] || [ "$REDIRECTS" = yes ] || [ "$1" = ok ]; then treq "$@"; else line info "$2" "$4"; fi
+}
+if [ "$TRAEFIK" != absent ] && [ "$PROXY" = traefik ] && [ -z "$CFG_UNSURE" ]; then
+	if [ -z "$TATT" ]; then line info "traefik on $TNET" 'could not read the networks of the traefik container'
+	else
+		case " $TATT " in
+		*" $TNET "*) req ok "traefik on $TNET" attached ;;
+		*) req missing "traefik on $TNET" "missing: the traefik container is not attached to $TNET, so it cannot reach what powder starts there (connect it by hand: docker network connect $TNET traefik; powder never changes an existing Traefik)" ;;
+		esac
+	fi
+fi
 if [ "$TRAEFIK" != absent ]; then
 	# Best effort: the dashboard parses the inspect JSON properly (and reads a
 	# mounted traefik.yml); here we look for the flag and a mount of $DYN.
@@ -270,11 +526,11 @@ if [ "$TRAEFIK" != absent ]; then
 		printf '%s' "$INSPECT" | grep -q "\"Source\": \"$DYN\""; then
 		treq ok 'traefik file provider' "watches $DYN"
 	else
-		treq missing 'traefik file provider' "no file provider on $DYN found in flags (a traefik.yml config is only checked by the dashboard)"
+		rreq missing 'traefik file provider' "missing: domain redirects are set up on this server, and Traefik needs a watched file provider on $DYN to serve them (a traefik.yml config is only checked by the dashboard)" "not found in its flags: no file provider on $DYN in the traefik flags (a traefik.yml config is only checked by the dashboard); with --redirects no nothing here needs it, and domain redirects stay unavailable until Traefik has a watched file provider on $DYN"
 	fi
 fi
 [ "$(get apps_dir)" = present ] && req ok /opt/apps exists || req missing /opt/apps missing
-[ "$(get dynamic_dir)" = present ] && treq ok "$DYN" exists || treq missing "$DYN" missing
+[ "$(get dynamic_dir)" = present ] && treq ok "$DYN" exists || rreq missing "$DYN" 'missing: domain redirects are set up on this server, and powder writes their Traefik rules here' 'not created: only domain redirects use it, and none is set up on this server; they stay unavailable here until Traefik has a file provider on it'
 case "$(get ufw)" in
 active) line info 'firewall (ufw)' 'active: make sure 80 and 443 are allowed (never run here; Docker-published ports bypass it)' ;;
 inactive) line info 'firewall (ufw)' 'installed, inactive' ;;
@@ -322,13 +578,28 @@ else
 	line info 'powder-resource-guard' 'optional, not installed (install by hand, see /docs/self-hosting#per-server-helpers)'
 fi
 PRUNE_CRON_LINE='17 * * * * root /usr/local/bin/powder-image-prune >> /var/log/powder-image-prune.log 2>&1'
-case "$(get prune_cron)" in
-current) line ok 'image prune cron' '/etc/cron.d/powder-image-prune: hourly at :17' ;;
-absent) line warn 'image prune cron' '/etc/cron.d/powder-image-prune missing: powder-image-prune never runs (--apply adds it)' ;;
-no-crond) line warn 'image prune cron' "no /etc/cron.d on this server: add this line to /etc/crontab by hand: $PRUNE_CRON_LINE" ;;
-*) line info 'image prune cron' "/etc/cron.d/powder-image-prune has other content; left as is. powder's line: $PRUNE_CRON_LINE" ;;
-esac
-if [ "$PROXY" = traefik ]; then
+PRUNE_OTHER="$(get prune_cron_other)"
+if [ -n "$PRUNE_OTHER" ]; then
+	# another cron file already runs it: handled there, or twice with powder's own file
+	case "$(get prune_cron)" in
+	current | different) line warn 'image prune cron' "/etc/cron.d/powder-image-prune and /etc/$PRUNE_OTHER both run powder-image-prune; remove one of them by hand" ;;
+	*) line ok 'image prune cron' "/etc/$PRUNE_OTHER already runs powder-image-prune; handled there, left alone (powder adds no second line)" ;;
+	esac
+else
+	case "$(get prune_cron)" in
+	current) line ok 'image prune cron' '/etc/cron.d/powder-image-prune: hourly at :17' ;;
+	absent) line warn 'image prune cron' '/etc/cron.d/powder-image-prune missing: powder-image-prune never runs (--apply adds it)' ;;
+	no-crond) line warn 'image prune cron' "no /etc/cron.d on this server: add this line to /etc/crontab by hand: $PRUNE_CRON_LINE" ;;
+	*) line info 'image prune cron' "/etc/cron.d/powder-image-prune has other content; left as is. powder's line: $PRUNE_CRON_LINE" ;;
+	esac
+fi
+LR_OTHER="$(get traefik_logrotate_other)"
+if [ "$PROXY" = traefik ] && [ -n "$LR_OTHER" ] && [ "$(get traefik_logrotate)" != no-logrotate ]; then
+	case "$(get traefik_logrotate)" in
+	absent) line ok 'traefik log rotation' "/etc/logrotate.d/$LR_OTHER already rotates /var/log/traefik; handled there, left alone (powder adds no second file)" ;;
+	*) line warn 'traefik log rotation' "/etc/logrotate.d/powder-traefik and /etc/logrotate.d/$LR_OTHER both rotate /var/log/traefik: logrotate reports a duplicate entry and exits non-zero; remove one of them by hand" ;;
+	esac
+elif [ "$PROXY" = traefik ]; then
 	case "$(get traefik_logrotate)" in
 	current) line ok 'traefik log rotation' '/etc/logrotate.d/powder-traefik: daily, 7 kept, 100 MB cap' ;;
 	absent) line warn 'traefik log rotation' '/etc/logrotate.d/powder-traefik missing: /var/log/traefik/access.log grows without bound (--apply adds it)' ;;
@@ -375,11 +646,22 @@ else
 	[ "$DOCKER" = unreachable ] && SKIPPED+=('docker: installed but the daemon is not reachable; fix by hand')
 	[ "$DOCKER" = present ] && [ "$(get compose)" = absent ] && SKIPPED+=('compose: install the docker compose plugin by hand')
 	[ "$(get apps_dir)" = absent ] && STEPS+=(mkdir_apps)
-	[ "$(get dynamic_dir)" = absent ] && [ "$PROXY" = traefik ] && STEPS+=(mkdir_dynamic)
+	[ "$(get dynamic_dir)" = absent ] && [ "$PROXY" = traefik ] && [ "$REDIRECTS" = yes ] && STEPS+=(mkdir_dynamic)
 	if [ "$DOCKER" != unreachable ]; then
-		for n in web internal; do
-			if [ "$(get "net_$n")" = absent ] || [ "$DOCKER" = absent ]; then STEPS+=("network_$n"); fi
+		# the routing network (Traefik's on traefik servers, else web), then internal
+		_route=web; [ "$PROXY" = traefik ] && _route=$TNET
+		# the routing network is unknown here: create nothing for it
+		[ "$PROXY" = traefik ] && [ -n "$CFG_UNSURE" ] && { _route=; SKIPPED+=('traefik-network: a mounted Traefik config only the dashboard reads names the routing network; run the check from the dashboard'); }
+		for n in "$_route" internal; do
+			[ -n "$n" ] || continue
+			[ "$n" = internal ] && [ "$_route" = internal ] && continue
+			if ! net_exists "$n" || [ "$DOCKER" = absent ]; then
+				case "$n" in web | internal) STEPS+=("network_$n") ;; *) STEPS+=(network_traefik) ;; esac
+			fi
 		done
+	fi
+	if [ "$PROXY" = traefik ] && [ "$TRAEFIK" != absent ] && [ -n "$TATT" ] && [ -z "$CFG_UNSURE" ]; then
+		case " $TATT " in *" $TNET "*) ;; *) SKIPPED+=("traefik-network: attach Traefik to $TNET by hand (docker network connect $TNET traefik); powder never changes an existing Traefik") ;; esac
 	fi
 	BLOCKER="$(traefik_blocker)"
 	if [ -n "$BLOCKER" ]; then SKIPPED+=("traefik: $BLOCKER"); else STEPS+=(start_traefik); fi
@@ -397,15 +679,16 @@ else
 	# The prune's cron, once the helper is there or about to be installed.
 	case "$(get prune_cron)" in
 	absent)
-		if [ "$(get helper_image_prune)" = present ] || [[ " ${STEPS[*]-} " == *" install_powder_image_prune "* ]]; then STEPS+=(install_image_prune_cron)
+		if [ -n "$PRUNE_OTHER" ]; then :
+		elif [ "$(get helper_image_prune)" = present ] || [[ " ${STEPS[*]-} " == *" install_powder_image_prune "* ]]; then STEPS+=(install_image_prune_cron)
 		else SKIPPED+=('image-prune-cron: powder-image-prune is not installed; install it first'); fi
 		;;
-	no-crond) SKIPPED+=("image-prune-cron: no /etc/cron.d on this server; add to /etc/crontab: $PRUNE_CRON_LINE") ;;
+	no-crond) [ -n "$PRUNE_OTHER" ] || SKIPPED+=("image-prune-cron: no /etc/cron.d on this server; add to /etc/crontab: $PRUNE_CRON_LINE") ;;
 	esac
 	# Traefik's access log rotation, on traefik servers only (same as planApply()).
 	if [ "$PROXY" = traefik ]; then
 		case "$(get traefik_logrotate)" in
-		absent) STEPS+=(install_traefik_logrotate) ;;
+		absent) [ -n "$LR_OTHER" ] || STEPS+=(install_traefik_logrotate) ;;
 		no-logrotate) SKIPPED+=('traefik-logrotate: no /etc/logrotate.d on this server; install logrotate to rotate /var/log/traefik/access.log') ;;
 		esac
 	fi

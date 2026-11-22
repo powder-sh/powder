@@ -9,6 +9,7 @@ import Link from 'next/link'
 import { useEffect } from 'react'
 import { Button } from '@/components/ui/button'
 import { buttonVariants } from '@/components/ui/button-variants'
+import { CopyButton } from '@/components/ui/copy-button'
 import { EmptyState } from '@/components/ui/empty-state'
 
 export default function DashboardError({
@@ -42,7 +43,8 @@ export default function DashboardError({
 				{error.digest ? (
 					<>
 						the server log of powder has the details under{' '}
-						<code className="font-mono text-foreground">{error.digest}</code>.
+						<code className="font-mono text-foreground">{error.digest}</code>
+						<CopyButton value={error.digest} label="copy the error id" size="inline" className="ml-0.5" />.
 					</>
 				) : (
 					'the browser console has the details.'

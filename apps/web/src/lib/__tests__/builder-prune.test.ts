@@ -84,7 +84,7 @@ describe('builder cleanup and pull', () => {
 
 // the cap prune after a builder phase: a run that could not prune (builds held
 // the slots, a pull ran, the prune failed) gives no "after the prune" verdict; a
-// cache not pruned for 6h does. The clock is a stub `date` (NOW); ages come from
+// cache not pruned for a day does. The clock is a stub `date` (NOW); ages come from
 // the state file. Slot holders are real flock processes (util-linux).
 const HAS_FLOCK = spawnSync('flock', ['--version']).status === 0
 
@@ -103,6 +103,10 @@ describe('builder cap prune verdict', () => {
 		psLine?: string
 		/** the attempt file cannot be written (it is a dir). */
 		attemptUnwritable?: boolean
+		/** the root disk (%) the last prune that held the slots left (the root file). */
+		rootAtAttempt?: number
+		/** the root disk drops to `pct` once the age prune `until=<at>` ran. */
+		rootDrop?: { at: string; pct: number | '' }
 	}
 	function host(name: string, cacheGb: number, o: HostOpts) {
 		const dir = join(root, `p-${name}`)
@@ -110,6 +114,8 @@ describe('builder cap prune verdict', () => {
 		mkdirSync(pbin, { recursive: true })
 		const log = join(dir, 'docker.log')
 		const slot0 = join(dir, 'slot.0')
+		const pct = join(dir, 'root.pct')
+		writeFileSync(pct, `${o.rootPct ?? 61}\n`)
 		writeFileSync(
 			join(pbin, 'docker'),
 			`#!/bin/bash\necho "$*" >> ${JSON.stringify(log)}\n` +
@@ -117,6 +123,7 @@ describe('builder cap prune verdict', () => {
 				`[ "$*" = "image prune -f" ] && { flock -n ${JSON.stringify(slot0)} true && echo slot0=free || echo slot0=held; } >> ${JSON.stringify(log)}\n` +
 				`[ "$*" = "image prune -f" ] && echo "Total reclaimed space: 1.5GB"\n` +
 				(o.slowImagePrune ? `case "$*" in *prune*) exec sleep 31.5;; esac\n` : '') +
+				(o.rootDrop ? `[ "$*" = "builder prune -af --filter until=${o.rootDrop.at}" ] && echo ${o.rootDrop.pct} > ${JSON.stringify(pct)}\n` : '') +
 				`[ "$*" = "buildx du" ] && printf 'Total:\\t\\t${cacheGb}GB\\n'\nexit 0\n`,
 		)
 		// psBusyFrom: from the Nth ps call on, an image pull is in progress.
@@ -128,7 +135,7 @@ describe('builder cap prune verdict', () => {
 				: `#!/bin/bash\nn=$(( $(cat ${JSON.stringify(psCount)} 2>/dev/null || echo 0) + 1 )); echo $n > ${JSON.stringify(psCount)}\n[ "$n" -ge ${o.psBusyFrom} ] && echo "  12 ${o.psLine ?? 'docker pull node:22'}"\nexit 0\n`,
 		)
 		writeFileSync(join(pbin, 'date'), `#!/bin/bash\necho ${NOW}\n`)
-		writeFileSync(join(pbin, 'df'), `#!/bin/bash\nprintf "Filesystem 1024-blocks Used Available Capacity Mounted on\\n/dev/sda1 300 150 150 ${o.rootPct ?? 61}%% /\\n"\n`)
+		writeFileSync(join(pbin, 'df'), `#!/bin/bash\nprintf "Filesystem 1024-blocks Used Available Capacity Mounted on\\n/dev/sda1 300 150 150 $(cat ${JSON.stringify(pct)})%% /\\n"\n`)
 		for (const f of ['docker', 'ps', 'date', 'df']) chmodSync(join(pbin, f), 0o755)
 		writeFileSync(log, '')
 		if (o.lastPrune !== null) {
@@ -141,6 +148,10 @@ describe('builder cap prune verdict', () => {
 		if (o.lastAttempt !== undefined) {
 			mkdirSync(join(dir, 'state'), { recursive: true })
 			writeFileSync(join(dir, 'state', 'builder-prune.attempt'), `${o.lastAttempt}\n`)
+		}
+		if (o.rootAtAttempt !== undefined) {
+			mkdirSync(join(dir, 'state'), { recursive: true })
+			writeFileSync(join(dir, 'state', 'builder-prune.root'), `${o.rootAtAttempt}\n`)
 		}
 		const sh = builderCapPruneShell({
 			capGb: 30,
@@ -161,6 +172,7 @@ describe('builder cap prune verdict', () => {
 			return { out: r.stdout, ms: Date.now() - t0, p, calls: readFileSync(log, 'utf8').slice(from), state: readFileSync(join(dir, 'state', 'last'), 'utf8').trim() }
 		}
 		const attempt = () => readFileSync(join(dir, 'state', 'builder-prune.attempt'), 'utf8').trim()
+		const rootAt = () => readFileSync(join(dir, 'state', 'builder-prune.root'), 'utf8').trim()
 		/** run while a build holds slot 0 for `sec` seconds (a real flock); the
 		 *  build logs `build-done` as it ends. */
 		const runBusy = (sec = 10) => {
@@ -176,7 +188,7 @@ describe('builder cap prune verdict', () => {
 		const slotFree = () => spawnSync('flock', ['-n', slot0, 'true']).status === 0
 		/** forget the last prune that held the slots (the 1h gate). */
 		const clearGate = () => rmSync(join(dir, 'state', 'builder-prune.attempt'), { force: true })
-		return { run, runBusy, slotFree, attempt, clearGate }
+		return { run, runBusy, slotFree, attempt, rootAt, clearGate }
 	}
 
 	it.skipIf(!HAS_FLOCK)('a run skipped because builds held the slots posts no card', () => {
@@ -193,15 +205,15 @@ describe('builder cap prune verdict', () => {
 		const due = host('busy-due', 65, { lastPrune: NOW - 3600, lastAttempt: NOW - 900 - 2700 }).run()
 		expect(due.p).toMatchObject({ pruned: true, skip: null })
 	})
-	it.skipIf(!HAS_FLOCK)('a skipped run whose last real prune is 6h+ old warns that the cache is not pruned', () => {
-		const r = host('stale', 65, { lastPrune: NOW - 7 * 3600 }).runBusy()
-		expect(r.p?.lastPruneAgeSec).toBe(7 * 3600)
+	it.skipIf(!HAS_FLOCK)('a skipped run whose last real prune is a day old warns that the cache is not pruned', () => {
+		const r = host('stale', 65, { lastPrune: NOW - 25 * 3600 }).runBusy()
+		expect(r.p?.lastPruneAgeSec).toBe(25 * 3600)
 		expect(r.p && builderPruneVerdict(r.p)).toEqual({
 			post: true,
 			afterPrune: false,
-			problem: 'the build cache has not been pruned for 7h because builds never paused; cache 65 GB, cap 30 GB',
+			problem: 'the build cache has not been pruned for 25h because builds never paused; cache 65 GB, cap 30 GB',
 		})
-		expect(r.p && builderPruneLogLine('5.6.7.8', r.p)).toBe('[builder-prune] 5.6.7.8: cache 65000 MB (found 65000 MB) cap 30000 MB root 61% pruned=0 skip=locked last_prune_age=25200s stuck=0')
+		expect(r.p && builderPruneLogLine('5.6.7.8', r.p)).toBe('[builder-prune] 5.6.7.8: cache 65000 MB (found 65000 MB) cap 30000 MB root 61% pruned=0 skip=locked last_prune_age=90000s stuck=0')
 	})
 	it.skipIf(!HAS_FLOCK)('a host never pruned starts its clock at the first run', () => {
 		const r = host('fresh', 65, { lastPrune: null }).runBusy()
@@ -275,6 +287,68 @@ describe('builder cap prune verdict', () => {
 		expect(ok.calls).not.toContain('prune')
 		expect(ok.p && builderPruneVerdict(ok.p)).toEqual({ post: true, afterPrune: true, problem: null })
 	})
+	it.skipIf(!HAS_FLOCK)('at 75% the gate ends once the cache refilled the disk, 15 min after the last prune', () => {
+		// a build burst: 45% after the prune 2200s ago, 75% now. The prune runs.
+		const burst = host('rate-burst', 200, { lastPrune: NOW - 2200, lastAttempt: NOW - 2200, rootAtAttempt: 45, rootPct: 75 })
+		const r = burst.run()
+		expect(r.out).toContain('root disk 75%, 45% after the prune 2200s ago, cache over the cap: the gate ends, pruning now')
+		expect(r.calls).toContain('image prune -f')
+		expect(r.p).toMatchObject({ pruned: true, skip: null })
+		// the new base, and the gate starts again.
+		expect(burst.rootAt()).toBe('75')
+		expect(burst.attempt()).toBe(String(NOW))
+		expect(burst.run().p).toMatchObject({ pruned: false, skip: 'recent' })
+		// a slower burst reaches 75% late in the gate: it still prunes before the
+		// card's threshold would post a skipped run.
+		const late = host('rate-late', 200, { lastPrune: NOW - 2820, lastAttempt: NOW - 2820, rootAtAttempt: 46, rootPct: 75 }).run()
+		expect(late.p).toMatchObject({ pruned: true, skip: null })
+		// a slow rise at the warn level prunes too.
+		const slow = host('rate-slow', 200, { lastPrune: NOW - 2000, lastAttempt: NOW - 2000, rootAtAttempt: 74, rootPct: 76 }).run()
+		expect(slow.p).toMatchObject({ pruned: true, skip: null })
+		// a disk that is not rising: pruning again would not help, the gate holds.
+		const flat = host('rate-flat', 200, { lastPrune: NOW - 2000, lastAttempt: NOW - 2000, rootAtAttempt: 80, rootPct: 80 }).run()
+		expect(flat.calls).not.toContain('prune')
+		// the disk fills from something other than the cache (under its cap): the gate holds.
+		const other = host('rate-other', 12, { lastPrune: NOW - 2000, lastAttempt: NOW - 2000, rootAtAttempt: 60, rootPct: 80 }).run()
+		expect(other.calls).not.toContain('prune')
+		expect(other.p).toMatchObject({ pruned: false, skip: 'recent' })
+		// under 15 min since the last prune: too short, the gate holds.
+		const soon = host('rate-soon', 200, { lastPrune: NOW - 600, lastAttempt: NOW - 600, rootAtAttempt: 40, rootPct: 80 }).run()
+		expect(soon.calls).not.toContain('prune')
+		// no recorded base (a host from before the root file): the fixed gate.
+		const nobase = host('rate-nobase', 200, { lastPrune: NOW - 2200, lastAttempt: NOW - 2200, rootPct: 80 }).run()
+		expect(nobase.calls).not.toContain('prune')
+		// under the warn level the gate holds, however fast it fills.
+		const low = host('rate-low', 200, { lastPrune: NOW - 1800, lastAttempt: NOW - 1800, rootAtAttempt: 30, rootPct: 70 }).run()
+		expect(low.calls).not.toContain('prune')
+		expect(low.p && builderPruneVerdict(low.p)).toEqual({ post: false })
+	})
+	it.skipIf(!HAS_FLOCK)('a root disk unreadable after the prune clears the base: the fixed gate holds next', () => {
+		const h = host('rate-unreadable', 200, { lastPrune: NOW - 7 * 3600, rootAtAttempt: 50, rootPct: 61, rootDrop: { at: '1h', pct: '' } })
+		expect(h.run().p).toMatchObject({ pruned: true })
+		expect(h.rootAt()).toBe('0')
+	})
+	it.skipIf(!HAS_FLOCK)('the age steps go below 1h only with the root disk at 75%, and stop once it is under', () => {
+		const calm = host('deep-calm', 200, { lastPrune: NOW - 7 * 3600, rootPct: 61 }).run()
+		expect(calm.calls).toContain('until=1h')
+		expect(calm.calls).not.toMatch(/until=\d+m/)
+		const hot = host('deep-hot', 200, { lastPrune: NOW - 7 * 3600, rootPct: 80 }).run()
+		expect(hot.calls).toContain('until=1h\n')
+		expect(hot.calls).toContain('until=30m\n')
+		expect(hot.calls).toContain('until=15m\n')
+		expect(hot.calls.indexOf('until=30m')).toBeLessThan(hot.calls.indexOf('until=15m'))
+		// 30m brought the disk under 75%: 15m is not taken, and the card resolves.
+		const eased = host('deep-eased', 200, { lastPrune: NOW - 7 * 3600, rootPct: 80, rootDrop: { at: '30m', pct: 60 } })
+		const e = eased.run()
+		expect(e.calls).toContain('until=30m')
+		expect(e.calls).not.toContain('until=15m')
+		expect(e.p).toMatchObject({ pruned: true, rootPct: 60 })
+		expect(e.p && builderPruneVerdict(e.p)).toEqual({ post: true, afterPrune: true, problem: null })
+		expect(eased.rootAt()).toBe('60')
+		// under the cap after 1h: no step below it, whatever the root disk.
+		const small = host('deep-under-cap', 12, { lastPrune: NOW - 7 * 3600, rootPct: 80 }).run()
+		expect(small.calls).not.toContain('until=')
+	})
 	it.skipIf(!HAS_FLOCK)('a prune that held the slots gates the next run for 1h, done or failed', () => {
 		const h = host('gate', 65, { lastPrune: NOW - 7 * 3600 })
 		expect(h.run().p).toMatchObject({ pruned: true })
@@ -314,7 +388,7 @@ describe('builder cap prune verdict', () => {
 			['pull-before', 1],
 			['pull-after', 2],
 		] as const) {
-			const r = host(name, 65, { lastPrune: NOW - 7 * 3600, psBusyFrom: from }).run()
+			const r = host(name, 65, { lastPrune: NOW - 25 * 3600, psBusyFrom: from }).run()
 			expect(r.calls).not.toContain('prune')
 			expect(r.p).toMatchObject({ pruned: false, skip: 'busy' })
 			expect(r.p && builderPruneVerdict(r.p)).toMatchObject({ problem: expect.stringContaining('because an image pull was in progress every time') })
@@ -344,11 +418,11 @@ describe('builder cap prune verdict', () => {
 		expect(r.out).toContain('builder-prune.attempt is not writable: the prune runs after every build')
 	})
 	it.skipIf(!HAS_FLOCK)('a prune over its time limit is killed, frees the slots and says it failed', () => {
-		const h = host('slow', 65, { lastPrune: NOW - 7 * 3600, bodyTimeoutSec: 2, slowImagePrune: true })
+		const h = host('slow', 65, { lastPrune: NOW - 25 * 3600, bodyTimeoutSec: 2, slowImagePrune: true })
 		const r = h.run()
 		expect(r.ms).toBeLessThan(15000)
 		expect(r.out).toContain('the prune failed or timed out (exit 124)')
-		expect(r.p).toMatchObject({ pruned: false, skip: 'failed', lastPruneAgeSec: 7 * 3600 })
+		expect(r.p).toMatchObject({ pruned: false, skip: 'failed', lastPruneAgeSec: 25 * 3600 })
 		expect(h.slotFree()).toBe(true)
 		// the killed docker call is gone too (polled: it may take a moment to be reaped).
 		expect(spawnSync('bash', ['-c', 'for i in $(seq 30); do pgrep -f "^sleep 31.5" >/dev/null || exit 0; sleep 0.1; done; exit 1']).status).toBe(0)
